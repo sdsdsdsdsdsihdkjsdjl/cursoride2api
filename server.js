@@ -184,7 +184,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
 
 // ── POST /v1/messages (Anthropic Messages API) ──
 app.post('/v1/messages', checkApiKey, async (req, res) => {
-  const { messages, model, system, max_tokens, stream, temperature, top_p, stop_sequences } = req.body;
+  const { messages, model, system, max_tokens, stream, temperature, top_p, stop_sequences } = req.body || {};
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json(anthropicConverter.buildAnthropicErrorResponse('messages is required', 'invalid_request_error'));
