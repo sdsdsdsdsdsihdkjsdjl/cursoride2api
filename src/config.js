@@ -28,6 +28,28 @@ const config = {
     'composer-1.5': 'composer-1.5',
     'default': 'default',
   },
+
+  // 模型映射 (Anthropic model → Cursor model)
+  anthropicModelMapping: {
+    // Claude 4.x family
+    'claude-opus-4-20250514': 'claude-4.6-opus-high',
+    'claude-opus-4-6': 'claude-4.6-opus-high',
+    'claude-sonnet-4-20250514': 'claude-4.5-sonnet',
+    'claude-sonnet-4-6': 'claude-4.5-sonnet',
+    // Claude 3.5 family
+    'claude-3-5-sonnet-20241022': 'claude-3.5-sonnet',
+    'claude-3-5-sonnet-latest': 'claude-3.5-sonnet',
+    'claude-3-5-haiku-20241022': 'claude-3.5-haiku',
+    'claude-3-5-haiku-latest': 'claude-3.5-haiku',
+    // Claude 3 family
+    'claude-3-opus-20240229': 'claude-4.6-opus-high',
+    'claude-3-opus-latest': 'claude-4.6-opus-high',
+    'claude-3-sonnet-20240229': 'claude-4.6-sonnet-medium',
+    'claude-3-haiku-20240307': 'claude-3-haiku',
+    // Short aliases
+    'claude-opus-4': 'claude-4.6-opus-high',
+    'claude-sonnet-4': 'claude-4.5-sonnet',
+  },
 };
 
 module.exports = config;

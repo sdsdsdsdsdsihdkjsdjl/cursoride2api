@@ -10,6 +10,8 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const cursorClient = require('./src/cursor-client');
 const converter = require('./src/converter');
+const anthropicConverter = require('./src/anthropic-converter');
+const config = require('./src/config');
 
 // ── 配置 ──
 const PORT = parseInt(process.env.PORT || '3000');
@@ -180,6 +182,90 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
   }
 });
 
+// ── POST /v1/messages (Anthropic Messages API) ──
+app.post('/v1/messages', checkApiKey, async (req, res) => {
+  const { messages, model, system, max_tokens, stream, temperature, top_p, stop_sequences } = req.body;
+
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json(anthropicConverter.buildAnthropicErrorResponse('messages is required', 'invalid_request_error'));
+  }
+
+  const token = pickToken();
+  if (!token) {
+    return res.status(503).json(anthropicConverter.buildAnthropicErrorResponse('No available tokens', 'api_error'));
+  }
+
+  const requestedModel = model || 'claude-sonnet-4-20250514';
+  const cursorModel = anthropicConverter.mapAnthropicModel(requestedModel, config.anthropicModelMapping);
+  const prompt = anthropicConverter.anthropicMessagesToPrompt(messages, system);
+  const isStream = stream === true;
+
+  console.log(`  📨 [${new Date().toLocaleTimeString()}] (Anthropic) ${requestedModel} → ${cursorModel} | stream=${isStream} | ${prompt.substring(0, 80)}...`);
+
+  if (isStream) {
+    // ── Anthropic 流式响应 ──
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    res.write(anthropicConverter.buildMessageStart(requestedModel, 0));
+    res.write(anthropicConverter.buildPing());
+    res.write(anthropicConverter.buildContentBlockStart(0));
+
+    try {
+      const result = await cursorClient.chat(token, prompt, cursorModel, {
+        stream: true,
+        onDelta: (text) => {
+          if (!res.writableEnded) {
+            res.write(anthropicConverter.buildContentBlockDelta(0, text));
+          }
+        },
+      });
+
+      if (result.error && !res.writableEnded) {
+        res.write(anthropicConverter.buildContentBlockDelta(0, `\n\n[Error: ${result.error}]`));
+      }
+
+      if (!res.writableEnded) {
+        res.write(anthropicConverter.buildContentBlockStop(0));
+        res.write(anthropicConverter.buildMessageDelta('end_turn', result.outputTokens || 0));
+        res.write(anthropicConverter.buildMessageStop());
+        res.end();
+      }
+
+      console.log(`  ✅ anthropic stream done | in=${result.inputTokens} out=${result.outputTokens}`);
+    } catch (e) {
+      console.error(`  ❌ anthropic stream error: ${e.message}`);
+      if (!res.writableEnded) {
+        res.write(anthropicConverter.buildContentBlockDelta(0, `\n\n[Error: ${e.message}]`));
+        res.write(anthropicConverter.buildContentBlockStop(0));
+        res.write(anthropicConverter.buildMessageDelta('end_turn', 0));
+        res.write(anthropicConverter.buildMessageStop());
+        res.end();
+      }
+    }
+
+  } else {
+    // ── Anthropic 非流式响应 ──
+    try {
+      const result = await cursorClient.chat(token, prompt, cursorModel, { stream: false });
+
+      if (result.error) {
+        console.error(`  ❌ ${result.error}`);
+        return res.status(500).json(anthropicConverter.buildAnthropicErrorResponse(result.error, 'api_error'));
+      }
+
+      console.log(`  ✅ anthropic done | in=${result.inputTokens} out=${result.outputTokens}`);
+      res.json(anthropicConverter.buildAnthropicResponse(result.text, requestedModel, result.inputTokens, result.outputTokens));
+    } catch (e) {
+      console.error(`  ❌ ${e.message}`);
+      res.status(500).json(anthropicConverter.buildAnthropicErrorResponse(e.message, 'api_error'));
+    }
+  }
+});
+
 // ── 健康检查 ──
 app.get('/health', (req, res) => {
   res.json({
@@ -201,6 +287,7 @@ app.listen(PORT, HOST, () => {
   console.log('  ╠═══════════════════════════════════════════╣');
   console.log(`  ║  🌐 http://${HOST}:${PORT}                     ║`);
   console.log(`  ║  🔌 /v1/chat/completions                  ║`);
+  console.log(`  ║  🔌 /v1/messages (Anthropic)               ║`);
   console.log(`  ║  📋 /v1/models                            ║`);
   console.log('  ╠═══════════════════════════════════════════╣');
   console.log(`  ║  🔑 Tokens: ${String(count).padEnd(30)}║`);
