@@ -41,13 +41,18 @@ const config = {
     // Claude 4.5 Opus
     'claude-opus-4-5': 'claude-4.5-opus-high-thinking',
     // Claude 4.6 Sonnet
-    'claude-sonnet-4-20250514': 'claude-4.6-sonnet-medium-thinking',
+    'claude-sonnet-4-6-20250514': 'claude-4.6-sonnet-medium-thinking',
     'claude-sonnet-4-6': 'claude-4.6-sonnet-medium-thinking',
     // Claude 4.5 Sonnet
     'claude-sonnet-4-5-20241022': 'claude-4.5-sonnet-thinking',
     'claude-sonnet-4-5': 'claude-4.5-sonnet-thinking',
     // Claude 4 Sonnet
     'claude-sonnet-4-20250514': 'claude-4-sonnet-thinking',
+    // Claude Haiku (no Cursor haiku, use fast alternatives)
+    'claude-haiku-4-5-20251001': 'composer-2-fast',
+    'claude-haiku-4-5': 'composer-2-fast',
+    'claude-3-5-haiku-20241022': 'composer-2-fast',
+    'claude-3-5-haiku-latest': 'composer-2-fast',
     // Claude 3.5 family
     'claude-3-5-sonnet-20241022': 'claude-4.5-sonnet',
     'claude-3-5-sonnet-latest': 'claude-4.5-sonnet',
@@ -58,7 +63,7 @@ const config = {
     'claude-3-haiku-20240307': 'gemini-3-flash',
     // Short aliases (point to latest)
     'claude-opus-4': 'claude-opus-4-7-thinking-max',
-    'claude-sonnet-4': 'claude-4.6-sonnet-medium-thinking',
+    'claude-sonnet-4': 'claude-4-sonnet-thinking',
   },
 };
 
