@@ -450,7 +450,8 @@ function handleExecMessage(exec, tools, writeFrame, onMcpCall) {
     writeFrame({
       execClientMessage: {
         id, execId,
-        shellResult: {
+        // shellStreamArgs response type is `shellStream`, not `shellResult`.
+        shellStream: {
           rejected: {
             command: exec.shellStreamArgs.command || '',
             workingDirectory: exec.shellStreamArgs.workingDirectory || '',
@@ -600,6 +601,10 @@ function startConversation(token, options = {}) {
   let inputTokens = 0;
   let outputTokens = 0;
   let capturedState = null;
+  // Blob store: Cursor sends setBlobArgs to cache pieces of conversation state
+  // on our side (system prompt, user context, etc.) and may getBlobArgs them
+  // back later. We just need to play along — keyed by base64 blobId string.
+  const blobStore = new Map();
 
   const writeFrame = (obj) => {
     if (closed) return;
@@ -713,8 +718,43 @@ function startConversation(token, options = {}) {
     }
 
     if (msg.kvServerMessage) {
-      // Not implemented in this client — Cursor will retry blob fetches.
-      // We don't manage a blob store here.
+      const kv = msg.kvServerMessage;
+      const kvId = kv.id;
+
+      // setBlobArgs: Cursor is asking us to cache a blob (typically the system
+      // prompt / user context / assistant turns). Store and ACK so the model
+      // can keep streaming.
+      if (kv.setBlobArgs) {
+        const { blobId, blobData } = kv.setBlobArgs;
+        if (blobId) blobStore.set(blobId, blobData || '');
+        if (process.env.CURSOR_AGENT_DEBUG) {
+          console.log(`[cursor-agent][debug] kv setBlob id=${kvId} blobId=${(blobId || '').slice(0, 24)}... bytes=${(blobData || '').length}`);
+        }
+        writeFrame({ kvClientMessage: { id: kvId, setBlobResult: {} } });
+        return;
+      }
+
+      // getBlobArgs: Cursor is asking us to return a previously-cached blob.
+      // If we have it, return it; otherwise empty.
+      if (kv.getBlobArgs) {
+        const { blobId } = kv.getBlobArgs;
+        const blobData = blobStore.get(blobId);
+        if (process.env.CURSOR_AGENT_DEBUG) {
+          console.log(`[cursor-agent][debug] kv getBlob id=${kvId} blobId=${(blobId || '').slice(0, 24)}... found=${blobData != null}`);
+        }
+        writeFrame({
+          kvClientMessage: {
+            id: kvId,
+            getBlobResult: blobData ? { blobData } : {},
+          },
+        });
+        return;
+      }
+
+      if (process.env.CURSOR_AGENT_DEBUG) {
+        const keys = Object.keys(kv).filter(k => !['id', 'execId', 'spanContext'].includes(k));
+        console.log(`[cursor-agent][debug] kv id=${kvId} unhandled keys=${keys.join(',')}`);
+      }
       return;
     }
 
