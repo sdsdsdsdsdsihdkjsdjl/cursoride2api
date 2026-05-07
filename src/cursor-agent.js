@@ -1,14 +1,17 @@
 // ═══════════════════════════════════════════════
 //  CursorIDE2API - Cursor Agent Protocol Client
-//  Full tool support over a persistent H2 stream
+//  application/connect+proto (binary protobuf)
 // ═══════════════════════════════════════════════
 //
-//  Unlike cursor-client.js which resolves once on turnEnded,
-//  this client keeps the H2 stream alive across tool calls.
-//  The model emits mcpArgs → onMcpCall fires → caller invokes
-//  sendToolResult() → mcpResult written back into the same
-//  stream. The stream stays open (with heartbeats) until
-//  turnEnded or close().
+//  Like cursor-client.js, but keeps the H2 stream alive across tool calls.
+//  Bubbles MCP tool calls up via onMcpCall, then resumes the stream when
+//  the caller invokes sendToolResult(). Uses binary protobuf encoding so
+//  Cursor's MCP tool dispatcher actually picks up tools registered via
+//  RequestContext.tools.
+//
+//  Schemas live in src/proto/agent_pb.mjs (ESM); we load them at startup
+//  via dynamic import. The first startConversation() call awaits the load;
+//  subsequent calls are synchronous.
 
 const http2 = require('http2');
 const crypto = require('crypto');
@@ -16,23 +19,64 @@ const { v4: uuidv4 } = require('uuid');
 const config = require('./config');
 const { generateChecksum } = require('./cursor-client');
 
-// ── 5-byte connect+json frame ──
-function encodeFrame(obj) {
-  const jsonBuf = Buffer.from(JSON.stringify(obj), 'utf8');
-  const frame = Buffer.alloc(5 + jsonBuf.length);
-  frame[0] = 0;
-  frame.writeUInt32BE(jsonBuf.length, 1);
-  jsonBuf.copy(frame, 5);
+// Connect-protocol "end stream" frame flag
+const CONNECT_END_STREAM_FLAG = 0b00000010;
+
+// ── Lazy proto module loader ──
+//
+// `@bufbuild/protobuf` is dual-package; `agent_pb.mjs` is ESM only. From
+// CommonJS we load both via `await import()` once and cache.
+let _protoMod = null;
+let _protoLoadPromise = null;
+
+function loadProto() {
+  if (_protoMod) return Promise.resolve(_protoMod);
+  if (_protoLoadPromise) return _protoLoadPromise;
+  _protoLoadPromise = (async () => {
+    const protobuf = require('@bufbuild/protobuf');
+    const wkt = require('@bufbuild/protobuf/wkt');
+    const agent = await import('./proto/agent_pb.mjs');
+    _protoMod = { ...protobuf, wkt, agent };
+    return _protoMod;
+  })();
+  return _protoLoadPromise;
+}
+
+// Pre-warm so callers that need synchronous access (e.g. encodeValue) work.
+loadProto().catch((e) => {
+  console.error(`[cursor-agent] proto load failed: ${e.message}`);
+});
+
+// ── Frame helpers ──
+//
+// Connect protocol frame: [1-byte flags][4-byte BE length][payload]
+
+function frameConnectMessage(payload, flags = 0) {
+  const frame = Buffer.alloc(5 + payload.length);
+  frame[0] = flags;
+  frame.writeUInt32BE(payload.length, 1);
+  if (payload.length > 0) Buffer.from(payload).copy(frame, 5);
   return frame;
 }
 
-// ── Build H2 request headers (matches cursor-client.js) ──
+// Legacy export — historical callers (anthropic-tools.js used to call this)
+// passed plain JS objects. We keep the name and accept Uint8Array-or-Buffer.
+function encodeFrame(payload) {
+  if (Buffer.isBuffer(payload)) return frameConnectMessage(payload);
+  if (payload instanceof Uint8Array) return frameConnectMessage(payload);
+  // Legacy JSON-frame path — should not be reached after the proto migration
+  // but keep it as a sentinel for backwards-compat with old callers.
+  throw new Error('encodeFrame: connect+json frames are no longer supported; pass binary payload');
+}
+
+// ── Build H2 request headers ──
 function buildHeaders(token) {
   return {
     ':method': 'POST',
     ':path': '/agent.v1.AgentService/Run',
-    'content-type': 'application/connect+json',
+    'content-type': 'application/connect+proto',
     'connect-protocol-version': '1',
+    te: 'trailers',
     'authorization': `Bearer ${token.accessToken}`,
     'x-cursor-checksum': generateChecksum(token.machineId || '', token.macMachineId || ''),
     'x-cursor-client-version': config.cursor.clientVersion,
@@ -42,9 +86,6 @@ function buildHeaders(token) {
 }
 
 // ── Deterministic conversation UUID derived from a key ──
-// Format 16 bytes of SHA-256 as a v4-shaped UUID so the same convKey
-// always produces the same conversationId. Lets Cursor's server-side
-// state survive proxy restarts.
 function deterministicConversationId(convKey) {
   const hex = crypto.createHash('sha256')
     .update(`cursor-conv-id:${convKey}`)
@@ -60,273 +101,99 @@ function deterministicConversationId(convKey) {
 }
 
 // ═══════════════════════════════════════════════
-//  Minimal google.protobuf.Value codec
+//  google.protobuf.Value codec (kept for legacy callers)
 // ═══════════════════════════════════════════════
 //
-// Wire format reminder:
-//   1 (varint)         null_value
-//   2 (64-bit/fixed64) number_value (double LE)
-//   3 (length-delim)   string_value
-//   4 (varint)         bool_value
-//   5 (length-delim)   struct_value (Struct = repeated FieldsEntry)
-//   6 (length-delim)   list_value   (ListValue.values = repeated Value)
+// `anthropic-tools.js` historically called `encodeValue` to base64-encode an
+// inputSchema. After the proto migration, `anthropicToolsToMcpTools` returns
+// the raw JSON schema and we encode in `buildMcpToolDefinitions` below.
 //
-// FieldsEntry: { 1: string key, 2: Value value }
-// ListValue:   { 1: repeated Value }
+// We still keep these exports for any external callers, mapping them to the
+// new bufbuild Value codec. They throw if the proto module hasn't loaded
+// (synchronous loadProto() can't await), which won't happen because
+// loadProto() is kicked off at module load.
 
-// ── Varint encode/decode ──
-function encodeVarint(n) {
-  const out = [];
-  let v = BigInt(n);
-  while (v > 0x7fn) {
-    out.push(Number((v & 0x7fn) | 0x80n));
-    v >>= 7n;
+function _requireProto() {
+  if (!_protoMod) {
+    throw new Error('proto module not loaded yet — call await loadProto() first');
   }
-  out.push(Number(v));
-  return Buffer.from(out);
+  return _protoMod;
 }
 
-function decodeVarint(buf, offset) {
-  let result = 0n;
-  let shift = 0n;
-  let pos = offset;
-  while (pos < buf.length) {
-    const byte = buf[pos++];
-    result |= BigInt(byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) {
-      return { value: result, next: pos };
-    }
-    shift += 7n;
-    if (shift > 63n) throw new Error('varint overflow');
-  }
-  throw new Error('varint truncated');
-}
-
-// ── Field tag = (field_number << 3) | wire_type ──
-function tag(fieldNumber, wireType) {
-  return encodeVarint((fieldNumber << 3) | wireType);
-}
-
-function lenDelim(fieldNumber, payload) {
-  return Buffer.concat([tag(fieldNumber, 2), encodeVarint(payload.length), payload]);
-}
-
-// ── Encode a JS value as google.protobuf.Value bytes ──
 function encodeValue(json) {
-  if (json === null || json === undefined) {
-    // null_value, NullValue.NULL_VALUE = 0
-    return Buffer.concat([tag(1, 0), encodeVarint(0)]);
-  }
-  if (typeof json === 'boolean') {
-    return Buffer.concat([tag(4, 0), encodeVarint(json ? 1 : 0)]);
-  }
-  if (typeof json === 'number') {
-    const dbl = Buffer.alloc(8);
-    dbl.writeDoubleLE(json, 0);
-    return Buffer.concat([tag(2, 1), dbl]);
-  }
-  if (typeof json === 'string') {
-    const strBuf = Buffer.from(json, 'utf8');
-    return lenDelim(3, strBuf);
-  }
-  if (Array.isArray(json)) {
-    // ListValue: repeated Value values = 1
-    const inner = Buffer.concat(json.map((v) => lenDelim(1, encodeValue(v))));
-    return lenDelim(6, inner);
-  }
-  if (typeof json === 'object') {
-    // Struct: repeated FieldsEntry fields = 1
-    // FieldsEntry: { 1: string key, 2: Value value }
-    const entries = [];
-    for (const k of Object.keys(json)) {
-      const keyBuf = lenDelim(1, Buffer.from(k, 'utf8'));
-      const valBuf = lenDelim(2, encodeValue(json[k]));
-      const fields = Buffer.concat([keyBuf, valBuf]);
-      // Each FieldsEntry is itself the message-typed map entry under field 1 of Struct.
-      entries.push(lenDelim(1, fields));
-    }
-    return lenDelim(5, Buffer.concat(entries));
-  }
-  // Fallback — coerce to string
-  return lenDelim(3, Buffer.from(String(json), 'utf8'));
+  const { wkt, fromJson, toBinary } = _requireProto();
+  const valueMsg = fromJson(wkt.ValueSchema, json == null ? null : json);
+  return Buffer.from(toBinary(wkt.ValueSchema, valueMsg));
 }
 
-// ── Decode google.protobuf.Value bytes to a JS value ──
 function decodeValueBytes(buf) {
-  let offset = 0;
-  let result;
-  let resolved = false;
-
-  while (offset < buf.length) {
-    const t = decodeVarint(buf, offset);
-    const tagVal = Number(t.value);
-    offset = t.next;
-    const fieldNumber = tagVal >>> 3;
-    const wireType = tagVal & 0x7;
-
-    if (fieldNumber === 1 && wireType === 0) {
-      // null_value
-      const v = decodeVarint(buf, offset);
-      offset = v.next;
-      result = null;
-      resolved = true;
-    } else if (fieldNumber === 2 && wireType === 1) {
-      // number_value (double, 8 bytes LE)
-      result = buf.readDoubleLE(offset);
-      offset += 8;
-      resolved = true;
-    } else if (fieldNumber === 3 && wireType === 2) {
-      // string_value
-      const len = decodeVarint(buf, offset);
-      offset = len.next;
-      const n = Number(len.value);
-      result = buf.slice(offset, offset + n).toString('utf8');
-      offset += n;
-      resolved = true;
-    } else if (fieldNumber === 4 && wireType === 0) {
-      // bool_value
-      const v = decodeVarint(buf, offset);
-      offset = v.next;
-      result = Number(v.value) !== 0;
-      resolved = true;
-    } else if (fieldNumber === 5 && wireType === 2) {
-      // struct_value
-      const len = decodeVarint(buf, offset);
-      offset = len.next;
-      const n = Number(len.value);
-      result = decodeStructBytes(buf.slice(offset, offset + n));
-      offset += n;
-      resolved = true;
-    } else if (fieldNumber === 6 && wireType === 2) {
-      // list_value
-      const len = decodeVarint(buf, offset);
-      offset = len.next;
-      const n = Number(len.value);
-      result = decodeListBytes(buf.slice(offset, offset + n));
-      offset += n;
-      resolved = true;
-    } else {
-      // Unknown — skip per wire type
-      offset = skipField(buf, offset, wireType);
-    }
-  }
-
-  if (!resolved) return null;
-  return result;
+  const { wkt, fromBinary, toJson } = _requireProto();
+  const bytes = Buffer.isBuffer(buf) ? new Uint8Array(buf) : buf;
+  const v = fromBinary(wkt.ValueSchema, bytes);
+  return toJson(wkt.ValueSchema, v);
 }
 
-function decodeStructBytes(buf) {
-  // Struct: repeated FieldsEntry fields = 1
-  // FieldsEntry (length-delimited): { 1: string key, 2: Value value }
-  const out = {};
-  let offset = 0;
-  while (offset < buf.length) {
-    const t = decodeVarint(buf, offset);
-    offset = t.next;
-    const fieldNumber = Number(t.value) >>> 3;
-    const wireType = Number(t.value) & 0x7;
-    if (fieldNumber === 1 && wireType === 2) {
-      const len = decodeVarint(buf, offset);
-      offset = len.next;
-      const n = Number(len.value);
-      const entry = buf.slice(offset, offset + n);
-      offset += n;
-      // Parse FieldsEntry
-      let eo = 0;
-      let key = '';
-      let valBytes = null;
-      while (eo < entry.length) {
-        const et = decodeVarint(entry, eo);
-        eo = et.next;
-        const efn = Number(et.value) >>> 3;
-        const ewt = Number(et.value) & 0x7;
-        if (efn === 1 && ewt === 2) {
-          const elen = decodeVarint(entry, eo);
-          eo = elen.next;
-          const en = Number(elen.value);
-          key = entry.slice(eo, eo + en).toString('utf8');
-          eo += en;
-        } else if (efn === 2 && ewt === 2) {
-          const elen = decodeVarint(entry, eo);
-          eo = elen.next;
-          const en = Number(elen.value);
-          valBytes = entry.slice(eo, eo + en);
-          eo += en;
-        } else {
-          eo = skipField(entry, eo, ewt);
-        }
-      }
-      out[key] = valBytes ? decodeValueBytes(valBytes) : null;
-    } else {
-      offset = skipField(buf, offset, wireType);
-    }
-  }
-  return out;
-}
-
-function decodeListBytes(buf) {
-  // ListValue: repeated Value values = 1
-  const out = [];
-  let offset = 0;
-  while (offset < buf.length) {
-    const t = decodeVarint(buf, offset);
-    offset = t.next;
-    const fieldNumber = Number(t.value) >>> 3;
-    const wireType = Number(t.value) & 0x7;
-    if (fieldNumber === 1 && wireType === 2) {
-      const len = decodeVarint(buf, offset);
-      offset = len.next;
-      const n = Number(len.value);
-      const valBytes = buf.slice(offset, offset + n);
-      offset += n;
-      out.push(decodeValueBytes(valBytes));
-    } else {
-      offset = skipField(buf, offset, wireType);
-    }
-  }
-  return out;
-}
-
-function skipField(buf, offset, wireType) {
-  if (wireType === 0) {
-    return decodeVarint(buf, offset).next;
-  }
-  if (wireType === 1) return offset + 8;
-  if (wireType === 5) return offset + 4;
-  if (wireType === 2) {
-    const len = decodeVarint(buf, offset);
-    return len.next + Number(len.value);
-  }
-  throw new Error(`unsupported wire type ${wireType}`);
-}
-
-// ── Decode an mcp_args.args map into a plain JS object ──
-// Wire shape: { key: { value: "<base64 of Value bytes>" } }
+// ── Decode mcpArgs.args (Map<string, bytes>) into a plain JS object ──
 function decodeMcpArgs(argsMap) {
   const out = {};
-  if (!argsMap || typeof argsMap !== 'object') return out;
+  if (!argsMap) return out;
+  // Proto-decoded map is a plain object whose values are Uint8Array
+  if (typeof argsMap !== 'object') return out;
   for (const k of Object.keys(argsMap)) {
-    const entry = argsMap[k];
-    let b64 = null;
-    if (typeof entry === 'string') {
-      b64 = entry;
-    } else if (entry && typeof entry === 'object') {
-      b64 = entry.value || entry.bytes || entry.data || null;
-    }
-    if (!b64) {
-      out[k] = null;
+    const v = argsMap[k];
+    if (!v) { out[k] = null; continue; }
+    let bytes;
+    if (v instanceof Uint8Array) bytes = v;
+    else if (Buffer.isBuffer(v)) bytes = new Uint8Array(v);
+    else if (typeof v === 'string') {
+      // Legacy connect+json path stored values as base64 strings
+      try { bytes = new Uint8Array(Buffer.from(v, 'base64')); } catch { bytes = null; }
+    } else {
+      out[k] = v; // already a JS value
       continue;
     }
+    if (!bytes) { out[k] = null; continue; }
     try {
-      const bytes = Buffer.from(b64, 'base64');
-      try {
-        out[k] = decodeValueBytes(bytes);
-      } catch {
-        out[k] = bytes.toString('utf8');
-      }
+      out[k] = decodeValueBytes(bytes);
     } catch {
-      out[k] = null;
+      try { out[k] = Buffer.from(bytes).toString('utf8'); }
+      catch { out[k] = null; }
     }
+  }
+  return out;
+}
+
+// ═══════════════════════════════════════════════
+//  Build McpToolDefinition list for RequestContext / runRequest
+// ═══════════════════════════════════════════════
+function buildMcpToolDefinitions(mcpToolsRaw) {
+  if (!Array.isArray(mcpToolsRaw) || mcpToolsRaw.length === 0) return [];
+  const { create, fromJson, toBinary, wkt, agent } = _requireProto();
+  const out = [];
+  for (const t of mcpToolsRaw) {
+    if (!t || !t.name) continue;
+    // Two shapes are accepted:
+    //   { name, toolName, description, providerIdentifier, jsonSchema }
+    //   { name, toolName, description, providerIdentifier, inputSchema } (raw bytes)
+    let inputSchema;
+    if (t.inputSchema && (t.inputSchema instanceof Uint8Array || Buffer.isBuffer(t.inputSchema))) {
+      inputSchema = t.inputSchema instanceof Uint8Array ? t.inputSchema : new Uint8Array(t.inputSchema);
+    } else {
+      const schema = t.jsonSchema || t.input_schema || { type: 'object', properties: {}, required: [] };
+      try {
+        inputSchema = toBinary(wkt.ValueSchema, fromJson(wkt.ValueSchema, schema));
+      } catch (e) {
+        // Skip tools whose schema can't be encoded
+        continue;
+      }
+    }
+    out.push(create(agent.McpToolDefinitionSchema, {
+      name: t.name,
+      toolName: t.toolName || t.name,
+      description: t.description || '',
+      providerIdentifier: t.providerIdentifier || 'cursoride2api',
+      inputSchema,
+    }));
   }
   return out;
 }
@@ -335,43 +202,45 @@ function decodeMcpArgs(argsMap) {
 //  ExecServerMessage handling
 // ═══════════════════════════════════════════════
 
-function handleExecMessage(exec, tools, writeFrame, onMcpCall) {
-  const { id = 0, execId = '' } = exec;
+function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
+  const { create, toBinary, agent } = _requireProto();
+  const A = agent;
+  const id = execMsg.id;
+  const execId = execMsg.execId || '';
+  const msgCase = execMsg.message?.case;
+  const msgValue = execMsg.message?.value;
+
   if (process.env.CURSOR_AGENT_DEBUG) {
-    const keys = Object.keys(exec).filter(k => !['id', 'execId'].includes(k));
-    console.log(`[cursor-agent][debug] exec id=${id} execId=${execId} keys=${keys.join(',')}`);
+    console.log(`[cursor-agent][debug] exec id=${id} execId=${execId} case=${msgCase}`);
   }
 
-  if (exec.requestContextArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        requestContextResult: {
-          success: {
-            requestContext: {
-              env: {
-                operatingSystem: process.platform === 'win32' ? 'windows' : process.platform,
-                defaultShell: process.platform === 'win32' ? 'powershell' : 'bash',
-              },
-              tools: tools || [],
-              rules: [],
-              repositoryInfo: [],
-              gitRepos: [],
-              projectLayouts: [],
-              mcpInstructions: [],
-              fileContents: {},
-              customSubagents: [],
-            },
-          },
-        },
-      },
+  // ── requestContextArgs → respond with our tools + env ──
+  if (msgCase === 'requestContextArgs') {
+    const requestContext = create(A.RequestContextSchema, {
+      env: create(A.RequestContextEnvSchema, {
+        osVersion: process.platform === 'win32' ? 'windows' : process.platform,
+        shell: process.platform === 'win32' ? 'powershell' : 'bash',
+        workspacePaths: [],
+      }),
+      tools: mcpToolDefs,
+      rules: [],
+      repositoryInfo: [],
+      gitRepos: [],
+      projectLayouts: [],
+      mcpInstructions: [],
+      fileContents: {},
+      customSubagents: [],
     });
+    const result = create(A.RequestContextResultSchema, {
+      result: { case: 'success', value: create(A.RequestContextSuccessSchema, { requestContext }) },
+    });
+    sendExecClientMessage(id, execId, 'requestContextResult', result, sendBinaryFrame);
     return 'requestContext';
   }
 
-  // ── MCP tool call: bubble up to caller, do NOT respond yet ──
-  if (exec.mcpArgs) {
-    const m = exec.mcpArgs;
+  // ── mcpArgs → bubble up to caller ──
+  if (msgCase === 'mcpArgs') {
+    const m = msgValue || {};
     const args = decodeMcpArgs(m.args || {});
     const toolCallId = m.toolCallId || `tc_${Math.random().toString(36).slice(2)}`;
     const toolName = m.toolName || m.name || '';
@@ -381,152 +250,174 @@ function handleExecMessage(exec, tools, writeFrame, onMcpCall) {
 
   const REJECT_REASON = 'Tool not available; use MCP tools.';
 
-  if (exec.readArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        readResult: {
-          rejected: { path: exec.readArgs.path || '', reason: REJECT_REASON },
-        },
-      },
+  // ── Reject native Cursor tools so the model falls back to MCP ──
+  if (msgCase === 'readArgs') {
+    const result = create(A.ReadResultSchema, {
+      result: { case: 'rejected', value: create(A.ReadRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
+    sendExecClientMessage(id, execId, 'readResult', result, sendBinaryFrame);
     return 'read';
   }
-
-  if (exec.lsArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        lsResult: {
-          rejected: { path: exec.lsArgs.path || '', reason: REJECT_REASON },
-        },
-      },
+  if (msgCase === 'lsArgs') {
+    const result = create(A.LsResultSchema, {
+      result: { case: 'rejected', value: create(A.LsRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
+    sendExecClientMessage(id, execId, 'lsResult', result, sendBinaryFrame);
     return 'ls';
   }
-
-  if (exec.writeArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        writeResult: {
-          rejected: { path: exec.writeArgs.path || '', reason: REJECT_REASON },
-        },
-      },
+  if (msgCase === 'writeArgs') {
+    const result = create(A.WriteResultSchema, {
+      result: { case: 'rejected', value: create(A.WriteRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
+    sendExecClientMessage(id, execId, 'writeResult', result, sendBinaryFrame);
     return 'write';
   }
-
-  if (exec.deleteArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        deleteResult: {
-          rejected: { path: exec.deleteArgs.path || '', reason: REJECT_REASON },
-        },
-      },
+  if (msgCase === 'deleteArgs') {
+    const result = create(A.DeleteResultSchema, {
+      result: { case: 'rejected', value: create(A.DeleteRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
+    sendExecClientMessage(id, execId, 'deleteResult', result, sendBinaryFrame);
     return 'delete';
   }
-
-  if (exec.shellArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        shellResult: {
-          rejected: {
-            command: exec.shellArgs.command || '',
-            workingDirectory: exec.shellArgs.workingDirectory || '',
-            reason: REJECT_REASON,
-            isReadonly: false,
-          },
-        },
+  if (msgCase === 'shellArgs') {
+    const result = create(A.ShellResultSchema, {
+      result: {
+        case: 'rejected',
+        value: create(A.ShellRejectedSchema, {
+          command: msgValue?.command || '',
+          workingDirectory: msgValue?.workingDirectory || '',
+          reason: REJECT_REASON,
+          isReadonly: false,
+        }),
       },
     });
+    sendExecClientMessage(id, execId, 'shellResult', result, sendBinaryFrame);
     return 'shell';
   }
-
-  if (exec.shellStreamArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        // shellStreamArgs response type is `shellStream`, not `shellResult`.
-        shellStream: {
-          rejected: {
-            command: exec.shellStreamArgs.command || '',
-            workingDirectory: exec.shellStreamArgs.workingDirectory || '',
-            reason: REJECT_REASON,
-            isReadonly: false,
-          },
-        },
+  if (msgCase === 'shellStreamArgs') {
+    // shellStreamArgs response type is `shellStream`, not `shellResult`.
+    const result = create(A.ShellStreamSchema, {
+      event: {
+        case: 'rejected',
+        value: create(A.ShellRejectedSchema, {
+          command: msgValue?.command || '',
+          workingDirectory: msgValue?.workingDirectory || '',
+          reason: REJECT_REASON,
+          isReadonly: false,
+        }),
       },
     });
+    sendExecClientMessage(id, execId, 'shellStream', result, sendBinaryFrame);
     return 'shellStream';
   }
-
-  if (exec.backgroundShellSpawnArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        backgroundShellSpawnResult: {
-          rejected: {
-            command: exec.backgroundShellSpawnArgs.command || '',
-            workingDirectory: exec.backgroundShellSpawnArgs.workingDirectory || '',
-            reason: REJECT_REASON,
-            isReadonly: false,
-          },
-        },
+  if (msgCase === 'backgroundShellSpawnArgs') {
+    const result = create(A.BackgroundShellSpawnResultSchema, {
+      result: {
+        case: 'rejected',
+        value: create(A.ShellRejectedSchema, {
+          command: msgValue?.command || '',
+          workingDirectory: msgValue?.workingDirectory || '',
+          reason: REJECT_REASON,
+          isReadonly: false,
+        }),
       },
     });
+    sendExecClientMessage(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
     return 'backgroundShell';
   }
-
-  if (exec.grepArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        grepResult: { error: { error: REJECT_REASON } },
-      },
+  if (msgCase === 'grepArgs') {
+    const result = create(A.GrepResultSchema, {
+      result: { case: 'error', value: create(A.GrepErrorSchema, { error: REJECT_REASON }) },
     });
+    sendExecClientMessage(id, execId, 'grepResult', result, sendBinaryFrame);
     return 'grep';
   }
-
-  if (exec.fetchArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        fetchResult: {
-          error: { url: exec.fetchArgs.url || '', error: REJECT_REASON },
-        },
-      },
+  if (msgCase === 'fetchArgs') {
+    const result = create(A.FetchResultSchema, {
+      result: { case: 'error', value: create(A.FetchErrorSchema, { url: msgValue?.url || '', error: REJECT_REASON }) },
     });
+    sendExecClientMessage(id, execId, 'fetchResult', result, sendBinaryFrame);
     return 'fetch';
   }
-
-  if (exec.writeShellStdinArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        writeShellStdinResult: { error: { error: REJECT_REASON } },
-      },
+  if (msgCase === 'writeShellStdinArgs') {
+    const result = create(A.WriteShellStdinResultSchema, {
+      result: { case: 'error', value: create(A.WriteShellStdinErrorSchema, { error: REJECT_REASON }) },
     });
+    sendExecClientMessage(id, execId, 'writeShellStdinResult', result, sendBinaryFrame);
     return 'writeShellStdin';
   }
-
-  if (exec.diagnosticsArgs) {
-    writeFrame({
-      execClientMessage: {
-        id, execId,
-        diagnosticsResult: { diagnostics: [] },
-      },
+  if (msgCase === 'diagnosticsArgs') {
+    const result = create(A.DiagnosticsResultSchema, {
+      result: { case: 'success', value: create(A.DiagnosticsSuccessSchema, { path: msgValue?.path || '', diagnostics: [], totalDiagnostics: 0 }) },
     });
+    sendExecClientMessage(id, execId, 'diagnosticsResult', result, sendBinaryFrame);
     return 'diagnostics';
   }
 
-  // Unknown exec type — log and ignore. Sending a stray reply with the
-  // wrong field would just cause a mismatch error from Cursor.
-  console.log(`[cursor-agent] unhandled exec type for execId=${execId}`);
+  console.log(`[cursor-agent] unhandled exec case=${msgCase} execId=${execId}`);
   return 'unknown';
+}
+
+// ── Build an ExecClientMessage and send it as a binary connect frame ──
+function sendExecClientMessage(id, execId, messageCase, value, sendBinaryFrame) {
+  const { create, toBinary, agent } = _requireProto();
+  const execClient = create(agent.ExecClientMessageSchema, {
+    id, execId,
+    message: { case: messageCase, value },
+  });
+  const wrapper = create(agent.AgentClientMessageSchema, {
+    message: { case: 'execClientMessage', value: execClient },
+  });
+  sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, wrapper));
+}
+
+// ── KV server message handling (blob store handshake) ──
+function handleKvMessage(kvMsg, blobStore, sendBinaryFrame) {
+  const { create, toBinary, agent } = _requireProto();
+  const kvId = kvMsg.id;
+  const kvCase = kvMsg.message?.case;
+  const kvValue = kvMsg.message?.value || {};
+
+  if (kvCase === 'setBlobArgs') {
+    const blobId = kvValue.blobId;
+    const blobData = kvValue.blobData || new Uint8Array(0);
+    if (blobId && blobId.length > 0) {
+      blobStore.set(Buffer.from(blobId).toString('hex'), blobData);
+    }
+    if (process.env.CURSOR_AGENT_DEBUG) {
+      const idHex = blobId ? Buffer.from(blobId).toString('hex').slice(0, 24) : '';
+      console.log(`[cursor-agent][debug] kv setBlob id=${kvId} blobId=${idHex}... bytes=${blobData?.length ?? 0}`);
+    }
+    sendKvResponse(kvId, 'setBlobResult', create(agent.SetBlobResultSchema, {}), sendBinaryFrame);
+    return;
+  }
+  if (kvCase === 'getBlobArgs') {
+    const blobId = kvValue.blobId;
+    const idHex = blobId ? Buffer.from(blobId).toString('hex') : '';
+    const blobData = blobStore.get(idHex);
+    if (process.env.CURSOR_AGENT_DEBUG) {
+      console.log(`[cursor-agent][debug] kv getBlob id=${kvId} blobId=${idHex.slice(0, 24)}... found=${blobData != null}`);
+    }
+    sendKvResponse(kvId, 'getBlobResult',
+      create(agent.GetBlobResultSchema, blobData ? { blobData } : {}),
+      sendBinaryFrame);
+    return;
+  }
+  if (process.env.CURSOR_AGENT_DEBUG) {
+    console.log(`[cursor-agent][debug] kv id=${kvId} unhandled case=${kvCase}`);
+  }
+}
+
+function sendKvResponse(id, messageCase, value, sendBinaryFrame) {
+  const { create, toBinary, agent } = _requireProto();
+  const kvClient = create(agent.KvClientMessageSchema, {
+    id,
+    message: { case: messageCase, value },
+  });
+  const wrapper = create(agent.AgentClientMessageSchema, {
+    message: { case: 'kvClientMessage', value: kvClient },
+  });
+  sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, wrapper));
 }
 
 // ═══════════════════════════════════════════════
@@ -547,9 +438,6 @@ function startConversation(token, options = {}) {
     onError,
   } = options;
 
-  // ── Mutable callback slot — caller can swap callbacks across turns ──
-  // Each event handler dispatches through `currentCallbacks.<name>?.(...)` so
-  // re-binding via setCallbacks() steers later events to a fresh HTTP response.
   const currentCallbacks = {
     onTextDelta: onTextDelta || (() => {}),
     onThinkingDelta: onThinkingDelta || (() => {}),
@@ -572,61 +460,22 @@ function startConversation(token, options = {}) {
     `hasState=${!!conversationState} tools=${(tools || []).length}`
   );
 
-  let client;
-  try {
-    client = http2.connect(config.cursor.baseUrl);
-  } catch (e) {
-    currentCallbacks.onError(`Connection failed: ${e.message}`);
-    return makeDeadBridge(conversationId);
-  }
-  client.on('error', (e) => {
-    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client error: ${e.message}`);
-  });
-  client.on('close', () => {
-    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client closed`);
-  });
-  client.on('connect', () => {
-    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client connected`);
-  });
-  client.on('goaway', () => {
-    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client goaway`);
-  });
+  // We need the proto module loaded before we can encode anything.
+  // Most callers will already have it (we kicked off loadProto at import),
+  // but if not, the bridge defers connection until the load completes.
 
-  const req = client.request(buildHeaders(token));
-  req.setTimeout(config.cursor.requestTimeout);
-  if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] req created`);
-
-  let buffer = Buffer.alloc(0);
+  let client = null;
+  let req = null;
   let closed = false;
+  let connectionStarted = false;
+  // Pending writes queued before loadProto resolves
+  const pendingWrites = [];
+  let buffer = Buffer.alloc(0);
   let inputTokens = 0;
   let outputTokens = 0;
   let capturedState = null;
-  // Blob store: Cursor sends setBlobArgs to cache pieces of conversation state
-  // on our side (system prompt, user context, etc.) and may getBlobArgs them
-  // back later. We just need to play along — keyed by base64 blobId string.
+  // Blob store keyed by blobId hex string
   const blobStore = new Map();
-
-  const writeFrame = (obj) => {
-    if (closed) return;
-    try { req.write(encodeFrame(obj)); } catch { /* ignore */ }
-  };
-
-  // Heartbeat — keep firing even while we're waiting for a tool result.
-  // This is the key difference vs cursor-client.js.
-  const heartbeat = setInterval(() => {
-    writeFrame({ clientHeartbeat: {} });
-  }, config.cursor.heartbeatInterval);
-
-  function close() {
-    if (closed) return;
-    closed = true;
-    clearInterval(heartbeat);
-    try { req.end(); } catch { /* ignore */ }
-    setTimeout(() => {
-      try { req.close(); } catch { /* ignore */ }
-      try { client.close(); } catch { /* ignore */ }
-    }, 200);
-  }
 
   function fail(msg) {
     if (closed) return;
@@ -634,164 +483,117 @@ function startConversation(token, options = {}) {
     close();
   }
 
-  // ── sendToolResult: write mcpResult into the live stream ──
-  function sendToolResult(id, execId, content) {
+  function close() {
     if (closed) return;
-    let mcpResult;
-    if (typeof content === 'string') {
-      mcpResult = {
-        success: {
-          // McpToolResultContentItem.text -> McpTextContent { text }
-          content: [{ text: { text: content } }],
-          isError: false,
-        },
-      };
-    } else if (content && typeof content === 'object' && content.error) {
-      mcpResult = { error: { error: String(content.error) } };
-    } else {
-      // Coerce anything else to a string success
-      const s = content == null ? '' : (typeof content === 'string' ? content : JSON.stringify(content));
-      mcpResult = {
-        success: {
-          content: [{ text: { text: s } }],
-          isError: false,
-        },
-      };
-    }
-    console.log(`[cursor-agent] sending tool result execId=${execId} ok=${!content?.error}`);
-    writeFrame({ execClientMessage: { id, execId, mcpResult } });
+    closed = true;
+    clearInterval(heartbeat);
+    try { if (req) req.end(); } catch { /* ignore */ }
+    setTimeout(() => {
+      try { if (req) req.close(); } catch { /* ignore */ }
+      try { if (client) client.close(); } catch { /* ignore */ }
+    }, 200);
   }
 
-  // ── Frame parser: 5-byte header + JSON body ──
-  req.on('data', (chunk) => {
-    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] data chunk ${chunk.length}B`);
-    buffer = Buffer.concat([buffer, chunk]);
-    let offset = 0;
-    while (offset + 5 <= buffer.length) {
-      const len = buffer.readUInt32BE(offset + 1);
-      if (offset + 5 + len > buffer.length) break;
-      const s = buffer.slice(offset + 5, offset + 5 + len).toString('utf8');
-      offset += 5 + len;
-      let msg;
-      try { msg = JSON.parse(s); } catch { continue; }
-      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] msg keys: ${Object.keys(msg).join(',')}`);
-      handleServerMessage(msg);
-    }
-    buffer = buffer.slice(offset);
-  });
-
-  req.on('response', (headers) => {
-    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] response status=${headers[':status']}`);
-  });
-
-  req.on('end', () => {
+  // Send a binary payload as a connect frame on the H2 stream.
+  function sendBinaryFrame(payload) {
     if (closed) return;
-    // Stream closed without an explicit turnEnded — surface what we have.
-    clearInterval(heartbeat);
-    if (!closed) {
-      closed = true;
-      try { client.close(); } catch { /* ignore */ }
+    if (!req) {
+      pendingWrites.push(payload);
+      return;
     }
-  });
+    try {
+      req.write(frameConnectMessage(payload));
+    } catch (e) {
+      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] write failed: ${e.message}`);
+    }
+  }
 
-  req.on('error', (e) => fail(e.message || 'Stream error'));
-  req.on('timeout', () => fail('Request timeout'));
+  // Heartbeat — written as a binary connect frame
+  let heartbeat = null;
 
-  // ── Top-level server message dispatch ──
+  // sendToolResult: write mcpResult into the live stream
+  function sendToolResult(id, execId, content) {
+    if (closed) return;
+    const { create, toBinary, agent } = _requireProto();
+    let mcpResult;
+    if (typeof content === 'string') {
+      mcpResult = create(agent.McpResultSchema, {
+        result: {
+          case: 'success',
+          value: create(agent.McpSuccessSchema, {
+            content: [
+              create(agent.McpToolResultContentItemSchema, {
+                content: { case: 'text', value: create(agent.McpTextContentSchema, { text: content }) },
+              }),
+            ],
+            isError: false,
+          }),
+        },
+      });
+    } else if (content && typeof content === 'object' && content.error) {
+      mcpResult = create(agent.McpResultSchema, {
+        result: { case: 'error', value: create(agent.McpErrorSchema, { error: String(content.error) }) },
+      });
+    } else {
+      const s = content == null ? '' : (typeof content === 'string' ? content : JSON.stringify(content));
+      mcpResult = create(agent.McpResultSchema, {
+        result: {
+          case: 'success',
+          value: create(agent.McpSuccessSchema, {
+            content: [
+              create(agent.McpToolResultContentItemSchema, {
+                content: { case: 'text', value: create(agent.McpTextContentSchema, { text: s }) },
+              }),
+            ],
+            isError: false,
+          }),
+        },
+      });
+    }
+    console.log(`[cursor-agent] sending tool result execId=${execId} ok=${!content?.error}`);
+    sendExecClientMessage(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
+  }
+
+  // Top-level server message dispatch
   function handleServerMessage(msg) {
-    // Connect-level error envelope
-    if (msg.error) {
-      let detail = '';
-      if (msg.error.details && msg.error.details[0] && msg.error.details[0].value) {
-        try {
-          detail = Buffer.from(msg.error.details[0].value, 'base64').toString('utf8');
-        } catch { /* ignore */ }
-      }
-      fail(detail || msg.error.message || msg.error.code || 'Unknown error');
+    const msgCase = msg.message?.case;
+
+    if (msgCase === 'execServerMessage') {
+      const exec = msg.message.value;
+      const mcpToolDefs = state.mcpToolDefs;
+      handleExecMessage(exec, mcpToolDefs, sendBinaryFrame, (info) => currentCallbacks.onMcpCall(info));
       return;
     }
-
-    if (msg.execServerMessage) {
-      // Dispatch through currentCallbacks so re-binding via setCallbacks() takes effect.
-      handleExecMessage(msg.execServerMessage, tools, writeFrame, (info) => currentCallbacks.onMcpCall(info));
+    if (msgCase === 'kvServerMessage') {
+      handleKvMessage(msg.message.value, blobStore, sendBinaryFrame);
       return;
     }
+    if (msgCase === 'interactionUpdate') {
+      const iu = msg.message.value;
+      const iuCase = iu.message?.case;
+      const iuVal = iu.message?.value;
 
-    if (msg.kvServerMessage) {
-      const kv = msg.kvServerMessage;
-      const kvId = kv.id;
-
-      // setBlobArgs: Cursor is asking us to cache a blob (typically the system
-      // prompt / user context / assistant turns). Store and ACK so the model
-      // can keep streaming.
-      if (kv.setBlobArgs) {
-        const { blobId, blobData } = kv.setBlobArgs;
-        if (blobId) blobStore.set(blobId, blobData || '');
-        if (process.env.CURSOR_AGENT_DEBUG) {
-          console.log(`[cursor-agent][debug] kv setBlob id=${kvId} blobId=${(blobId || '').slice(0, 24)}... bytes=${(blobData || '').length}`);
-        }
-        writeFrame({ kvClientMessage: { id: kvId, setBlobResult: {} } });
-        return;
-      }
-
-      // getBlobArgs: Cursor is asking us to return a previously-cached blob.
-      // If we have it, return it; otherwise empty.
-      if (kv.getBlobArgs) {
-        const { blobId } = kv.getBlobArgs;
-        const blobData = blobStore.get(blobId);
-        if (process.env.CURSOR_AGENT_DEBUG) {
-          console.log(`[cursor-agent][debug] kv getBlob id=${kvId} blobId=${(blobId || '').slice(0, 24)}... found=${blobData != null}`);
-        }
-        writeFrame({
-          kvClientMessage: {
-            id: kvId,
-            getBlobResult: blobData ? { blobData } : {},
-          },
-        });
-        return;
-      }
-
-      if (process.env.CURSOR_AGENT_DEBUG) {
-        const keys = Object.keys(kv).filter(k => !['id', 'execId', 'spanContext'].includes(k));
-        console.log(`[cursor-agent][debug] kv id=${kvId} unhandled keys=${keys.join(',')}`);
-      }
-      return;
-    }
-
-    if (msg.interactionUpdate) {
-      const iu = msg.interactionUpdate;
-
-      if (iu.heartbeat !== undefined) return;
-
-      if (iu.textDelta) {
-        const t = typeof iu.textDelta === 'string'
-          ? iu.textDelta
-          : (iu.textDelta.text || iu.textDelta.delta || '');
+      if (iuCase === 'heartbeat') return;
+      if (iuCase === 'textDelta') {
+        const t = iuVal?.text || '';
         if (t) currentCallbacks.onTextDelta(t);
         return;
       }
-
-      if (iu.thinkingDelta) {
-        const t = typeof iu.thinkingDelta === 'string'
-          ? iu.thinkingDelta
-          : (iu.thinkingDelta.text || iu.thinkingDelta.delta || '');
+      if (iuCase === 'thinkingDelta') {
+        const t = iuVal?.text || '';
         if (t) currentCallbacks.onThinkingDelta(t);
         return;
       }
-
-      if (iu.thinkingCompleted) return;
-
-      if (iu.tokenDelta) {
-        const td = iu.tokenDelta;
-        if (td.tokens) outputTokens += parseInt(td.tokens, 10) || 0;
+      if (iuCase === 'thinkingCompleted') return;
+      if (iuCase === 'tokenDelta') {
+        outputTokens += iuVal?.tokens || 0;
         return;
       }
-
-      if (iu.stepCompleted) return;
-
-      if (iu.turnEnded) {
-        inputTokens = parseInt(iu.turnEnded.inputTokens || '0', 10) || 0;
-        outputTokens = parseInt(iu.turnEnded.outputTokens || String(outputTokens), 10) || outputTokens;
+      if (iuCase === 'stepCompleted' || iuCase === 'stepStarted') return;
+      if (iuCase === 'turnEnded') {
+        // Note: turnEnded message has no fields per the proto def.
+        // Token counts have been accumulated via tokenDelta and the
+        // checkpoint update.
         console.log(
           `[cursor-agent] turn ended in=${inputTokens} out=${outputTokens} ` +
           `state=${capturedState ? capturedState.length + 'B' : 'null'}`
@@ -801,103 +603,240 @@ function startConversation(token, options = {}) {
         } catch (e) {
           console.log(`[cursor-agent] onTurnEnded threw: ${e.message}`);
         }
-        // NOTE: do not auto-close here. The caller decides whether to keep the
-        // bridge alive for a follow-up turn (e.g. tool_use → tool_result) or
-        // close it. Closing here would race with sendToolResult for tool_use
-        // turns. The caller invokes bridge.close() when no tool calls remain.
         return;
       }
-
-      // Nested-message variants seen on some models
-      const m = iu.message;
-      if (m) {
-        if (m.textDelta) {
-          const t = typeof m.textDelta === 'string'
-            ? m.textDelta
-            : (m.textDelta.text || m.textDelta.delta || '');
-          if (t) currentCallbacks.onTextDelta(t);
-        }
-        if (m.thinkingDelta) {
-          const t = m.thinkingDelta.text || m.thinkingDelta.delta || '';
-          if (t) currentCallbacks.onThinkingDelta(t);
-        }
-        if (m.turnEnded) {
-          inputTokens = parseInt(m.turnEnded.inputTokens || '0', 10) || 0;
-          outputTokens = parseInt(m.turnEnded.outputTokens || String(outputTokens), 10) || outputTokens;
-          console.log(
-            `[cursor-agent] turn ended (nested) in=${inputTokens} out=${outputTokens} ` +
-            `state=${capturedState ? capturedState.length + 'B' : 'null'}`
-          );
-          try {
-            currentCallbacks.onTurnEnded({ inputTokens, outputTokens, conversationState: capturedState });
-          } catch (e) {
-            console.log(`[cursor-agent] onTurnEnded threw: ${e.message}`);
-          }
-        }
-      }
-
+      // Misc updates we don't render: toolCallStarted/Delta/Completed,
+      // partialToolCall, summary*, shellOutputDelta, userMessageAppended
       return;
     }
+    if (msgCase === 'conversationCheckpointUpdate') {
+      const stateStruct = msg.message.value;
+      if (stateStruct?.tokenDetails) {
+        // totalTokens (used) tracks input+output combined; we keep
+        // the simple in/out split based on tokenDelta + final state.
+        const used = Number(stateStruct.tokenDetails.usedTokens || 0);
+        // Treat the difference as input usage for callers that want it.
+        const probeOutput = outputTokens || 0;
+        inputTokens = Math.max(0, used - probeOutput);
+      }
+      try {
+        const { toBinary, agent } = _requireProto();
+        capturedState = Buffer.from(toBinary(agent.ConversationStateStructureSchema, stateStruct));
+      } catch (e) {
+        if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] checkpoint encode failed: ${e.message}`);
+      }
+      return;
+    }
+    if (msgCase === 'interactionQuery') return;
+    if (msgCase === 'execServerControlMessage') return;
 
-    if (msg.conversationCheckpointUpdate) {
-      const cp = msg.conversationCheckpointUpdate;
-      // Field name varies by server version; try the obvious ones.
-      const b64 = cp.state || cp.checkpoint || cp.conversationState ||
-        (cp.checkpointState && (cp.checkpointState.state || cp.checkpointState.bytes));
-      if (b64 && typeof b64 === 'string') {
+    if (process.env.CURSOR_AGENT_DEBUG) {
+      console.log(`[cursor-agent][debug] unhandled server case=${msgCase}`);
+    }
+  }
+
+  // Holds runtime state + pre-encoded mcpTools used by handleExecMessage.
+  const state = { mcpToolDefs: [] };
+
+  // Frame parser: connect frames are [flags(1)][len(4 BE)][payload].
+  function parseFrames(chunk) {
+    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] data chunk ${chunk.length}B`);
+    buffer = Buffer.concat([buffer, chunk]);
+    let offset = 0;
+    while (offset + 5 <= buffer.length) {
+      const flags = buffer[offset];
+      const len = buffer.readUInt32BE(offset + 1);
+      if (offset + 5 + len > buffer.length) break;
+      const payload = buffer.slice(offset + 5, offset + 5 + len);
+      offset += 5 + len;
+
+      if (flags & CONNECT_END_STREAM_FLAG) {
+        // Connect end-stream — payload is JSON describing trailers.
         try {
-          capturedState = Buffer.from(b64, 'base64');
-        } catch { /* ignore */ }
-      } else if (b64 && b64.type === 'Buffer' && Array.isArray(b64.data)) {
-        capturedState = Buffer.from(b64.data);
-      } else {
-        // Unknown shape — log key list once for debugging
-        const keys = Object.keys(cp).join(',');
-        console.log(`[cursor-agent] conversationCheckpointUpdate keys: ${keys}`);
+          const json = JSON.parse(payload.toString('utf8'));
+          if (json && json.error) {
+            const code = json.error.code || 'unknown';
+            const message = json.error.message || 'Unknown error';
+            fail(`Connect error ${code}: ${message}`);
+          }
+        } catch (e) {
+          if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] end-stream parse: ${e.message}`);
+        }
+        continue;
       }
+
+      try {
+        const { fromBinary, agent } = _requireProto();
+        const msg = fromBinary(agent.AgentServerMessageSchema, new Uint8Array(payload));
+        handleServerMessage(msg);
+      } catch (e) {
+        if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] decode failed: ${e.message}`);
+      }
+    }
+    buffer = buffer.slice(offset);
+  }
+
+  function startConnection(proto) {
+    if (connectionStarted) return;
+    connectionStarted = true;
+    try {
+      client = http2.connect(config.cursor.baseUrl);
+    } catch (e) {
+      currentCallbacks.onError(`Connection failed: ${e.message}`);
       return;
     }
+    client.on('error', (e) => {
+      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client error: ${e.message}`);
+    });
+    client.on('close', () => {
+      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client closed`);
+    });
+    client.on('connect', () => {
+      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client connected`);
+    });
+    client.on('goaway', () => {
+      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client goaway`);
+    });
 
-    if (msg.interactionQuery) return;
-  }
+    req = client.request(buildHeaders(token));
+    req.setTimeout(config.cursor.requestTimeout);
 
-  // ── Build and send the initial runRequest ──
-  const stateField = conversationState && Buffer.isBuffer(conversationState)
-    ? conversationState.toString('base64')
-    : (conversationState && typeof conversationState === 'string' ? conversationState : {});
+    req.on('data', parseFrames);
+    req.on('response', (headers) => {
+      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] response status=${headers[':status']}`);
+    });
+    req.on('end', () => {
+      if (closed) return;
+      clearInterval(heartbeat);
+      if (!closed) {
+        closed = true;
+        try { client.close(); } catch { /* ignore */ }
+      }
+    });
+    req.on('error', (e) => fail(e.message || 'Stream error'));
+    req.on('timeout', () => fail('Request timeout'));
 
-  const runRequestPayload = {
-    runRequest: {
-      conversationState: stateField,
+    // Heartbeat
+    heartbeat = setInterval(() => {
+      if (closed) return;
+      const { create, toBinary, agent } = proto;
+      const hb = create(agent.AgentClientMessageSchema, {
+        message: { case: 'clientHeartbeat', value: create(agent.ClientHeartbeatSchema, {}) },
+      });
+      sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, hb));
+    }, config.cursor.heartbeatInterval);
+
+    // Build mcpTools once and stash for handleExecMessage / runRequest
+    state.mcpToolDefs = buildMcpToolDefinitions(tools || []);
+
+    // Build runRequest
+    const { create, toBinary, agent } = proto;
+    let stateStruct;
+    if (conversationState) {
+      let bytes;
+      if (Buffer.isBuffer(conversationState)) bytes = new Uint8Array(conversationState);
+      else if (conversationState instanceof Uint8Array) bytes = conversationState;
+      else if (typeof conversationState === 'string') {
+        try { bytes = new Uint8Array(Buffer.from(conversationState, 'base64')); } catch { bytes = null; }
+      }
+      if (bytes && bytes.length > 0) {
+        try {
+          stateStruct = proto.fromBinary(agent.ConversationStateStructureSchema, bytes);
+        } catch (e) {
+          if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] state decode failed: ${e.message}`);
+        }
+      }
+    }
+    if (!stateStruct) {
+      stateStruct = create(agent.ConversationStateStructureSchema, {
+        rootPromptMessagesJson: [],
+        turns: [],
+        todos: [],
+        pendingToolCalls: [],
+        previousWorkspaceUris: [],
+        fileStates: {},
+        fileStatesV2: {},
+        summaryArchives: [],
+        turnTimings: [],
+        subagentStates: {},
+        selfSummaryCount: 0,
+        readPaths: [],
+      });
+    }
+
+    const userMsg = create(agent.UserMessageSchema, {
+      text: prompt,
+      messageId: uuidv4(),
+    });
+    const action = create(agent.ConversationActionSchema, {
       action: {
-        userMessageAction: {
-          userMessage: { text: prompt },
-        },
+        case: 'userMessageAction',
+        value: create(agent.UserMessageActionSchema, { userMessage: userMsg }),
       },
-      modelDetails: {
-        modelId,
-        displayName: modelId,
-        displayNameShort: modelId,
-      },
-      requestedModel: { modelId },
+    });
+    // Enable Cursor max_mode when many tools are registered. Without it,
+    // Cursor's per-request context budget is too small for full Claude Code
+    // tool sets (~49 tools at ~150KB) and returns resource_exhausted.
+    const enableMaxMode = state.mcpToolDefs.length >= 8 || !!options.maxMode;
+    const modelDetails = create(agent.ModelDetailsSchema, {
+      modelId,
+      displayModelId: modelId,
+      displayName: modelId,
+      displayNameShort: modelId,
+      maxMode: enableMaxMode,
+    });
+
+    const runRequestFields = {
+      conversationState: stateStruct,
+      action,
+      modelDetails,
       conversationId,
-    },
-  };
-  // Also expose tools at the runRequest level (mcpTools) — some Cursor models
-  // appear to need this in addition to requestContext.tools to actually call them.
-  if (Array.isArray(tools) && tools.length > 0) {
-    runRequestPayload.runRequest.mcpTools = { mcpTools: tools };
+    };
+    // Tools are also exposed via runRequest.mcpTools — some Cursor models
+    // require this in addition to RequestContext.tools to actually dispatch.
+    if (state.mcpToolDefs.length > 0) {
+      runRequestFields.mcpTools = create(agent.McpToolsSchema, { mcpTools: state.mcpToolDefs });
+    }
+    // Also enable max_mode on requestedModel to mirror modelDetails.
+    runRequestFields.requestedModel = create(agent.RequestedModelSchema, {
+      modelId,
+      maxMode: enableMaxMode,
+    });
+    if (options.customSystemPrompt) {
+      runRequestFields.customSystemPrompt = String(options.customSystemPrompt);
+    }
+    const runRequest = create(agent.AgentRunRequestSchema, runRequestFields);
+    const wrapper = create(agent.AgentClientMessageSchema, {
+      message: { case: 'runRequest', value: runRequest },
+    });
+    if (process.env.CURSOR_AGENT_DEBUG) {
+      console.log(`[cursor-agent][debug] sending runRequest tools=${state.mcpToolDefs.length}`);
+    }
+    sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, wrapper));
+
+    // Drain any frames queued before req existed
+    if (pendingWrites.length > 0) {
+      // pending writes were queued via sendBinaryFrame — but they go through req.write,
+      // so push the buffered ones now
+      const drain = pendingWrites.splice(0);
+      for (const p of drain) {
+        try { req.write(frameConnectMessage(p)); } catch { /* ignore */ }
+      }
+    }
+    if (process.env.CURSOR_AGENT_DEBUG) {
+      console.log(`[cursor-agent][debug] runRequest sent`);
+    }
   }
-  // Custom system prompt — primes the model and provides tool context.
-  if (options.customSystemPrompt) {
-    runRequestPayload.runRequest.customSystemPrompt = String(options.customSystemPrompt);
-  }
-  if (process.env.CURSOR_AGENT_DEBUG) {
-    console.log(`[cursor-agent][debug] sending runRequest: ${JSON.stringify(runRequestPayload).slice(0, 500)}`);
-  }
-  writeFrame(runRequestPayload);
-  if (process.env.CURSOR_AGENT_DEBUG) {
-    console.log(`[cursor-agent][debug] runRequest sent`);
+
+  // Kick off the connection. If the proto module isn't loaded yet (pre-warm
+  // is async), wait for it.
+  if (_protoMod) {
+    startConnection(_protoMod);
+  } else {
+    loadProto().then((proto) => {
+      if (closed) return;
+      startConnection(proto);
+    }).catch((e) => fail(`proto load failed: ${e.message}`));
   }
 
   return {
@@ -905,16 +844,6 @@ function startConversation(token, options = {}) {
     sendToolResult,
     setCallbacks,
     close,
-  };
-}
-
-// Returned when initial connect fails so callers don't NPE on .close().
-function makeDeadBridge(conversationId) {
-  return {
-    conversationId,
-    sendToolResult: () => {},
-    setCallbacks: () => {},
-    close: () => {},
   };
 }
 
@@ -926,4 +855,5 @@ module.exports = {
   deterministicConversationId,
   encodeFrame,
   buildHeaders,
+  loadProto,
 };

@@ -40,12 +40,12 @@ const config = {
     'claude-opus-4-6': 'claude-4.6-opus-max-thinking',
     // Claude 4.5 Opus
     'claude-opus-4-5': 'claude-4.5-opus-high-thinking',
-    // Claude 4.6 Sonnet
-    'claude-sonnet-4-6-20250514': 'claude-4.6-sonnet-medium-thinking',
-    'claude-sonnet-4-6': 'claude-4.6-sonnet-medium-thinking',
+    // Claude 4.6 Sonnet — non-thinking variant by default (faster, less rate-limited)
+    'claude-sonnet-4-6-20250514': 'claude-4.6-sonnet-medium',
+    'claude-sonnet-4-6': 'claude-4.6-sonnet-medium',
     // Claude 4.5 Sonnet
-    'claude-sonnet-4-5-20241022': 'claude-4.5-sonnet-thinking',
-    'claude-sonnet-4-5': 'claude-4.5-sonnet-thinking',
+    'claude-sonnet-4-5-20241022': 'claude-4.5-sonnet',
+    'claude-sonnet-4-5': 'claude-4.5-sonnet',
     // Claude 4 Sonnet
     'claude-sonnet-4-20250514': 'claude-4-sonnet-thinking',
     // Claude Haiku (no Cursor haiku, use fast alternatives)

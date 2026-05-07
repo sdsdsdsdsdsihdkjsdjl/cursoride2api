@@ -3,37 +3,39 @@
 // ═══════════════════════════════════════════════
 
 const crypto = require('crypto');
-const { encodeValue } = require('./cursor-agent');
 
 /**
- * Anthropic tool definitions → Cursor MCP tool definitions
- * 过滤无效工具，base64 编码 inputSchema (protobuf Value bytes)
+ * Anthropic tool definitions → intermediate MCP tool descriptors.
+ *
+ * Returns plain objects with the raw JSON schema; cursor-agent.js converts
+ * them into protobuf McpToolDefinition messages (encoding the schema as a
+ * google.protobuf.Value binary blob).
  */
 function anthropicToolsToMcpTools(tools, providerIdentifier) {
   if (!tools || !Array.isArray(tools) || tools.length === 0) return [];
 
   const provider = providerIdentifier || 'cursoride2api';
+  // Optional truncation to fit Cursor's per-request input budget.
+  // Set TOOL_DESC_LIMIT (chars) to trim long tool descriptions; without it,
+  // requests with full Claude Code tool sets (~150KB) hit resource_exhausted.
+  const descLimit = parseInt(process.env.TOOL_DESC_LIMIT || '0', 10);
   const out = [];
 
   for (const tool of tools) {
     if (!tool || !tool.name) continue;
 
     const schema = tool.input_schema || { type: 'object', properties: {}, required: [] };
-    let inputSchemaB64;
-    try {
-      const bytes = encodeValue(schema);
-      inputSchemaB64 = bytes.toString('base64');
-    } catch (e) {
-      // 跳过无法编码的工具
-      continue;
+    let description = tool.description || '';
+    if (descLimit > 0 && description.length > descLimit) {
+      description = description.slice(0, descLimit) + '...';
     }
 
     out.push({
       name: tool.name,
       toolName: tool.name,
-      description: tool.description || '',
+      description,
       providerIdentifier: provider,
-      inputSchema: inputSchemaB64,
+      jsonSchema: schema,
     });
   }
 

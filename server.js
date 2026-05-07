@@ -291,7 +291,6 @@ function buildTurnCallbacks(ctx) {
 
       if (isStream && !res.writableEnded) {
         res.write(anthropicConverter.buildContentBlockStartToolUse(blockIndex, anthropicToolUseId, toolName));
-        // Emit args as a single input_json_delta with the full payload.
         try {
           res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, JSON.stringify(args || {})));
         } catch {
@@ -303,28 +302,20 @@ function buildTurnCallbacks(ctx) {
       let argsPreview = '';
       try { argsPreview = JSON.stringify(args || {}).slice(0, 80); } catch { argsPreview = '{...}'; }
       console.log(`  🔧 tool call: ${toolName}(${argsPreview}) → ${anthropicToolUseId}`);
-    },
 
-    onTurnEnded: ({ inputTokens, outputTokens, conversationState: newState }) => {
-      closeOpenBlock();
+      // The Cursor stream is now paused waiting for our mcpResult — Cursor
+      // will NOT emit turnEnded until we send tool results. So when we get an
+      // mcpArgs we synthesize a turn-end with stop_reason=tool_use after a
+      // small debounce window (in case more parallel tool calls land).
+      if (turnState.toolUseFinishTimer) clearTimeout(turnState.toolUseFinishTimer);
+      turnState.toolUseFinishTimer = setTimeout(() => {
+        turnState.toolUseFinishTimer = null;
+        if (turnState.toolUseFinished) return;
+        turnState.toolUseFinished = true;
+        closeOpenBlock();
 
-      const hasTools = turnState.pendingToolCalls.length > 0;
-      const stopReason = hasTools ? 'tool_use' : 'end_turn';
-
-      // Persist the (possibly updated) checkpoint state.
-      if (newState) {
-        conversationStates.set(convKey, {
-          conversationId,
-          state: newState,
-          lastAccessMs: Date.now(),
-        });
-      }
-
-      const bridge = getBridge();
-
-      if (hasTools) {
-        // Cache the bridge so the client's follow-up POST (with tool_result
-        // blocks) can resume on the same H2 stream.
+        // Cache the bridge for the client's follow-up tool_result POST.
+        const bridge = getBridge();
         activeBridges.set(bridgeKey, {
           bridge,
           lastAccessMs: Date.now(),
@@ -335,9 +326,70 @@ function buildTurnCallbacks(ctx) {
           requestedModel,
           cursorModel,
         });
-        // DO NOT close the bridge — leave it alive for the continuation.
+
+        if (isStream) {
+          if (!res.writableEnded) {
+            res.write(anthropicConverter.buildMessageDelta('tool_use', 0));
+            res.write(anthropicConverter.buildMessageStop());
+            res.end();
+          }
+        } else if (!res.headersSent) {
+          const toolUses = turnState.pendingToolCalls.map(tc => ({
+            id: tc.anthropicToolUseId,
+            name: tc.toolName,
+            input: tc.args,
+          }));
+          res.json(anthropicConverter.buildAnthropicResponse(
+            turnState.accumulatedText,
+            requestedModel,
+            0, 0,
+            { stopReason: 'tool_use', toolUses }
+          ));
+        }
+
+        console.log(
+          `  ✅ turn ended (tool_use finalize) | toolCalls=${turnState.pendingToolCalls.length}`
+        );
+      }, 250);
+    },
+
+    onTurnEnded: ({ inputTokens, outputTokens, conversationState: newState }) => {
+      closeOpenBlock();
+
+      // Persist the (possibly updated) checkpoint state.
+      if (newState) {
+        conversationStates.set(convKey, {
+          conversationId,
+          state: newState,
+          lastAccessMs: Date.now(),
+        });
+      }
+
+      // If we already finalized this turn via the tool-use debounce, ignore
+      // (the model has paused waiting for tool results — turnEnded won't fire
+      // until we sendToolResult, but if it does we don't want to double-send).
+      if (turnState.toolUseFinished) {
+        console.log(`  (turnEnded after tool_use finalize, in=${inputTokens} out=${outputTokens})`);
+        return;
+      }
+
+      const hasTools = turnState.pendingToolCalls.length > 0;
+      const stopReason = hasTools ? 'tool_use' : 'end_turn';
+
+      const bridge = getBridge();
+
+      if (hasTools) {
+        activeBridges.set(bridgeKey, {
+          bridge,
+          lastAccessMs: Date.now(),
+          mcpTools,
+          pendingExecs: turnState.pendingToolCalls.slice(),
+          convKey,
+          conversationId,
+          requestedModel,
+          cursorModel,
+        });
       } else {
-        // No tools → we're done. Drop the bridge cache entry and close.
         activeBridges.delete(bridgeKey);
         try { bridge && bridge.close(); } catch {}
       }
@@ -368,6 +420,7 @@ function buildTurnCallbacks(ctx) {
         `stopReason=${stopReason} | toolCalls=${turnState.pendingToolCalls.length}`
       );
     },
+
 
     onError: (errMsg) => {
       console.error(`  ❌ ${errMsg}`);
@@ -530,6 +583,15 @@ async function handleFreshTurn(req, res, token, params) {
 app.post('/v1/messages', checkApiKey, async (req, res) => {
   const body = req.body || {};
   const { messages, model, system, max_tokens, stream, temperature, top_p, stop_sequences, tools } = body;
+
+  // Optional debug dump
+  if (process.env.DUMP_REQUESTS) {
+    try {
+      const dumpFile = `/tmp/v1messages-${Date.now()}-${Math.random().toString(36).slice(2,6)}.json`;
+      require('fs').writeFileSync(dumpFile, JSON.stringify(body, null, 2));
+      console.log(`  📋 dumped request to ${dumpFile} | bytes=${JSON.stringify(body).length} | tools=${(tools||[]).length} | msgs=${(messages||[]).length}`);
+    } catch (e) { /* ignore */ }
+  }
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json(anthropicConverter.buildAnthropicErrorResponse('messages is required', 'invalid_request_error'));
