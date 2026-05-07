@@ -37,10 +37,35 @@ function anthropicMessagesToPrompt(messages, system) {
     if (typeof msg.content === 'string') {
       content = msg.content;
     } else if (Array.isArray(msg.content)) {
-      content = msg.content
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n');
+      const segments = [];
+      for (const b of msg.content) {
+        if (!b || !b.type) continue;
+        if (b.type === 'text') {
+          if (b.text) segments.push(b.text);
+        } else if (b.type === 'tool_use') {
+          let argStr = '';
+          try {
+            argStr = JSON.stringify(b.input || {});
+          } catch (_) {
+            argStr = '{}';
+          }
+          segments.push(`[Tool call: ${b.name || ''}(${argStr})]`);
+        } else if (b.type === 'tool_result') {
+          let resultText = '';
+          if (typeof b.content === 'string') {
+            resultText = b.content;
+          } else if (Array.isArray(b.content)) {
+            resultText = b.content
+              .filter(c => c && c.type === 'text')
+              .map(c => c.text)
+              .join('\n');
+          }
+          segments.push(`[Tool result for ${b.tool_use_id || ''}]:\n${resultText}`);
+        } else if (b.type === 'image') {
+          segments.push('[image]');
+        }
+      }
+      content = segments.join('\n');
     }
 
     if (!content) continue;
@@ -72,15 +97,34 @@ function mapAnthropicModel(model, configMapping) {
 
 /**
  * 构建非流式 Anthropic 响应
+ *
+ * options:
+ *   - stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | 'pause_turn'
+ *   - toolUses: [{ id, name, input }, ...]
  */
-function buildAnthropicResponse(text, model, inputTokens, outputTokens) {
+function buildAnthropicResponse(text, model, inputTokens, outputTokens, options = {}) {
+  const { stopReason = 'end_turn', toolUses = [] } = options;
+
+  const content = [];
+  if (text) {
+    content.push({ type: 'text', text: text });
+  }
+  for (const tu of toolUses) {
+    content.push({
+      type: 'tool_use',
+      id: tu.id,
+      name: tu.name,
+      input: tu.input,
+    });
+  }
+
   return {
     id: `msg_${uuidv4()}`,
     type: 'message',
     role: 'assistant',
-    content: [{ type: 'text', text: text }],
+    content,
     model: model,
-    stop_reason: 'end_turn',
+    stop_reason: stopReason,
     stop_sequence: null,
     usage: {
       input_tokens: inputTokens || 0,
@@ -157,6 +201,58 @@ function buildContentBlockDelta(index, text) {
 }
 
 /**
+ * content_block_start 事件 (tool_use)
+ */
+function buildContentBlockStartToolUse(index, toolUseId, toolName) {
+  return formatSSE('content_block_start', {
+    type: 'content_block_start',
+    index: index,
+    content_block: {
+      type: 'tool_use',
+      id: toolUseId,
+      name: toolName,
+      input: {},
+    },
+  });
+}
+
+/**
+ * content_block_delta 事件 (tool_use input — 增量 JSON)
+ */
+function buildContentBlockDeltaInputJson(index, partialJson) {
+  return formatSSE('content_block_delta', {
+    type: 'content_block_delta',
+    index: index,
+    delta: {
+      type: 'input_json_delta',
+      partial_json: partialJson,
+    },
+  });
+}
+
+/**
+ * content_block_start 事件 (thinking)
+ */
+function buildContentBlockStartThinking(index) {
+  return formatSSE('content_block_start', {
+    type: 'content_block_start',
+    index: index,
+    content_block: { type: 'thinking', thinking: '' },
+  });
+}
+
+/**
+ * content_block_delta 事件 (thinking)
+ */
+function buildContentBlockDeltaThinking(index, text) {
+  return formatSSE('content_block_delta', {
+    type: 'content_block_delta',
+    index: index,
+    delta: { type: 'thinking_delta', thinking: text },
+  });
+}
+
+/**
  * content_block_stop 事件
  */
 function buildContentBlockStop(index) {
@@ -205,5 +301,7 @@ module.exports = {
   buildAnthropicResponse, buildAnthropicErrorResponse,
   formatSSE,
   buildMessageStart, buildContentBlockStart, buildContentBlockDelta,
+  buildContentBlockStartToolUse, buildContentBlockDeltaInputJson,
+  buildContentBlockStartThinking, buildContentBlockDeltaThinking,
   buildContentBlockStop, buildMessageDelta, buildMessageStop, buildPing,
 };
