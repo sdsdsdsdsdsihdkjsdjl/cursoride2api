@@ -19,8 +19,8 @@ const config = {
     'gpt-4-turbo': 'composer-2',
     'gpt-3.5-turbo': 'composer-1.5',
     'claude-3-opus': 'claude-4.6-opus-max-thinking',
-    'claude-3-sonnet': 'claude-4.6-sonnet-medium',
-    'claude-3.5-sonnet': 'claude-4.5-sonnet',
+    'claude-3-sonnet': 'claude-4.6-sonnet-medium-thinking',
+    'claude-3.5-sonnet': 'claude-4.5-sonnet-thinking',
     'gemini-pro': 'gemini-3.1-pro',
     // 直通
     'composer-2': 'composer-2',
@@ -30,28 +30,35 @@ const config = {
   },
 
   // 模型映射 (Anthropic model → Cursor model)
+  // 实际可用模型通过 /v1/models 查询
   anthropicModelMapping: {
-    // Claude 4.x family
+    // Claude 4.7 Opus
+    'claude-opus-4-7-20250507': 'claude-opus-4-7-thinking-max',
+    'claude-opus-4-7': 'claude-opus-4-7-thinking-max',
+    // Claude 4.6 Opus
     'claude-opus-4-20250514': 'claude-4.6-opus-max-thinking',
     'claude-opus-4-6': 'claude-4.6-opus-max-thinking',
-    'claude-sonnet-4-20250514': 'claude-4.5-sonnet',
-    'claude-sonnet-4-6': 'claude-4.5-sonnet',
+    // Claude 4.5 Opus
+    'claude-opus-4-5': 'claude-4.5-opus-high-thinking',
+    // Claude 4.6 Sonnet
+    'claude-sonnet-4-20250514': 'claude-4.6-sonnet-medium-thinking',
+    'claude-sonnet-4-6': 'claude-4.6-sonnet-medium-thinking',
+    // Claude 4.5 Sonnet
+    'claude-sonnet-4-5-20241022': 'claude-4.5-sonnet-thinking',
+    'claude-sonnet-4-5': 'claude-4.5-sonnet-thinking',
+    // Claude 4 Sonnet
+    'claude-sonnet-4-20250514': 'claude-4-sonnet-thinking',
     // Claude 3.5 family
-    'claude-3-5-sonnet-20241022': 'claude-3.5-sonnet',
-    'claude-3-5-sonnet-latest': 'claude-3.5-sonnet',
-    'claude-3-5-haiku-20241022': 'claude-3.5-haiku',
-    'claude-3-5-haiku-latest': 'claude-3.5-haiku',
+    'claude-3-5-sonnet-20241022': 'claude-4.5-sonnet',
+    'claude-3-5-sonnet-latest': 'claude-4.5-sonnet',
     // Claude 3 family
     'claude-3-opus-20240229': 'claude-4.6-opus-max-thinking',
     'claude-3-opus-latest': 'claude-4.6-opus-max-thinking',
     'claude-3-sonnet-20240229': 'claude-4.6-sonnet-medium',
-    'claude-3-haiku-20240307': 'claude-3-haiku',
-    // Claude 4.7 family
-    'claude-opus-4-7-20250507': 'claude-4.7-opus-max-thinking',
-    'claude-opus-4-7': 'claude-4.7-opus-max-thinking',
-    // Short aliases
-    'claude-opus-4': 'claude-4.7-opus-max-thinking',
-    'claude-sonnet-4': 'claude-4.5-sonnet',
+    'claude-3-haiku-20240307': 'gemini-3-flash',
+    // Short aliases (point to latest)
+    'claude-opus-4': 'claude-opus-4-7-thinking-max',
+    'claude-sonnet-4': 'claude-4.6-sonnet-medium-thinking',
   },
 };
 
