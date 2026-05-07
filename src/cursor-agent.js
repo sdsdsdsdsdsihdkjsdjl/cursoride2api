@@ -656,7 +656,27 @@ function startConversation(token, options = {}) {
           const json = JSON.parse(payload.toString('utf8'));
           if (json && json.error) {
             const code = json.error.code || 'unknown';
-            const message = json.error.message || 'Unknown error';
+            // The top-level "message" is often a generic "Error". The real
+            // detail lives under details[].debug.details.detail (Cursor's
+            // aiserver.v1.ErrorDetails wrapper). Walk the array and surface
+            // the first useful detail/error string we find.
+            let message = json.error.message || 'Unknown error';
+            const dets = Array.isArray(json.error.details) ? json.error.details : [];
+            for (const d of dets) {
+              const debug = d && d.debug;
+              if (!debug) continue;
+              const innerDetail = debug.details && (debug.details.detail || debug.details.title);
+              const innerErr = debug.error;
+              if (innerDetail) {
+                message = innerDetail + (debug.details.title && debug.details.title !== innerDetail ? ` (${debug.details.title})` : '');
+                if (innerErr && innerErr !== 'ERROR_UNKNOWN') message += ` [${innerErr}]`;
+                break;
+              }
+              if (innerErr) {
+                message = `${innerErr}`;
+                break;
+              }
+            }
             fail(`Connect error ${code}: ${message}`);
           }
         } catch (e) {
@@ -774,10 +794,11 @@ function startConversation(token, options = {}) {
         value: create(agent.UserMessageActionSchema, { userMessage: userMsg }),
       },
     });
-    // Enable Cursor max_mode when many tools are registered. Without it,
-    // Cursor's per-request context budget is too small for full Claude Code
-    // tool sets (~49 tools at ~150KB) and returns resource_exhausted.
-    const enableMaxMode = state.mcpToolDefs.length >= 8 || !!options.maxMode;
+    // maxMode opt-in only. Setting it changes Cursor's per-token billing
+    // and on some Cursor accounts triggers ERROR_PROVIDER_ERROR even for
+    // single-tool requests. Default off; users can pass options.maxMode=true
+    // when they actually need the extended budget.
+    const enableMaxMode = !!options.maxMode;
     const modelDetails = create(agent.ModelDetailsSchema, {
       modelId,
       displayModelId: modelId,
@@ -792,11 +813,12 @@ function startConversation(token, options = {}) {
       modelDetails,
       conversationId,
     };
-    // Tools are also exposed via runRequest.mcpTools — some Cursor models
-    // require this in addition to RequestContext.tools to actually dispatch.
-    if (state.mcpToolDefs.length > 0) {
-      runRequestFields.mcpTools = create(agent.McpToolsSchema, { mcpTools: state.mcpToolDefs });
-    }
+    // NOTE: tools go ONLY via RequestContext.tools (sent in
+    // requestContextResult after Cursor asks for it). We deliberately do NOT
+    // duplicate them in runRequest.mcpTools — that would double the tool
+    // payload bytes and push us over Cursor's upstream provider tool budget
+    // (~30KB schema-bytes threshold). The reference proxy
+    // (opencode-cursor) only uses RequestContext.tools.
     // Also enable max_mode on requestedModel to mirror modelDetails.
     runRequestFields.requestedModel = create(agent.RequestedModelSchema, {
       modelId,
@@ -809,10 +831,17 @@ function startConversation(token, options = {}) {
     const wrapper = create(agent.AgentClientMessageSchema, {
       message: { case: 'runRequest', value: runRequest },
     });
-    if (process.env.CURSOR_AGENT_DEBUG) {
-      console.log(`[cursor-agent][debug] sending runRequest tools=${state.mcpToolDefs.length}`);
+    // Log encoded size (helpful for tool-budget tuning).
+    const encoded = toBinary(agent.AgentClientMessageSchema, wrapper);
+    let toolBytes = 0;
+    for (const td of state.mcpToolDefs) {
+      try { toolBytes += toBinary(agent.McpToolDefinitionSchema, td).length; } catch { /* ignore */ }
     }
-    sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, wrapper));
+    console.log(
+      `[cursor-agent] runRequest tools=${state.mcpToolDefs.length} ` +
+      `toolBytes=${toolBytes} totalBytes=${encoded.length} maxMode=${enableMaxMode}`
+    );
+    sendBinaryFrame(encoded);
 
     // Drain any frames queued before req existed
     if (pendingWrites.length > 0) {

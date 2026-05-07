@@ -11,20 +11,92 @@ const crypto = require('crypto');
  * them into protobuf McpToolDefinition messages (encoding the schema as a
  * google.protobuf.Value binary blob).
  */
+// Strip per-property descriptions out of a JSON schema (in place on a clone).
+// Many Anthropic tools embed verbose LLM-targeted hints under
+// properties[].description that duplicate the top-level tool description,
+// adding kilobytes per tool. Cursor's upstream provider rejects requests
+// with too-large tool schemas (ERROR_PROVIDER_ERROR / resource_exhausted).
+function _stripSchemaDescriptions(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  // shallow clone is fine — we don't mutate child references except by
+  // replacement
+  const cloned = Array.isArray(schema) ? schema.slice() : { ...schema };
+  if (cloned.description) delete cloned.description;
+  if (cloned.properties && typeof cloned.properties === 'object') {
+    const newProps = {};
+    for (const k of Object.keys(cloned.properties)) {
+      newProps[k] = _stripSchemaDescriptions(cloned.properties[k]);
+    }
+    cloned.properties = newProps;
+  }
+  if (cloned.items) cloned.items = _stripSchemaDescriptions(cloned.items);
+  for (const key of ['oneOf', 'anyOf', 'allOf']) {
+    if (Array.isArray(cloned[key])) {
+      cloned[key] = cloned[key].map(_stripSchemaDescriptions);
+    }
+  }
+  return cloned;
+}
+
 function anthropicToolsToMcpTools(tools, providerIdentifier) {
   if (!tools || !Array.isArray(tools) || tools.length === 0) return [];
 
   const provider = providerIdentifier || 'cursoride2api';
-  // Optional truncation to fit Cursor's per-request input budget.
-  // Set TOOL_DESC_LIMIT (chars) to trim long tool descriptions; without it,
-  // requests with full Claude Code tool sets (~150KB) hit resource_exhausted.
-  const descLimit = parseInt(process.env.TOOL_DESC_LIMIT || '0', 10);
-  const out = [];
+  // Cursor's upstream provider rejects requests with too many tools
+  // (empirical threshold ~10-12 tools regardless of trimming). Two knobs:
+  //
+  //   TOOL_INCLUDE = comma-separated allowlist of tool names. If set, only
+  //   tools whose names match are forwarded. Use this to pick a workable
+  //   subset for clients with large tool sets (Claude Code ships 49 tools
+  //   alphabetically including CronCreate, Skill, Monitor, etc. that crowd
+  //   out the core editing tools).
+  //
+  //   TOOL_LIMIT = max tool count after applying TOOL_INCLUDE. Default 0
+  //   (unlimited). Useful as a hard cap when the client's allowlist is
+  //   still too large.
+  //
+  // Example: TOOL_INCLUDE="Read,Write,Edit,Bash,Glob,Grep,WebFetch" keeps
+  // just the file/shell/search core, well within Cursor's tool budget.
+  const includeEnv = (process.env.TOOL_INCLUDE || '').trim();
+  if (includeEnv) {
+    const allow = new Set(includeEnv.split(/[,\s]+/).map(s => s.trim()).filter(Boolean));
+    tools = tools.filter(t => t && t.name && allow.has(t.name));
+  }
+  const limitEnv = process.env.TOOL_LIMIT;
+  const toolLimit = limitEnv == null || limitEnv === '' ? 0 : parseInt(limitEnv, 10);
+  if (toolLimit > 0 && tools.length > toolLimit) {
+    tools = tools.slice(0, toolLimit);
+  }
+  // Description trimming. TOOL_DESC_LIMIT defaults to 600 chars — Cursor's
+  // upstream provider rejects payloads with too-large aggregate tool schema,
+  // and Claude Code's stock tool set has 4-10KB descriptions per tool.
+  // Set TOOL_DESC_LIMIT=0 to disable trimming.
+  const envLimit = process.env.TOOL_DESC_LIMIT;
+  const descLimit = envLimit === '' || envLimit == null ? 600 : parseInt(envLimit, 10);
+  // Schema trimming: when total tool-schema bytes exceed this threshold (default
+  // 30KB), strip per-property descriptions to shrink the payload further.
+  // Set TOOL_SCHEMA_TRIM_BYTES=0 to disable.
+  const schemaTrimEnv = process.env.TOOL_SCHEMA_TRIM_BYTES;
+  const schemaTrimBytes = schemaTrimEnv === '' || schemaTrimEnv == null ? 30000 : parseInt(schemaTrimEnv, 10);
 
+  // First pass — measure approximate combined schema size (to decide whether
+  // to strip property descriptions).
+  let approxSchemaBytes = 0;
+  for (const tool of tools) {
+    if (!tool || !tool.name) continue;
+    if (tool.input_schema) {
+      try { approxSchemaBytes += JSON.stringify(tool.input_schema).length; } catch { /* ignore */ }
+    }
+  }
+  const stripPropDescs = schemaTrimBytes > 0 && approxSchemaBytes > schemaTrimBytes;
+
+  const out = [];
   for (const tool of tools) {
     if (!tool || !tool.name) continue;
 
-    const schema = tool.input_schema || { type: 'object', properties: {}, required: [] };
+    let schema = tool.input_schema || { type: 'object', properties: {}, required: [] };
+    if (stripPropDescs) schema = _stripSchemaDescriptions(schema);
+
     let description = tool.description || '';
     if (descLimit > 0 && description.length > descLimit) {
       description = description.slice(0, descLimit) + '...';
