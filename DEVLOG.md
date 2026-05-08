@@ -664,6 +664,24 @@ Verified end-to-end:
 - 4-way unit test: identical-conversation continuation matches; different IP / different system / different model all diverge.
 - End-to-end: `claude -p` with tool round-trip → both requests share `convKey`, bridge cache hit, no "Bridge cache miss" warning, correct file content returned.
 
+### Auto-retry extended to `NGHTTP2_INTERNAL_ERROR` + per-pool-slot eviction
+
+User log under heavy long-session load showed `Stream closed with error code NGHTTP2_INTERNAL_ERROR` firing mid-conversation on long sessions (toolResults=320+, accumulated history ~1MB). Cursor's server seems to give up on streams that stay open too long with too much state. The error fires AFTER data has flowed, so the original REFUSED_STREAM-only retry didn't apply.
+
+Two refinements:
+
+1. **Distinguish "received data" from "emitted client-visible content"**. `hasReceivedData` tracks raw H2 bytes (which includes setup chatter — requestContextArgs, blob handshakes, heartbeats). `hasEmittedContent` is set only when we forward textDelta / thinkingDelta / mcpArgs to the client. Retry safety hinges on the latter: if no client-visible content has flowed, a fresh attempt won't produce duplicate output.
+
+2. **Add `INTERNAL_ERROR` to the retryable set**. Per H2 spec, `INTERNAL_ERROR` is a soft, server-side hiccup that's safe to retry on a fresh stream — same logic as `REFUSED_STREAM`. The retry condition is now `(!hasEmittedContent && retryAttempts < MAX) && (REFUSED_STREAM || INTERNAL_ERROR)`.
+
+3. **Per-pool-slot error tracking**. `_poolErrorCount[slot]` increments on every transient error. After 3 errors on the same slot, `reportSlotError` evicts it (nulls the slot, GC reaps the underlying client when its remaining streams drain). Sibling slots are untouched. This prevents one bad pool slot from cascading errors across many sessions.
+
+Verified:
+- Fault-injection: synthetic `NGHTTP2_INTERNAL_ERROR` on the first attempt → retry on a fresh pool slot → second attempt holds. Logs show `poisoning pool slot #0: ... INTERNAL_ERROR` and `opening pool client #1`.
+- Smoke test under real claude-code: tool round-trip completes normally; no spurious retries.
+
+What this *doesn't* fix: when a session genuinely accumulates 300+ tool_results, claude-code may still hit Cursor's per-stream limits and end up doing a fresh-turn cache-miss with a 1MB+ context re-upload. That's a client-side compaction concern (claude-code has `/compact` for it) — out of scope for the proxy.
+
 ### Auto-retry on `NGHTTP2_REFUSED_STREAM`
 
 Symptom (observed 2026-05-07): a session running alongside others died with `[Error: Stream closed with error code NGHTTP2_REFUSED_STREAM]`. Per HTTP/2 spec this code is explicitly safe to retry — the server refused the stream before processing it (typically per-connection stream limit hit, server about to GOAWAY, or transient overload).

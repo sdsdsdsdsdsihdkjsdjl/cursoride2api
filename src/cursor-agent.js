@@ -130,7 +130,12 @@ const _poolSize = (() => {
   return Number.isFinite(n) && n > 0 ? n : 3;
 })();
 const _pool = new Array(_poolSize).fill(null);
+const _poolErrorCount = new Array(_poolSize).fill(0); // recent stream-error count per slot
 let _poolCursor = 0;
+
+// Tag a client object with its pool slot so failOrRetry can find it without
+// rescanning the pool. Set by _openClient; read by reportSlotError.
+const _slotOf = new WeakMap();
 
 function _openClient(slot) {
   if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] opening pool client #${slot} → ${_baseUrl}`);
@@ -139,6 +144,7 @@ function _openClient(slot) {
   });
   c.setMaxListeners(0);
   c.unref();
+  _slotOf.set(c, slot);
   const drop = (why) => {
     if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] pool client #${slot} ${why}`);
     if (_pool[slot] === c) _pool[slot] = null;
@@ -147,7 +153,25 @@ function _openClient(slot) {
   c.on('close', () => drop('closed'));
   c.on('goaway', () => drop('goaway'));
   _pool[slot] = c;
+  _poolErrorCount[slot] = 0; // fresh slot, reset error counter
   return c;
+}
+
+// Stream-level error happened on this client. Bump its slot's error count;
+// if a slot crosses the threshold (3 errors in this session-lifetime),
+// poison it so the next request opens a fresh connection.
+const _SLOT_ERROR_THRESHOLD = 3;
+function reportSlotError(client, reason) {
+  if (!client) return;
+  const slot = _slotOf.get(client);
+  if (slot == null) return;
+  if (_pool[slot] !== client) return; // already replaced
+  _poolErrorCount[slot]++;
+  if (_poolErrorCount[slot] >= _SLOT_ERROR_THRESHOLD) {
+    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] pool slot #${slot} hit ${_poolErrorCount[slot]} errors (${reason}); evicting`);
+    _pool[slot] = null;
+    _poolErrorCount[slot] = 0;
+  }
 }
 
 // Get a client from the pool. Round-robins across all live slots; opens a
@@ -832,7 +856,12 @@ function startConversation(token, options = {}) {
     if (msgCase === 'execServerMessage') {
       const exec = msg.message.value;
       const mcpToolDefs = state.mcpToolDefs;
-      handleExecMessage(exec, mcpToolDefs, sendBinaryFrame, (info) => currentCallbacks.onMcpCall(info));
+      handleExecMessage(exec, mcpToolDefs, sendBinaryFrame, (info) => {
+        // Tool calls are user-visible content; once we forward one, retrying
+        // the stream would duplicate it for the client.
+        hasEmittedContent = true;
+        currentCallbacks.onMcpCall(info);
+      });
       return;
     }
     if (msgCase === 'kvServerMessage') {
@@ -847,12 +876,13 @@ function startConversation(token, options = {}) {
       if (iuCase === 'heartbeat') return;
       if (iuCase === 'textDelta') {
         const t = iuVal?.text || '';
-        if (t) currentCallbacks.onTextDelta(t);
+        if (t) { hasEmittedContent = true; currentCallbacks.onTextDelta(t); }
         return;
       }
       if (iuCase === 'thinkingDelta') {
         const t = iuVal?.text || '';
-        if (t) currentCallbacks.onThinkingDelta(t);
+        // Thinking is also user-visible content (claude-code renders it).
+        if (t) { hasEmittedContent = true; currentCallbacks.onThinkingDelta(t); }
         return;
       }
       if (iuCase === 'thinkingCompleted') return;
@@ -981,12 +1011,19 @@ function startConversation(token, options = {}) {
 
   // Track first-byte arrival so we know whether a stream-level error is
   // safe to retry. NGHTTP2_REFUSED_STREAM before any data = server didn't
-  // process the request, fully retryable on a fresh connection. Errors
-  // mid-stream might mean partial state — don't retry those.
+  // process the request, fully retryable on a fresh connection.
   let hasReceivedData = false;
+  // Tracks whether we've forwarded any user-visible content to the client
+  // (text / thinking / tool_use). Once true, retrying mid-stream would
+  // produce duplicate content for the client, so we don't retry past this
+  // point even on otherwise-retryable errors. Set in handleServerMessage.
+  let hasEmittedContent = false;
   let retryAttempts = 0;
   const MAX_REQUEST_RETRIES = 2;
   let cachedInitialEncoded = null;
+  // Hold the H2 client we attached to so failOrRetry / poisonSharedClient
+  // can target the specific bad pool slot without rescanning the pool.
+  let attachedClient = null;
 
   function startConnection(proto) {
     if (connectionStarted) return;
@@ -1112,6 +1149,7 @@ function startConversation(token, options = {}) {
       // many simultaneous /v1/messages calls share one TCP/TLS connection,
       // and the first request after server startup pays no handshake cost.
       client = getSharedClient();
+      attachedClient = client;
     } catch (e) {
       currentCallbacks.onError(`Connection failed: ${e.message}`);
       return;
@@ -1163,19 +1201,31 @@ function startConversation(token, options = {}) {
     }, config.cursor.heartbeatInterval);
   }
 
-  // Retry-aware error handler. Auto-retries when:
-  //   - We haven't seen any data yet (so server hasn't started processing)
-  //   - The error is REFUSED_STREAM (per H2 spec, safe to retry on fresh conn)
+  // Retry-aware error handler. Auto-retries when ALL of:
+  //   - We haven't forwarded any user-visible content to the client yet
+  //     (so a fresh attempt won't produce duplicate output)
+  //   - The error is one of the H2-spec-retryable codes:
+  //       REFUSED_STREAM   — server didn't process the request
+  //       INTERNAL_ERROR   — server hit an internal hiccup; safe to retry
+  //                          if we haven't committed output yet
   //   - We're under the retry budget
-  // Otherwise bubbles to onError as usual.
+  // Mid-stream errors (after content emitted) bubble to onError unchanged
+  // so the client can decide to retry from its end.
   function failOrRetry(proto, msg, code) {
     if (closed) return;
-    const isRefused =
+    const isTransient =
       /NGHTTP2_REFUSED_STREAM|REFUSED_STREAM/i.test(msg) ||
-      (code === 'ERR_HTTP2_STREAM_ERROR' && /REFUSED_STREAM/i.test(msg));
-    if (!hasReceivedData && retryAttempts < MAX_REQUEST_RETRIES && isRefused) {
+      /NGHTTP2_INTERNAL_ERROR|INTERNAL_ERROR/i.test(msg) ||
+      (code === 'ERR_HTTP2_STREAM_ERROR' && /REFUSED_STREAM|INTERNAL_ERROR/i.test(msg));
+
+    // Always tell the pool slot tracker about the error — it'll evict the
+    // slot once it hits the threshold, regardless of whether we retry here.
+    if (isTransient) reportSlotError(attachedClient, msg);
+
+    const safeToRetry = !hasEmittedContent && retryAttempts < MAX_REQUEST_RETRIES && isTransient;
+    if (safeToRetry) {
       retryAttempts++;
-      console.log(`[cursor-agent] retrying after ${msg} (${retryAttempts}/${MAX_REQUEST_RETRIES})`);
+      console.log(`[cursor-agent] retrying after ${msg} (${retryAttempts}/${MAX_REQUEST_RETRIES}) hasReceivedData=${hasReceivedData}`);
       poisonSharedClient(msg, client);
       // Detach from the dead stream so its trailing 'end' event doesn't
       // flip `closed = true` and short-circuit the retry. Same for the
