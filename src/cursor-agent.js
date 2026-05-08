@@ -736,8 +736,42 @@ function startConversation(token, options = {}) {
   // Blob store keyed by blobId hex string
   const blobStore = new Map();
 
+  // ── Per-stream telemetry (for failure diagnostics) ──
+  // We log a one-line `📊 stream-summary` on every stream error so we can
+  // grep for patterns: do errors cluster on a specific pool slot? at a
+  // certain age? after a certain byte count? after a certain tool count?
+  // Numbers below are deliberately cheap to update — increments/timestamps
+  // only — so they cost nothing on the hot path.
+  let streamOpenedAt = 0;            // Date.now() at attemptConnection
+  let streamBytesIn = 0;             // bytes received from req.on('data')
+  let streamBytesOut = 0;            // bytes written via sendBinaryFrame
+  let streamMcpCallCount = 0;        // count of mcpArgs received from Cursor
+  let streamSummaryEmitted = false;  // dedupe — we may pass through multiple error paths
+  function dumpStreamSummary(reason, code) {
+    if (streamSummaryEmitted) return;
+    streamSummaryEmitted = true;
+    const ageMs = streamOpenedAt ? (Date.now() - streamOpenedAt) : -1;
+    const slot = client ? _slotOf.get(client) : -1;
+    // Single grep-able line. Keep it short.
+    console.log(
+      `  📊 stream-summary ` +
+      `code=${code || 'none'} ` +
+      `slot=${slot} ` +
+      `ageMs=${ageMs} ` +
+      `bytesIn=${streamBytesIn} ` +
+      `bytesOut=${streamBytesOut} ` +
+      `mcpCalls=${streamMcpCallCount} ` +
+      `hasContent=${hasEmittedContent} ` +
+      `retries=${retryAttempts} ` +
+      `model=${modelId} ` +
+      `sid=${(sessionId || '').slice(0, 8)} ` +
+      `reason="${(reason || '').slice(0, 80)}"`
+    );
+  }
+
   function fail(msg) {
     if (closed) return;
+    dumpStreamSummary(msg, 'fail');
     currentCallbacks.onError(msg);
     close();
   }
@@ -763,7 +797,9 @@ function startConversation(token, options = {}) {
       return;
     }
     try {
-      req.write(frameConnectMessage(payload));
+      const frame = frameConnectMessage(payload);
+      req.write(frame);
+      streamBytesOut += frame.length;
     } catch (e) {
       if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] write failed: ${e.message}`);
     }
@@ -866,6 +902,7 @@ function startConversation(token, options = {}) {
         // Tool calls are user-visible content; once we forward one, retrying
         // the stream would duplicate it for the client.
         hasEmittedContent = true;
+        streamMcpCallCount++;
         currentCallbacks.onMcpCall(info);
       });
       return;
@@ -1184,9 +1221,16 @@ function startConversation(token, options = {}) {
 
     req = client.request(buildHeaders(token, sessionId));
     req.setTimeout(config.cursor.requestTimeout);
+    // Reset per-attempt telemetry. We're on a fresh stream now.
+    streamOpenedAt = Date.now();
+    streamBytesIn = 0;
+    streamBytesOut = 0;
+    streamMcpCallCount = 0;
+    streamSummaryEmitted = false;
 
     req.on('data', (chunk) => {
       hasReceivedData = true;
+      streamBytesIn += chunk.length;
       parseFrames(chunk);
     });
     req.on('response', (headers) => {
@@ -1244,10 +1288,18 @@ function startConversation(token, options = {}) {
     if (isTransient) reportSlotError(attachedClient, msg);
 
     const safeToRetry = !hasEmittedContent && retryAttempts < MAX_REQUEST_RETRIES && isTransient;
+    // Dump the per-stream summary BEFORE we decide retry vs fail. That way
+    // we see the state at every error event, including ones that succeed
+    // on retry (which would otherwise leave no breadcrumb in the log).
+    dumpStreamSummary(msg, code || 'stream-error');
     if (safeToRetry) {
       retryAttempts++;
       console.log(`[cursor-agent] retrying after ${msg} (${retryAttempts}/${MAX_REQUEST_RETRIES}) hasReceivedData=${hasReceivedData}`);
       poisonSharedClient(msg, client);
+      // Reset the dedupe flag so the NEXT error on the new stream gets its
+      // own summary line (each retry attempt has its own ageMs, byte counts,
+      // etc.; we want them logged separately).
+      streamSummaryEmitted = false;
       // Detach from the dead stream so its trailing 'end' event doesn't
       // flip `closed = true` and short-circuit the retry. Same for the
       // heartbeat — it would otherwise keep writing to the destroyed req.
