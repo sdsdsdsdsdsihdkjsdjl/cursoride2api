@@ -301,32 +301,77 @@ function extractFirstUserText(messages) {
 }
 
 /**
- * 对话级稳定哈希（基于 model + 首条 user 文本）
+ * Stable hash of the system field — used to make bridge/conv keys unique
+ * across clients that happen to share the same first user message.
  *
- * Including modelId is important: Cursor's KV blob store is per-conversation-id
- * and the conversationId we derive is model-independent only by convention.
- * Different models reference different blob hashes, so reusing the same
- * conversationId across model switches triggers "Blob not found" errors when
- * the second model tries to load the first model's state. Keying on model
- * keeps each model's conversation state isolated.
+ * Claude Code injects a per-request `x-anthropic-billing-header` block
+ * containing a unique `cch=<hash>` per turn. We strip that block so the
+ * fingerprint stays stable across continuations of the same conversation.
  */
-function deriveConversationKey(messages, modelId) {
+function _stripVolatileSystemContent(text) {
+  if (!text) return text;
+  // The billing-header block looks like:
+  //   "x-anthropic-billing-header: cc_version=...; cc_entrypoint=...; cch=<hash>;"
+  // Skip it entirely — Claude Code's per-request hash defeats stable keying.
+  if (text.startsWith('x-anthropic-billing-header')) return '';
+  return text;
+}
+
+function _systemFingerprint(system) {
+  if (!system) return '';
+  if (typeof system === 'string') {
+    return _stripVolatileSystemContent(system).slice(0, 1024);
+  }
+  if (!Array.isArray(system)) return '';
+  return system
+    .filter(b => b && typeof b.text === 'string')
+    .map(b => _stripVolatileSystemContent(b.text))
+    .filter(t => t.length > 0)
+    .join('\n')
+    .slice(0, 1024);
+}
+
+/**
+ * Stable conversation hash — used as cache key for opaque conversation
+ * checkpoint state. Keyed on (model, system, first user text, remote addr).
+ *
+ * Including modelId: Cursor's KV blob store is per-conversation-id and
+ * different models reference different blob hashes; sharing across models
+ * triggers "Blob not found" errors.
+ *
+ * Including system + remoteAddr: protects against cache collisions when two
+ * concurrent clients send the same first user text. System prompts are
+ * mostly per-client (Claude Code injects skill/env reminders that vary
+ * between users), and remoteAddr distinguishes different machines.
+ */
+function deriveConversationKey(messages, modelId, system, remoteAddr) {
   const first = extractFirstUserText(messages).slice(0, 200);
+  const sys = _systemFingerprint(system);
+  const addr = remoteAddr || '';
   return crypto
     .createHash('sha256')
-    .update('conv:' + (modelId || '') + ':' + first)
+    .update('conv:' + (modelId || '') + ':' + sys + ':' + first + ':' + addr)
     .digest('hex')
     .slice(0, 16);
 }
 
 /**
- * 桥接级稳定哈希（按 model + 首条 user 文本）
+ * Stable bridge cache key — used to find the open H2 stream when a tool_result
+ * continuation request lands. Same shape as conversation key: includes model,
+ * system fingerprint, first user text, and remote address.
+ *
+ * The 4-component hash is deliberate: stays stable across continuations of
+ * the same conversation (system + first user text + model + remoteAddr are
+ * all unchanged) but diverges across different sessions even if their first
+ * user text happens to collide (system / remoteAddr differ).
  */
-function deriveBridgeKey(modelId, messages) {
+function deriveBridgeKey(modelId, messages, system, remoteAddr) {
   const first = extractFirstUserText(messages).slice(0, 200);
+  const sys = _systemFingerprint(system);
+  const addr = remoteAddr || '';
   return crypto
     .createHash('sha256')
-    .update('bridge:' + (modelId || '') + ':' + first)
+    .update('bridge:' + (modelId || '') + ':' + sys + ':' + first + ':' + addr)
     .digest('hex')
     .slice(0, 16);
 }

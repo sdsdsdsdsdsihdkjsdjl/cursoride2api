@@ -531,7 +531,7 @@ function makeTurnState() {
 }
 
 // ── Path A: Resume the cached bridge with tool results ──
-async function handleContinuation(req, res, cached, messages, requestedModel, cursorModel, isStream) {
+async function handleContinuation(req, res, cached, messages, requestedModel, cursorModel, isStream, bridgeKey) {
   const toolResults = anthropicTools.extractToolResults(messages);
 
   if (toolResults.length === 0) {
@@ -553,7 +553,10 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
   const callbacks = buildTurnCallbacks({
     res, isStream, turnState,
     convKey: cached.convKey,
-    bridgeKey: anthropicTools.deriveBridgeKey(cursorModel, messages),
+    // Use the EXACT bridgeKey the caller computed (with system + remoteAddr
+    // already mixed in) so re-caching after another tool round-trip matches
+    // the original entry.
+    bridgeKey,
     conversationId: cached.conversationId,
     requestedModel, cursorModel,
     mcpTools: cached.mcpTools,
@@ -732,8 +735,13 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
   const cursorModel = anthropicConverter.mapAnthropicModel(effectiveModel, config.anthropicModelMapping);
   const isStream = stream === true;
 
-  const convKey = anthropicTools.deriveConversationKey(messages, cursorModel);
-  const bridgeKey = anthropicTools.deriveBridgeKey(cursorModel, messages);
+  // Salt the cache keys with the client's remote address so two concurrent
+  // sessions that happen to send the same first-user-text don't collide on
+  // the bridge cache and clobber each other's H2 streams. `req.ip` honors
+  // express trust-proxy if configured; falls back to `req.socket.remoteAddress`.
+  const remoteAddr = (req.ip || req.socket?.remoteAddress || '').toString();
+  const convKey = anthropicTools.deriveConversationKey(messages, cursorModel, system, remoteAddr);
+  const bridgeKey = anthropicTools.deriveBridgeKey(cursorModel, messages, system, remoteAddr);
   const conversationId = anthropicTools.deterministicConversationId(convKey);
 
   const isContinuation = anthropicTools.hasToolResults(messages);
@@ -760,7 +768,7 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
     if (cached) {
       cached.lastAccessMs = Date.now();
       cached.requestId = requestId;
-      return handleContinuation(req, res, cached, messages, requestedModel, cursorModel, isStream);
+      return handleContinuation(req, res, cached, messages, requestedModel, cursorModel, isStream, bridgeKey);
     }
     // Cache miss — bridge died or was evicted. Fall through to a fresh turn
     // using the full message history (system + alternations) as the prompt.
