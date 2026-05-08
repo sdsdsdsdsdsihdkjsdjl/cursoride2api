@@ -83,19 +83,18 @@ const inputSchema = toBinary(wkt.ValueSchema, fromJson(wkt.ValueSchema, jsonSche
 - `name` → goes into Cursor's wire-level tool list, shown to the upstream Anthropic provider
 - `tool_name` → echoed back in `mcpArgs.tool_name` when the model calls it
 
-Cursor IDE's MCP integration namespaces server tools as `mcp__<server>__<tool>`, so the IDE never collides with Cursor's built-in surface. **We do collide** because Anthropic SDK clients pass tools with names like `Read`, `Write`, `Bash`. Without prefixing, the upstream provider sees duplicate `Read` (Cursor's native + ours) and returns `ERROR_PROVIDER_ERROR`.
+Cursor IDE's MCP integration namespaces server tools as `mcp__<server>__<tool>`, so the IDE never collides with Cursor's built-in surface. **We do collide** because Anthropic SDK clients pass tools with names like `Read`, `Write`, `Bash`, `TodoWrite`, etc. Without prefixing, the upstream provider sees duplicates and returns `ERROR_PROVIDER_ERROR`.
+
+Cursor's full native tool list isn't documented and is bigger than initial probing suggests (we found at least: `Read`, `Write`, `Ls`, `Grep`, `Delete`, `Shell`, `Fetch`, `WebFetch`, `Glob`, `Diagnostics`, `TodoWrite`, ...). Rather than maintain a brittle blocklist, **always prefix every MCP tool's wire `name` with `mcp_`** and leave `tool_name` unchanged.
 
 Fix in `cursor-agent.js`:
 
 ```js
-const CURSOR_NATIVE_TOOL_NAMES = new Set([
-  'Read', 'Write', 'Ls', 'Grep', 'Delete', 'Shell', 'Fetch',
-  'WebFetch', 'Glob', 'Diagnostics',
-]);
-const wireName = CURSOR_NATIVE_TOOL_NAMES.has(t.name) ? 'mcp_' + t.name : t.name;
+const MCP_NAME_PREFIX = 'mcp_';
+const wireName = t.name.startsWith(MCP_NAME_PREFIX) ? t.name : MCP_NAME_PREFIX + t.name;
 out.push(create(McpToolDefinitionSchema, {
-  name: wireName,            // wire-level, must not collide
-  toolName: t.toolName || t.name,  // echoed back, keep original
+  name: wireName,                 // wire-level, mcp_-prefixed
+  toolName: t.toolName || t.name, // echoed back, original name
   ...
 }));
 ```
@@ -221,9 +220,11 @@ TOOL_INCLUDE="Read,Write,Edit,Bash,Glob,Grep,WebFetch" PORT=4141 npm start
 
 ## Verified working configurations
 
+After the always-prefix fix, **no env vars are needed** for Claude Code's full 49-tool set:
+
 ```bash
-# Server
-TOOL_INCLUDE="Read,Write,Edit,Bash,Glob,Grep,WebFetch" PORT=4141 npm start
+# Server — just start it normally
+PORT=4141 npm start
 
 # Client — Claude Code
 ANTHROPIC_BASE_URL=http://localhost:4141 claude -p \
@@ -235,6 +236,15 @@ ANTHROPIC_BASE_URL=http://localhost:4141 claude -p \
 #   claude-sonnet-4-6 (mapped to claude-4.6-sonnet-medium)
 #   claude-haiku-4-5  (mapped to composer-2-fast)
 ```
+
+Optional knobs (only needed if you have unusually large tool sets that exceed Cursor's per-request schema budget):
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `TOOL_INCLUDE` | (unset) | Allowlist by tool name |
+| `TOOL_LIMIT` | `0` (unlimited) | Hard cap on tool count |
+| `TOOL_DESC_LIMIT` | `600` chars | Truncate `description` field |
+| `TOOL_SCHEMA_TRIM_BYTES` | `30000` | Strip `properties[].description` when aggregate exceeds |
 
 For the OpenAI-compatible endpoint (no tool-use), the original `cursor-client.js` path remains:
 

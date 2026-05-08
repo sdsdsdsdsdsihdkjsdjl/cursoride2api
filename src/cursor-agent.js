@@ -168,21 +168,17 @@ function decodeMcpArgs(argsMap) {
 // ═══════════════════════════════════════════════
 // Cursor's upstream Anthropic provider rejects requests with tool-name
 // collisions between MCP tools (RequestContext.tools) and Cursor's built-in
-// tool surface (Read/Write/Grep/Delete/Shell/Glob/WebFetch — Claude Code's
-// stock names). The collision triggers ERROR_PROVIDER_ERROR /
+// tool surface. The collision triggers ERROR_PROVIDER_ERROR /
 // resource_exhausted before the model even runs.
 //
-// Empirical block-list (May 2026): if any MCP tool's `name` field equals one
-// of these, opus/sonnet calls fail. Composer / GPT models tolerate it.
-// The safe fix is to prefix `name` with `mcp_` so the upstream tool list has
-// no duplicate entries. Cursor uses the proto `name` field as the
-// upstream-facing tool name, but echoes back the original `tool_name` field
-// in mcpArgs.toolName, so the bridging logic does NOT need to translate
-// names back — only the wire-level `name` must be unique.
-const CURSOR_NATIVE_TOOL_NAMES = new Set([
-  'Read', 'Write', 'Ls', 'Grep', 'Delete', 'Shell', 'Fetch', 'WebFetch',
-  'Glob', 'Diagnostics',
-]);
+// Cursor's native list isn't documented and is bigger than initial probing
+// suggested — it includes (at least, May 2026):
+//   Read, Write, Ls, Grep, Delete, Shell, Fetch, WebFetch, Glob,
+//   Diagnostics, TodoWrite, ...
+//
+// Rather than maintain a brittle blocklist, we just prefix EVERY MCP tool's
+// wire `name` with `mcp_`. The proto `tool_name` field (and the original
+// name) is preserved for the dispatcher / for echoing back to the client.
 const MCP_NAME_PREFIX = 'mcp_';
 
 function buildMcpToolDefinitions(mcpToolsRaw) {
@@ -206,12 +202,12 @@ function buildMcpToolDefinitions(mcpToolsRaw) {
         continue;
       }
     }
-    // Always prefix `name` to avoid native-tool collisions; keep `toolName`
-    // unchanged so Cursor's mcpArgs.toolName still matches what the caller
-    // registered (no mapping table needed downstream).
-    const wireName = (CURSOR_NATIVE_TOOL_NAMES.has(t.name) || t.name.startsWith(MCP_NAME_PREFIX))
-      ? (t.name.startsWith(MCP_NAME_PREFIX) ? t.name : MCP_NAME_PREFIX + t.name)
-      : t.name;
+    // Always prefix `name` so the upstream tool list never collides with any
+    // of Cursor's built-in tool names (the list is bigger than initial probing
+    // suggested — Read/Write/Glob/Grep/WebFetch/TodoWrite/... — and undocumented).
+    // Keep `toolName` unchanged so Cursor's mcpArgs.toolName still matches the
+    // original name the caller registered (no mapping table needed downstream).
+    const wireName = t.name.startsWith(MCP_NAME_PREFIX) ? t.name : MCP_NAME_PREFIX + t.name;
     out.push(create(agent.McpToolDefinitionSchema, {
       name: wireName,
       toolName: t.toolName || t.name,
