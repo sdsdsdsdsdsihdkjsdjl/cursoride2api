@@ -120,12 +120,14 @@ function applyModelOverrides(cursorModel, opts = {}) {
   if (!cursorModel) return cursorModel;
   const { effort, thinkingType } = opts;
 
-  // thinkingType semantics:
-  //   'adaptive' (claude-code default) — model decides → use thinking variant
-  //   'enabled'                          — force thinking
-  //   'disabled' / undefined / 'none'    — no thinking
+  // thinkingType semantics — default to thinking ON. Cursor's `-thinking-`
+  // variants are strictly more capable (model still skips trivial reasoning
+  // when not needed), and claude-code never sends `disabled` from the CLI
+  // anyway, so this is the most useful default. Explicit opt-out paths:
+  //   body.thinking.type === 'disabled' / 'none'      → off
+  //   CURSOR_FORCE_THINKING=off|disabled|false|0     → off (env, wins over body)
   let wantThinking;
-  if (thinkingType == null || thinkingType === 'disabled' || thinkingType === 'none') {
+  if (thinkingType === 'disabled' || thinkingType === 'none') {
     wantThinking = false;
   } else {
     wantThinking = true;
