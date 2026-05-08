@@ -735,13 +735,18 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
   const cursorModel = anthropicConverter.mapAnthropicModel(effectiveModel, config.anthropicModelMapping);
   const isStream = stream === true;
 
-  // Salt the cache keys with the client's remote address so two concurrent
-  // sessions that happen to send the same first-user-text don't collide on
-  // the bridge cache and clobber each other's H2 streams. `req.ip` honors
-  // express trust-proxy if configured; falls back to `req.socket.remoteAddress`.
+  // Salt the cache keys with the client's remote address + remote port + tool
+  // list hash. Two concurrent sessions that happen to send the same
+  // first-user-text would otherwise collide on the bridge cache and clobber
+  // each other's H2 streams (the second's `continuation=false` overwrites the
+  // first's bridge entry; the first then routes its tool_result onto the
+  // wrong stream and hangs). `remotePort` is the cheapest distinguisher: a
+  // claude-code process keeps a single keep-alive socket, so within a session
+  // the port is stable; two concurrent processes get distinct ports.
   const remoteAddr = (req.ip || req.socket?.remoteAddress || '').toString();
-  const convKey = anthropicTools.deriveConversationKey(messages, cursorModel, system, remoteAddr);
-  const bridgeKey = anthropicTools.deriveBridgeKey(cursorModel, messages, system, remoteAddr);
+  const remotePort = req.socket?.remotePort;
+  const convKey = anthropicTools.deriveConversationKey(messages, cursorModel, system, tools, remoteAddr, remotePort);
+  const bridgeKey = anthropicTools.deriveBridgeKey(cursorModel, messages, system, tools, remoteAddr, remotePort);
   const conversationId = anthropicTools.deterministicConversationId(convKey);
 
   const isContinuation = anthropicTools.hasToolResults(messages);

@@ -332,46 +332,65 @@ function _systemFingerprint(system) {
 }
 
 /**
- * Stable conversation hash — used as cache key for opaque conversation
- * checkpoint state. Keyed on (model, system, first user text, remote addr).
- *
- * Including modelId: Cursor's KV blob store is per-conversation-id and
- * different models reference different blob hashes; sharing across models
- * triggers "Blob not found" errors.
- *
- * Including system + remoteAddr: protects against cache collisions when two
- * concurrent clients send the same first user text. System prompts are
- * mostly per-client (Claude Code injects skill/env reminders that vary
- * between users), and remoteAddr distinguishes different machines.
+ * Hash a tool list down to 8 hex chars by sorted tool names. Used as a salt
+ * component so two clients with different tool sets (e.g. one with playwright
+ * MCP, one without) get distinct cache keys even if their first user text
+ * happens to match. Stable within one session — the tool list doesn't change
+ * across continuations.
  */
-function deriveConversationKey(messages, modelId, system, remoteAddr) {
+function _toolListHash(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return '';
+  const names = tools
+    .map(t => (t && typeof t.name === 'string') ? t.name : '')
+    .filter(Boolean)
+    .sort()
+    .join(',');
+  if (!names) return '';
+  return crypto.createHash('sha256').update(names).digest('hex').slice(0, 8);
+}
+
+/**
+ * Stable conversation hash — used as cache key for opaque conversation
+ * checkpoint state.
+ *
+ * Salt components, all stable across continuations of one session but
+ * varying across distinct sessions:
+ *   - modelId         — different models use different blob hashes
+ *   - system          — Claude Code injects per-client skill/env content
+ *   - first user text — first 200 chars
+ *   - remoteAddr      — distinguishes different machines
+ *   - remotePort      — distinguishes different TCP connections from the
+ *                       same machine (a claude-code process keeps a
+ *                       single keep-alive socket; two concurrent
+ *                       processes get distinct ports)
+ *   - tool-list hash  — different tool sets diverge automatically
+ */
+function deriveConversationKey(messages, modelId, system, tools, remoteAddr, remotePort) {
   const first = extractFirstUserText(messages).slice(0, 200);
   const sys = _systemFingerprint(system);
   const addr = remoteAddr || '';
+  const port = (remotePort != null && remotePort !== '') ? String(remotePort) : '';
+  const toolHash = _toolListHash(tools);
   return crypto
     .createHash('sha256')
-    .update('conv:' + (modelId || '') + ':' + sys + ':' + first + ':' + addr)
+    .update('conv:' + (modelId || '') + ':' + sys + ':' + first + ':' + addr + ':' + port + ':' + toolHash)
     .digest('hex')
     .slice(0, 16);
 }
 
 /**
  * Stable bridge cache key — used to find the open H2 stream when a tool_result
- * continuation request lands. Same shape as conversation key: includes model,
- * system fingerprint, first user text, and remote address.
- *
- * The 4-component hash is deliberate: stays stable across continuations of
- * the same conversation (system + first user text + model + remoteAddr are
- * all unchanged) but diverges across different sessions even if their first
- * user text happens to collide (system / remoteAddr differ).
+ * continuation request lands. Same salt shape as conversation key.
  */
-function deriveBridgeKey(modelId, messages, system, remoteAddr) {
+function deriveBridgeKey(modelId, messages, system, tools, remoteAddr, remotePort) {
   const first = extractFirstUserText(messages).slice(0, 200);
   const sys = _systemFingerprint(system);
   const addr = remoteAddr || '';
+  const port = (remotePort != null && remotePort !== '') ? String(remotePort) : '';
+  const toolHash = _toolListHash(tools);
   return crypto
     .createHash('sha256')
-    .update('bridge:' + (modelId || '') + ':' + sys + ':' + first + ':' + addr)
+    .update('bridge:' + (modelId || '') + ':' + sys + ':' + first + ':' + addr + ':' + port + ':' + toolHash)
     .digest('hex')
     .slice(0, 16);
 }

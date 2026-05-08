@@ -505,9 +505,35 @@ key = sha256("bridge:" + modelId + ":" + systemFingerprint + ":" + firstUserText
 - **`systemFingerprint`** = concat of `system` text blocks (Anthropic's system field). Mostly per-client (Claude Code injects skill list + env + project info that differ between users). Strips the `x-anthropic-billing-header` block first since that contains a per-request `cch=<hash>` that would otherwise change every turn and break continuation matching.
 - **`remoteAddr`** = `req.ip` (or `socket.remoteAddress`). Different machines diverge automatically. Behind a NAT this is shared, so same-machine collision is still possible if `system + firstUserText + model` all match — but Claude Code's system content (skill list, working dir, env) varies enough that real-world collisions are very rare.
 
-### Edge case that's still possible
+### Edge case fix: two sessions with identical first prompts
 
-Two Claude Code processes started in the same working directory on the same machine, with the same skill set, both sending the exact same first prompt, would collide. Mitigation if it bites you: include socket port (`req.socket.remotePort`) in the salt, accepting the cost of cache miss when the client reconnects mid-conversation.
+Two Claude Code processes started in the same working directory on the same machine, with the same skill set and same first user text (e.g., a SWE-bench-style harness running the same template across many tasks), still collided on the original 4-component hash. Symptom in the wild:
+
+- Session A is mid-tool-round-trip; its bridge is at `activeBridges[K]`
+- Session B arrives with `continuation=false` — `handleFreshTurn` `set`s a new bridge at the same `K`, **overwriting A's**
+- A's next `tool_result` POST does `activeBridges.get(K)` → gets B's stream → A writes its tool_result onto B's H2 stream
+- B's stream gets a foreign tool_result, A's real stream is orphaned waiting forever — A *appears* blocked while B happily runs
+
+Fix: extend the salt to 6 components.
+
+```js
+key = sha256("bridge:"
+  + modelId + ":"
+  + systemFingerprint + ":"
+  + firstUserText.slice(0,200) + ":"
+  + remoteAddr + ":"
+  + remotePort + ":"
+  + sortedToolNamesHash)
+```
+
+- **`remotePort`** = `req.socket.remotePort`. A claude-code process keeps a single keep-alive socket, so the port is stable within a session. Two concurrent processes get distinct ports → distinct keys → no collision.
+- **`sortedToolNamesHash`** = SHA-256 of comma-joined sorted tool names, truncated to 8 hex chars. Stable within a session (tool list doesn't change across continuations). Diverges across sessions with different tool sets (one with `mcp__playwright_*`, one without) even on the same TCP socket. Tool order doesn't matter.
+
+**Cost:** if a client's keep-alive times out and reconnects mid-conversation (e.g., undici's default 4 s `keepAliveTimeout` elapses during a long model-thinking pause), the new socket has a different port → bridge cache miss. The proxy gracefully falls through to `handleFreshTurn`, which rebuilds the conversation from the full message history. Slower than a cache hit (one extra H2 stream + context re-upload) but correct.
+
+Verified:
+- Unit test (8 cases): same client / continuation matches; different port / IP / model / tools / system all diverge; tool order is stable.
+- E2E: two parallel `claude -p` invocations with **identical** prompts on the same machine got distinct convKeys (`11eb2c30221071d5` vs `58aa770ea5201950`) and both completed cleanly. Pre-fix they would have collided.
 
 ### Verified
 
