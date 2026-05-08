@@ -70,7 +70,20 @@ function encodeFrame(payload) {
 }
 
 // ── Build H2 request headers ──
-function buildHeaders(token) {
+//
+// The reverse-engineering doc (Cursor IDE API 逆向工程文档.md §2) lists the
+// optional headers the IDE always sends. We were omitting them — `x-session-id`
+// in particular looks like Cursor's signal for "this is a different agent
+// window", and without it our proxy's concurrent claude-code sessions all
+// look like one session to Cursor's backend. Match the IDE's shape: send a
+// fresh UUID per Cursor stream as x-session-id, plus the other client-type
+// hints. All overridable via env if a deployment needs to lie about its OS.
+const _clientType = process.env.CURSOR_CLIENT_TYPE || 'ide';
+const _clientOs = process.env.CURSOR_CLIENT_OS || (process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows_nt' : 'linux');
+const _clientArch = process.env.CURSOR_CLIENT_ARCH || (process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch);
+const _clientDevice = process.env.CURSOR_CLIENT_DEVICE_TYPE || 'desktop';
+
+function buildHeaders(token, sessionId) {
   return {
     ':method': 'POST',
     ':path': '/agent.v1.AgentService/Run',
@@ -82,6 +95,15 @@ function buildHeaders(token) {
     'x-cursor-client-version': config.cursor.clientVersion,
     'x-cursor-timezone': Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
     'x-request-id': uuidv4(),
+    // Optional-but-IDE-always-sends headers. x-session-id is the load-bearing
+    // one: it uniquely identifies a Cursor stream so the backend can schedule
+    // concurrent sessions independently.
+    'x-session-id': sessionId || uuidv4(),
+    'x-ghost-mode': 'false',
+    'x-cursor-client-type': _clientType,
+    'x-cursor-client-os': _clientOs,
+    'x-cursor-client-arch': _clientArch,
+    'x-cursor-client-device-type': _clientDevice,
   };
 }
 
@@ -468,6 +490,92 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
   return 'unknown';
 }
 
+// Handle an InteractionQuery from Cursor by replying with an
+// InteractionResponse that rejects the inner query. This is the path Cursor
+// uses for native tools that aren't part of ExecServerMessage:
+// WebSearch, WebFetch, ExaSearch, ExaFetch, AskQuestion, SwitchMode.
+//
+// Without a reply the model waits forever for our response and the whole
+// turn hangs. Rejecting forces the model to fall back to the MCP-prefixed
+// equivalent we registered (e.g. `mcp_WebSearch`), which we then bubble up
+// to the client as a normal tool_use.
+function handleInteractionQuery(iq, sendBinaryFrame) {
+  const { create, toBinary, agent } = _requireProto();
+  const A = agent;
+  const id = iq.id;
+  const queryCase = iq.query?.case;
+  const REJECT_REASON = 'Tool not available; use MCP tools.';
+
+  if (process.env.CURSOR_AGENT_DEBUG) {
+    console.log(`[cursor-agent][debug] interactionQuery id=${id} case=${queryCase}`);
+  }
+
+  // Build the rejected `result` payload for each query type. The inner
+  // shape varies — some have a flat oneof, others wrap it in a *Result.
+  let resultCase, resultValue;
+  switch (queryCase) {
+    case 'webSearchRequestQuery':
+      resultCase = 'webSearchRequestResponse';
+      resultValue = create(A.WebSearchRequestResponseSchema, {
+        result: { case: 'rejected', value: create(A.WebSearchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
+      });
+      break;
+    case 'webFetchRequestQuery':
+      resultCase = 'webFetchRequestResponse';
+      resultValue = create(A.WebFetchRequestResponseSchema, {
+        result: { case: 'rejected', value: create(A.WebFetchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
+      });
+      break;
+    case 'exaSearchRequestQuery':
+      resultCase = 'exaSearchRequestResponse';
+      resultValue = create(A.ExaSearchRequestResponseSchema, {
+        result: { case: 'rejected', value: create(A.ExaSearchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
+      });
+      break;
+    case 'exaFetchRequestQuery':
+      resultCase = 'exaFetchRequestResponse';
+      resultValue = create(A.ExaFetchRequestResponseSchema, {
+        result: { case: 'rejected', value: create(A.ExaFetchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
+      });
+      break;
+    case 'switchModeRequestQuery':
+      resultCase = 'switchModeRequestResponse';
+      resultValue = create(A.SwitchModeRequestResponseSchema, {
+        result: { case: 'rejected', value: create(A.SwitchModeRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
+      });
+      break;
+    case 'askQuestionInteractionQuery':
+      // AskQuestionInteractionResponse wraps an AskQuestionResult oneof.
+      resultCase = 'askQuestionInteractionResponse';
+      resultValue = create(A.AskQuestionInteractionResponseSchema, {
+        result: create(A.AskQuestionResultSchema, {
+          result: { case: 'rejected', value: create(A.AskQuestionRejectedSchema, { reason: REJECT_REASON }) },
+        }),
+      });
+      break;
+    default:
+      // Unknown / not in our vendored proto (e.g. webFetchRequestQuery,
+      // createPlanRequestQuery, setupVmEnvironmentArgs — proto field nums
+      // 7-9 added in newer Cursor releases). Send a bare InteractionResponse
+      // with just `id` set. Cursor's server treats an unset `result` oneof
+      // as "client abandoned this request"; the model then falls back to
+      // its MCP-prefixed equivalent (e.g. `mcp_WebFetch`) which we route
+      // back to the client like any other tool_use.
+      console.log(`[cursor-agent] interactionQuery case=${queryCase} id=${id} not handled in vendored proto; abandoning so model falls back to MCP`);
+      resultCase = undefined;
+      resultValue = undefined;
+      break;
+  }
+
+  const interactionResponseFields = { id };
+  if (resultCase) interactionResponseFields.result = { case: resultCase, value: resultValue };
+  const interactionResponse = create(A.InteractionResponseSchema, interactionResponseFields);
+  const wrapper = create(A.AgentClientMessageSchema, {
+    message: { case: 'interactionResponse', value: interactionResponse },
+  });
+  sendBinaryFrame(toBinary(A.AgentClientMessageSchema, wrapper));
+}
+
 // ── Build an ExecClientMessage and send it as a binary connect frame ──
 function sendExecClientMessage(id, execId, messageCase, value, sendBinaryFrame) {
   const { create, toBinary, agent } = _requireProto();
@@ -541,6 +649,10 @@ function startConversation(token, options = {}) {
     conversationId = uuidv4(),
     conversationState = null,
     tools = [],
+    // Per-bridge UUID, sent as x-session-id so Cursor's backend can
+    // schedule concurrent claude-code sessions independently. Defaults to a
+    // fresh uuid if the caller doesn't provide one.
+    sessionId = uuidv4(),
     onTextDelta,
     onThinkingDelta,
     onMcpCall,
@@ -795,7 +907,10 @@ function startConversation(token, options = {}) {
       }
       return;
     }
-    if (msgCase === 'interactionQuery') return;
+    if (msgCase === 'interactionQuery') {
+      handleInteractionQuery(msg.message.value, sendBinaryFrame);
+      return;
+    }
     if (msgCase === 'execServerControlMessage') return;
 
     if (process.env.CURSOR_AGENT_DEBUG) {
@@ -1008,7 +1123,7 @@ function startConversation(token, options = {}) {
       heartbeat = null;
     }
 
-    req = client.request(buildHeaders(token));
+    req = client.request(buildHeaders(token, sessionId));
     req.setTimeout(config.cursor.requestTimeout);
 
     req.on('data', (chunk) => {

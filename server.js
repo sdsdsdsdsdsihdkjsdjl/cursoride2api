@@ -759,6 +759,10 @@ async function handleFreshTurn(req, res, token, params) {
     conversationId,
     conversationState,
     tools: mcpTools,
+    // Reuse the per-bridge sessionId we already minted for tool_use_id
+    // encoding: it now also serves as the IDE-style x-session-id header
+    // so Cursor's backend can schedule this stream independently.
+    sessionId,
     onTextDelta: callbacks.onTextDelta,
     onThinkingDelta: callbacks.onThinkingDelta,
     onMcpCall: callbacks.onMcpCall,

@@ -592,6 +592,48 @@ Every turn end now logs a compact `⏱` line with milestones relative to `t0` (r
 
 Previously `pickToken()` ran on every `/v1/messages` POST, including continuations that don't actually use a fresh token. Each unused call advanced `roundRobinIndex`, skewing token assignment for unrelated fresh requests. Moved the call to after continuation cache lookup so cache-hits are token-agnostic.
 
+### IDE-style request headers
+
+Per the reverse-engineering doc (Cursor IDE API 逆向工程文档.md §2), Cursor IDE always sends a set of "optional but always-present" headers we were omitting:
+
+| Header | Value |
+|---|---|
+| `x-session-id` | per-bridge UUID — same value as the one baked into our `tool_use_id` |
+| `x-ghost-mode` | `false` |
+| `x-cursor-client-type` | `ide` (override via `CURSOR_CLIENT_TYPE`) |
+| `x-cursor-client-os` | derived from `process.platform` (override via `CURSOR_CLIENT_OS`) |
+| `x-cursor-client-arch` | derived from `process.arch` (override via `CURSOR_CLIENT_ARCH`) |
+| `x-cursor-client-device-type` | `desktop` (override via `CURSOR_CLIENT_DEVICE_TYPE`) |
+
+`x-session-id` is the one we hypothesize matters most: without it, multiple concurrent claude-code sessions share the same identity from Cursor's backend perspective and may share whatever per-session scheduling buckets exist there. With it set to a fresh UUID per bridge, each session looks distinct.
+
+### `interactionQuery` handler — fixes hangs on WebSearch / WebFetch / similar
+
+Cursor uses **two** separate channels for native tool calls:
+- `ExecServerMessage` for `read/write/shell/grep/...` — we already reject these to force MCP fallback.
+- `InteractionQuery` for `WebSearch / WebFetch / ExaSearch / ExaFetch / AskQuestion / SwitchMode / ...` — we used to silently drop these (`if (msgCase === 'interactionQuery') return;`).
+
+Silently dropping caused the model to hang indefinitely waiting for our `InteractionResponse`. The whole turn would time out (90s in our test).
+
+Fix: implement `handleInteractionQuery`, mirroring the `handleExecMessage` pattern. For known query types we send `Rejected` so the model falls back to the MCP-prefixed equivalent (e.g. `mcp_WebSearch`):
+
+| Query case | Rejected via |
+|---|---|
+| `webSearchRequestQuery` | `WebSearchRequestResponse_Rejected` |
+| `webFetchRequestQuery` | (proto field 9, not in vendored proto — abandoned) |
+| `exaSearchRequestQuery` | `ExaSearchRequestResponse_Rejected` |
+| `exaFetchRequestQuery` | `ExaFetchRequestResponse_Rejected` |
+| `switchModeRequestQuery` | `SwitchModeRequestResponse_Rejected` |
+| `askQuestionInteractionQuery` | `AskQuestionRejected` |
+| _anything else_ | bare `InteractionResponse{id}` with unset `result` oneof — Cursor treats as abandoned and the model falls back |
+
+The vendored proto module is older than the proto definitions in `/tmp/cursor-tap/` so a few newer fields (notably `web_fetch_request_query`) decode as `case=undefined`. The abandoned-response fallback handles them — the model still gets unblocked and routes through MCP.
+
+Verified end-to-end:
+- WebSearch via claude-code → completes (`done`).
+- WebFetch via claude-code → completes (`page title is "Example Domain"`).
+- Three concurrent sessions (Bash + WebSearch + WebFetch) → all complete with their unique markers, 0 errors, 0 cache misses.
+
 ### Verified
 
 - 4-way unit test: identical-conversation continuation matches; different IP / different system / different model all diverge.
