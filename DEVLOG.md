@@ -284,6 +284,42 @@ Override the directory with `DEBUG_LOG_DIR=/var/log/cursoride2api`.
 
 ---
 
+## Request preprocessing & classification (ported from copilot-api)
+
+A user-prompt-vs-tool-continuation classification problem distinct from the wire-format work. Cursor bills per BiDi `AgentService.Run` stream — one stream = one fast request, regardless of how many tool round-trips happen inside. Our `activeBridges` cache already keeps the same H2 stream alive across `/v1/messages` continuations, so this is largely correct for free.
+
+But there are edge cases where Claude Code or OpenCode legitimately starts a *new* user turn that we'd rather not bill at full price. Ported from [`caozhiyuan/copilot-api`'s preprocess](https://github.com/caozhiyuan/copilot-api/blob/main/src/routes/messages/preprocess.ts):
+
+- **Compaction detection** — Claude Code's `/compact` and OpenCode's anchor-context summarizer emit a recognizable system prompt:
+  - `system` starts with *"You are a helpful AI assistant tasked with summarizing conversations"* (Claude Code) or *"You are an anchored context summarization assistant for coding sessions."* (OpenCode), OR
+  - last user message contains the `CRITICAL: Respond with TEXT ONLY` guard + the `Your task is to create a detailed summary` prompt + a `Pending Tasks:` / `Current Work:` section.
+
+  Detected as `COMPACT_REQUEST` (1) → routed to `SMALL_MODEL` (default `claude-sonnet-4-6`). Compaction summarization doesn't need full Opus reasoning; saves a fast request × N concurrent compactions.
+
+- **Compact auto-continue** — the prompt that lands AFTER a compaction summary, when the model resumes. Detected as `COMPACT_AUTO_CONTINUE` (2) but **not downgraded** (the model needs full reasoning to keep coding) — only logged, in case we want to special-case it later.
+
+- **Subagent marker** — Claude Code's `Agent` tool and OpenCode's sub-task launcher inject `<system-reminder>__SUBAGENT_MARKER__{"session_id":"...","agent_id":"...","agent_type":"..."}</system-reminder>` into the first user message of every subagent turn (the [copilot-api Claude Code plugin](https://github.com/caozhiyuan/copilot-api) does this; you'd install the same plugin to use it with us). Detected via `detectSubagentMarker()`. Default behavior: log the marker, keep the requested model. Set `SUBAGENT_USE_SMALL_MODEL=1` to downgrade subagents to `SMALL_MODEL` (good for cheap subtasks like web-search agents; not great if subagents do real coding).
+
+- **IDE tool sanitization** — Claude Code injects `mcp__ide__executeCode` and `mcp__ide__getDiagnostics` MCP tools when its IDE plugin is active, even on requests that don't need them. `mcp__ide__executeCode` (when not deferred) is dropped before forwarding so warmup/no-tool requests stay tool-less.
+
+**Env knobs**
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `SMALL_MODEL` | `claude-sonnet-4-6` | Used for compaction + (optionally) subagent + haiku-warmup-when-tools |
+| `SUBAGENT_USE_SMALL_MODEL` | unset | `1`/`true`/`yes` → also route subagent traffic to `SMALL_MODEL` |
+
+Source: `src/preprocess.js`. Server log surfaces the routing reason on each request:
+
+```
+📨 (Anthropic) claude-opus-4-7 → claude-4.6-sonnet-medium | ... | compact-request
+📨 (Anthropic) claude-opus-4-7 → claude-opus-4-7-thinking-max | ... | subagent passthrough (explore)
+```
+
+What this is NOT: **this does not reduce HTTP requests**. Claude Code still sends N+1 requests per user turn (Anthropic protocol shape). What it does is route the right *kind* of request to the right model so we're not paying full Opus for a 200-token summarization step. See "Cursor IDE has no N+1 problem" elsewhere in this doc for the architectural reason.
+
+---
+
 ## Tool-budget knobs
 
 Claude Code's stock 49 tools (~150 KB raw) work fine through the proxy now — defaults trim them under Cursor's per-request schema budget automatically. `src/anthropic-tools.js` exposes these as escape hatches for unusual cases:

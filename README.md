@@ -177,6 +177,8 @@ for chunk in resp:
 | `TOOL_LIMIT` | `0` | 工具数量上限 |
 | `TOOL_DESC_LIMIT` | `600` | 工具描述截断长度（字符） |
 | `TOOL_SCHEMA_TRIM_BYTES` | `30000` | 总 schema 超过此值则剥离 properties[].description |
+| `SMALL_MODEL` | `claude-sonnet-4-6` | 用于 compact / haiku 升级的小模型 |
+| `SUBAGENT_USE_SMALL_MODEL` | _(空)_ | `1` 时把 subagent 流量也降级到 `SMALL_MODEL` |
 
 ## 🗺️ 模型映射
 

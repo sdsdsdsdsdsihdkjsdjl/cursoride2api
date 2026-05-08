@@ -14,8 +14,17 @@ const anthropicConverter = require('./src/anthropic-converter');
 const config = require('./src/config');
 const cursorAgent = require('./src/cursor-agent');
 const anthropicTools = require('./src/anthropic-tools');
+const preprocess = require('./src/preprocess');
 const debugLog = require('./src/debug-log');
 debugLog.init();
+
+// Configurable "small model" used for warmup pings, compaction summarization,
+// and (optionally) subagent traffic — costs much less than a full Sonnet/Opus
+// turn. Default to the smallest real Claude on Cursor.
+const SMALL_MODEL = process.env.SMALL_MODEL || 'claude-sonnet-4-6';
+// Whether to also downgrade subagent traffic to SMALL_MODEL. Off by default
+// (subagents may legitimately need full reasoning capability).
+const SUBAGENT_USE_SMALL_MODEL = /^1|true|yes$/i.test(process.env.SUBAGENT_USE_SMALL_MODEL || '');
 
 // ── 配置 ──
 const PORT = parseInt(process.env.PORT || '3000');
@@ -686,16 +695,39 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
 
   const requestedModel = model || 'claude-sonnet-4-6';
 
+  // Run all preprocessing (compaction detect, subagent marker, IDE-tool
+  // sanitize) in one pass so server.js only sees a single decision object.
+  const pre = preprocess.preprocessAnthropicRequest(body);
+
   // Cursor has no Claude Haiku model. We previously routed warmup pings to
-  // `composer-2-fast` (Cursor's own Kimi-K2.5-derived Composer 2, not Claude),
-  // but that means even cheap probes returned non-Claude tokens — confusing
-  // when surfaced in logs. Always upgrade haiku to the smallest real Claude
-  // on Cursor (`claude-sonnet-4-6`). Warmup pings are tiny anyway so the cost
-  // bump is negligible, and behavior is honest: every claude-* request
-  // returns actual Claude.
+  // `composer-2-fast` (Cursor's own Kimi-K2.5 Composer 2, not Claude). All
+  // claude-haiku-* requests now upgrade to a real Claude — adjustable via
+  // SMALL_MODEL env var.
   let effectiveModel = requestedModel;
+  let routingReason = null;
   if (/^claude-haiku/i.test(requestedModel)) {
-    effectiveModel = 'claude-sonnet-4-6';
+    effectiveModel = SMALL_MODEL;
+    routingReason = 'haiku-upgrade';
+  }
+  // Compaction calls (Claude Code's /compact, OpenCode's anchor summarizer)
+  // don't need full Sonnet/Opus. Route to small model and log.
+  if (pre.compactType === preprocess.COMPACT_REQUEST) {
+    effectiveModel = SMALL_MODEL;
+    routingReason = 'compact-request';
+  } else if (pre.compactType === preprocess.COMPACT_AUTO_CONTINUE) {
+    // Auto-continue happens AFTER a compact summary lands; the model is
+    // re-attaching to the truncated history. Real model semantics matter
+    // here (it has to keep coding), so we leave the model as-is but mark it.
+    routingReason = 'compact-auto-continue';
+  }
+  // Subagent traffic — opt-in downgrade.
+  if (pre.subagentMarker) {
+    if (SUBAGENT_USE_SMALL_MODEL) {
+      effectiveModel = SMALL_MODEL;
+      routingReason = `subagent (${pre.subagentMarker.agent_type})`;
+    } else if (!routingReason) {
+      routingReason = `subagent passthrough (${pre.subagentMarker.agent_type})`;
+    }
   }
   const cursorModel = anthropicConverter.mapAnthropicModel(effectiveModel, config.anthropicModelMapping);
   const isStream = stream === true;
@@ -707,15 +739,19 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
   const isContinuation = anthropicTools.hasToolResults(messages);
 
   const requestId = uuidv4().slice(0, 8);
+  const reasonLabel = routingReason ? ` | ${routingReason}` : '';
   console.log(
     `  📨 [${new Date().toLocaleTimeString()}] (Anthropic) ${requestedModel} → ${cursorModel} | ` +
-    `stream=${isStream} | continuation=${isContinuation} | convKey=${convKey} | reqId=${requestId}`
+    `stream=${isStream} | continuation=${isContinuation} | convKey=${convKey} | reqId=${requestId}${reasonLabel}`
   );
 
   debugLog.logRequest(req, body, {
     requestId,
     requestedModel, effectiveModel, cursorModel,
     convKey, bridgeKey, isContinuation,
+    compactType: pre.compactType,
+    subagentMarker: pre.subagentMarker,
+    routingReason,
   });
 
   // Path A: continuation — caller is delivering tool_result blocks.
