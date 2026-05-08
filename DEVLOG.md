@@ -5,7 +5,7 @@ A working notebook of what we learned reverse-engineering Cursor's `agent.v1.Age
 ## TL;DR
 
 1. The proxy speaks `application/connect+proto` (binary protobuf). Connect+JSON works for simple chat but breaks tool registration silently.
-2. Cursor's upstream Anthropic provider rejects requests where any MCP tool name collides with Cursor's built-in tool surface (`Read`, `Write`, `Grep`, `Delete`, `Shell`, `Glob`, `WebFetch`, `Ls`, `Fetch`, `Diagnostics`). **Always prefix the wire-level `McpToolDefinition.name` with `mcp_`** while leaving `tool_name` unchanged.
+2. Cursor's upstream Anthropic provider rejects requests where any MCP tool name collides with Cursor's built-in agent-mode tool surface (14 confirmed names: `Read`, `Write`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `Shell`, `Delete`, `Task`, `TodoWrite`, `AskQuestion`, `ListMcpResources`, `ReadLints`, `SwitchMode`). **Always prefix the wire-level `McpToolDefinition.name` with `mcp_`** while leaving `tool_name` unchanged.
 3. Cursor's error envelope hides the real cause inside `error.details[].debug.details.detail`. Top-level `error.message` is often the literal string `"Error"`. Walk the trailer.
 4. The Cursor stream stays paused after emitting `mcpArgs` — it will NOT fire `turnEnded` until we send `mcpResult`. So when bridging to Anthropic semantics we have to *synthesize* `stop_reason=tool_use` ourselves (we use a 250 ms debounce to batch parallel tool calls).
 5. Cursor's KV blob channel must be ACKed (both `setBlobArgs` → `setBlobResult: {}` and `getBlobArgs` → `getBlobResult` with whatever we cached). Without this the model just sits there idle.
@@ -251,7 +251,7 @@ Top-level `message` is the literal string `"Error"`. Useful info is in `details[
 
 ## Tool-budget knobs
 
-Even after fixing the name collision, Claude Code's stock 49 tools (~150 KB raw, ~30 KB after our default trimming) can still trip Cursor's tool-schema budget. `src/anthropic-tools.js` exposes:
+Claude Code's stock 49 tools (~150 KB raw) work fine through the proxy now — defaults trim them under Cursor's per-request schema budget automatically. `src/anthropic-tools.js` exposes these as escape hatches for unusual cases:
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
@@ -260,11 +260,7 @@ Even after fixing the name collision, Claude Code's stock 49 tools (~150 KB raw,
 | `TOOL_DESC_LIMIT` | `600` chars | Truncate `description` field on each tool |
 | `TOOL_SCHEMA_TRIM_BYTES` | `30000` | If aggregate schema bytes exceed this, strip `properties[].description` from JSON schemas |
 
-Recommended:
-
-```bash
-TOOL_INCLUDE="Read,Write,Edit,Bash,Glob,Grep,WebFetch" PORT=4141 npm start
-```
+Defaults work for stock Claude Code; only set these if a specific client overflows the budget.
 
 ---
 
@@ -281,10 +277,11 @@ ANTHROPIC_BASE_URL=http://localhost:4141 claude -p \
   "Read test-data.txt and quote it" --model claude-opus-4-7
 # → opus calls Read → claude code executes → opus quotes the actual file content
 
-# Verified models with tools:
-#   claude-opus-4-7   (mapped to claude-opus-4-7-thinking-max)
-#   claude-sonnet-4-6 (mapped to claude-4.6-sonnet-medium)
-#   claude-haiku-4-5  (mapped to composer-2-fast)
+# Verified models with tools (full claude -p tool-use round-trip):
+#   claude-opus-4-7    → claude-opus-4-7-thinking-max
+#   claude-sonnet-4-6  → claude-4.6-sonnet-medium
+#   claude-haiku-4-5   → claude-4.6-sonnet-medium  (auto-upgrade when tools present)
+#   claude-haiku-4-5   → composer-2-fast           (warmup ping, no tools — keeps cheap)
 ```
 
 Optional knobs (only needed if you have unusually large tool sets that exceed Cursor's per-request schema budget):
@@ -344,13 +341,27 @@ Cursor has **no Claude Haiku model** — `/v1/models` returns 0 matches for "hai
 This matters: when a "haiku" request reaches the proxy, the user expects Claude tokenizer/grammar/billing. We were silently substituting Kimi K2.5. Earlier "tool use works for haiku" tests were actually proving Kimi+Cursor's MCP layer works — telling us nothing about real Claude Haiku.
 
 **Current strategy** (after the fix):
-- Detect Claude Code's startup warmup ping (no tools, max_tokens ≤ 16, single user message) and let it route to `composer-2-fast` for cheapness — that's what copilot-api does too.
-- Real `claude-haiku-*` requests with tools or non-trivial bodies upgrade to `claude-sonnet-4-6` (smallest real Claude on Cursor).
+- Bare `claude-haiku-*` requests **with no tools** (Claude Code's startup warmup ping) keep going to `composer-2-fast` for cheapness — that's what copilot-api does too. Behavior is non-Claude but it's just a "hello" probe so it doesn't matter.
+- `claude-haiku-*` requests **with tools** transparently upgrade to `claude-sonnet-4-6` (smallest real Claude on Cursor) so the client gets actual Claude semantics.
+
+The user-facing model name in the response is preserved as whatever the client requested (e.g., `"model":"claude-haiku-4-5"` in the response even though the underlying upstream is sonnet). This keeps clients that key on the model id happy.
+
+## Conversation/bridge cache keys
+
+We maintain two in-memory caches on the proxy:
+
+- `conversationStates` keyed by `convKey = sha256("conv:" + modelId + ":" + firstUserText.slice(0,200))` — stores the opaque protobuf checkpoint Cursor sends back via `conversationCheckpointUpdate`. Used to resume a conversation across HTTP request boundaries.
+- `activeBridges` keyed by `bridgeKey = sha256("bridge:" + modelId + ":" + firstUserText.slice(0,200))` — stores the open H2 stream + pending exec list. Used to route `tool_result` follow-ups back to the same Cursor stream.
+
+**Both keys include `modelId`.** Earlier we made `convKey` model-independent and immediately hit `Connect error internal: Blob not found`: switching from opus to sonnet would replay opus's checkpoint blobs into a sonnet conversation, which Cursor's blob store doesn't have under that conversationId. Including modelId isolates each model's state and fixes the issue.
+
+Both caches expire after 30 minutes of inactivity. There's no eviction on graceful turn end except when there are no pending tool calls — bridges with pending tool results are kept alive for the client's continuation POST.
+
+---
 
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
-- **Stale `Blob not found`**: When the same `convKey` is reused across model switches (e.g., haiku → opus), Cursor sometimes returns "Blob not found" because the previous-model blob expired upstream. We should evict the conversation cache on model change, not just on TTL.
 - **Parallel tool calls**: The 250 ms debounce on `mcpArgs` is a heuristic. For models that call many tools in parallel (Claude can issue 5+ in one turn), this could miss some. Consider replacing with a more explicit signal — `interactionUpdate.toolCallStarted` arrives before `mcpArgs` and could be used to pre-arm the debounce.
 - **`anthropic-beta` header forwarding**: copilot-api passes through specific betas (`interleaved-thinking-2025-05-14`, `context-management-2025-06-27`, `advanced-tool-use-2025-11-20`). We currently ignore them. Some Claude features may not work without them.
 - **Cursor IDE's exact wire format**: We never did a side-by-side comparison of an actual Cursor-IDE-generated request vs. ours, only reasoned from the proto definitions and the working reference. If something breaks after a Cursor update, capture a real IDE request via mitmproxy and diff against `agent_pb.mjs`.
