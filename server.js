@@ -356,14 +356,15 @@ function buildTurnCallbacks(ctx) {
     onTurnEnded: ({ inputTokens, outputTokens, conversationState: newState }) => {
       closeOpenBlock();
 
-      // Persist the (possibly updated) checkpoint state.
-      if (newState) {
-        conversationStates.set(convKey, {
-          conversationId,
-          state: newState,
-          lastAccessMs: Date.now(),
-        });
-      }
+      // NOTE: we deliberately do NOT cache `newState` to conversationStates
+      // anymore. Empirically, Cursor's KV blob store appears to be scoped
+      // per-H2-stream — replaying a saved checkpoint on a fresh stream
+      // triggers `Connect error internal: Blob not found` because the
+      // referenced blobs only existed in the closed stream. Each fresh
+      // /v1/messages request starts with empty state; Cursor rebuilds its
+      // blob store from setBlobArgs and the client re-supplies the message
+      // history anyway. The conversationStates Map is kept for the future
+      // case where we share an H2 client across requests.
 
       // If we already finalized this turn via the tool-use debounce, ignore
       // (the model has paused waiting for tool results — turnEnded won't fire
@@ -554,8 +555,9 @@ async function handleFreshTurn(req, res, token, params) {
   const prompt = anthropicConverter.anthropicMessagesToPrompt(messages, system);
   const mcpTools = anthropicTools.anthropicToolsToMcpTools(tools, 'cursoride2api');
 
-  const stateEntry = conversationStates.get(convKey);
-  const conversationState = stateEntry ? stateEntry.state : null;
+  // Do NOT load cached state — see onTurnEnded note. Cursor's blob store is
+  // per-H2-stream and replaying a stale checkpoint triggers Blob not found.
+  const conversationState = null;
 
   if (isStream) {
     setSSEHeaders(res);

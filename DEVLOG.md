@@ -346,16 +346,16 @@ This matters: when a "haiku" request reaches the proxy, the user expects Claude 
 
 The user-facing model name in the response is preserved as whatever the client requested (e.g., `"model":"claude-haiku-4-5"` in the response even though the underlying upstream is sonnet). This keeps clients that key on the model id happy.
 
-## Conversation/bridge cache keys
+## Conversation/bridge cache: state is per-stream, NOT per-conversation
 
 We maintain two in-memory caches on the proxy:
 
-- `conversationStates` keyed by `convKey = sha256("conv:" + modelId + ":" + firstUserText.slice(0,200))` — stores the opaque protobuf checkpoint Cursor sends back via `conversationCheckpointUpdate`. Used to resume a conversation across HTTP request boundaries.
-- `activeBridges` keyed by `bridgeKey = sha256("bridge:" + modelId + ":" + firstUserText.slice(0,200))` — stores the open H2 stream + pending exec list. Used to route `tool_result` follow-ups back to the same Cursor stream.
+- `activeBridges` keyed by `bridgeKey = sha256("bridge:" + modelId + ":" + firstUserText.slice(0,200))` — stores the open H2 stream + pending exec list. Used to route `tool_result` follow-ups back to the **same** Cursor stream. This works.
+- `conversationStates` keyed by `convKey = sha256("conv:" + modelId + ":" + firstUserText.slice(0,200))` — was supposed to cache the opaque protobuf checkpoint Cursor sends back via `conversationCheckpointUpdate`, so a fresh `/v1/messages` request could resume a previous conversation without re-uploading context. **This does not work** — Cursor's KV blob store is scoped per-H2-stream, not per-conversation-id. Replaying a saved checkpoint on a fresh stream causes `Connect error internal: Blob not found` because the stored blob hashes only existed in the closed stream.
 
-**Both keys include `modelId`.** Earlier we made `convKey` model-independent and immediately hit `Connect error internal: Blob not found`: switching from opus to sonnet would replay opus's checkpoint blobs into a sonnet conversation, which Cursor's blob store doesn't have under that conversationId. Including modelId isolates each model's state and fixes the issue.
+**Current behavior:** every fresh `/v1/messages` request starts with empty `conversationState`. Cursor rebuilds its blob store from `setBlobArgs` (system prompt, etc.) and the client re-supplies the message history in the prompt anyway. The `conversationStates` Map is preserved as scaffolding for a future architecture where we share an H2 client across requests, but it's not currently populated.
 
-Both caches expire after 30 minutes of inactivity. There's no eviction on graceful turn end except when there are no pending tool calls — bridges with pending tool results are kept alive for the client's continuation POST.
+Bridge cache expires after 30 minutes of inactivity. Bridges with pending tool calls are kept alive for the client's continuation POST.
 
 ---
 
