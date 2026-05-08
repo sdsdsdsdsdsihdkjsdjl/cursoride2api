@@ -166,6 +166,25 @@ function decodeMcpArgs(argsMap) {
 // ═══════════════════════════════════════════════
 //  Build McpToolDefinition list for RequestContext / runRequest
 // ═══════════════════════════════════════════════
+// Cursor's upstream Anthropic provider rejects requests with tool-name
+// collisions between MCP tools (RequestContext.tools) and Cursor's built-in
+// tool surface (Read/Write/Grep/Delete/Shell/Glob/WebFetch — Claude Code's
+// stock names). The collision triggers ERROR_PROVIDER_ERROR /
+// resource_exhausted before the model even runs.
+//
+// Empirical block-list (May 2026): if any MCP tool's `name` field equals one
+// of these, opus/sonnet calls fail. Composer / GPT models tolerate it.
+// The safe fix is to prefix `name` with `mcp_` so the upstream tool list has
+// no duplicate entries. Cursor uses the proto `name` field as the
+// upstream-facing tool name, but echoes back the original `tool_name` field
+// in mcpArgs.toolName, so the bridging logic does NOT need to translate
+// names back — only the wire-level `name` must be unique.
+const CURSOR_NATIVE_TOOL_NAMES = new Set([
+  'Read', 'Write', 'Ls', 'Grep', 'Delete', 'Shell', 'Fetch', 'WebFetch',
+  'Glob', 'Diagnostics',
+]);
+const MCP_NAME_PREFIX = 'mcp_';
+
 function buildMcpToolDefinitions(mcpToolsRaw) {
   if (!Array.isArray(mcpToolsRaw) || mcpToolsRaw.length === 0) return [];
   const { create, fromJson, toBinary, wkt, agent } = _requireProto();
@@ -187,8 +206,14 @@ function buildMcpToolDefinitions(mcpToolsRaw) {
         continue;
       }
     }
+    // Always prefix `name` to avoid native-tool collisions; keep `toolName`
+    // unchanged so Cursor's mcpArgs.toolName still matches what the caller
+    // registered (no mapping table needed downstream).
+    const wireName = (CURSOR_NATIVE_TOOL_NAMES.has(t.name) || t.name.startsWith(MCP_NAME_PREFIX))
+      ? (t.name.startsWith(MCP_NAME_PREFIX) ? t.name : MCP_NAME_PREFIX + t.name)
+      : t.name;
     out.push(create(agent.McpToolDefinitionSchema, {
-      name: t.name,
+      name: wireName,
       toolName: t.toolName || t.name,
       description: t.description || '',
       providerIdentifier: t.providerIdentifier || 'cursoride2api',

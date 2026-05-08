@@ -1,0 +1,277 @@
+# DEVLOG — Anthropic API + Tool-Use Support
+
+A working notebook of what we learned reverse-engineering Cursor's `agent.v1.AgentService/Run` enough to bridge the Anthropic Messages API (with full tool-use round-trip) on top of it. Written after the work was done; if you are continuing this you should be able to skip several days of dead ends by reading this first.
+
+## TL;DR
+
+1. The proxy speaks `application/connect+proto` (binary protobuf). Connect+JSON works for simple chat but breaks tool registration silently.
+2. Cursor's upstream Anthropic provider rejects requests where any MCP tool name collides with Cursor's built-in tool surface (`Read`, `Write`, `Grep`, `Delete`, `Shell`, `Glob`, `WebFetch`, `Ls`, `Fetch`, `Diagnostics`). **Always prefix the wire-level `McpToolDefinition.name` with `mcp_`** while leaving `tool_name` unchanged.
+3. Cursor's error envelope hides the real cause inside `error.details[].debug.details.detail`. Top-level `error.message` is often the literal string `"Error"`. Walk the trailer.
+4. The Cursor stream stays paused after emitting `mcpArgs` — it will NOT fire `turnEnded` until we send `mcpResult`. So when bridging to Anthropic semantics we have to *synthesize* `stop_reason=tool_use` ourselves (we use a 250 ms debounce to batch parallel tool calls).
+5. Cursor's KV blob channel must be ACKed (both `setBlobArgs` → `setBlobResult: {}` and `getBlobArgs` → `getBlobResult` with whatever we cached). Without this the model just sits there idle.
+6. Verified end-to-end through `claude -p` with `claude-opus-4-7`, `claude-sonnet-4-6`, and `claude-haiku-4-5`. Tool-use round-trip works.
+
+---
+
+## Architecture
+
+```
+Anthropic client                 Proxy (this repo)                   Cursor
+(Claude Code,                                                        api2.cursor.sh
+ Anthropic SDK,
+ opencode)
+       │                                  │                                │
+       │── POST /v1/messages ────────────>│                                │
+       │   (Anthropic format)             │── runRequest (proto bytes) ───>│
+       │                                  │   over HTTP/2 + connect+proto  │
+       │                                  │<── execServerMessage ──────────│
+       │                                  │   (requestContextArgs)         │
+       │                                  │── execClientMessage ──────────>│
+       │                                  │   (requestContextResult: tools)│
+       │                                  │<── kvServerMessage ────────────│
+       │                                  │   (setBlobArgs: system prompt) │
+       │                                  │── kvClientMessage ────────────>│
+       │                                  │   (setBlobResult: {})          │
+       │                                  │<── interactionUpdate ──────────│
+       │                                  │   (textDelta / thinkingDelta)  │
+       │                                  │<── execServerMessage ──────────│
+       │                                  │   (mcpArgs: TOOL CALL)         │
+       │<── tool_use block + ──────────────│   (proxy synthesizes          │
+       │   stop_reason=tool_use            │    stop_reason after 250 ms)  │
+       │                                  │   STREAM STAYS OPEN            │
+       │── POST /v1/messages ─────────────>│                                │
+       │   (with tool_result blocks)       │── execClientMessage ─────────>│
+       │                                  │   (mcpResult)                  │
+       │                                  │<── interactionUpdate ──────────│
+       │                                  │   (final text)                 │
+       │                                  │<── interactionUpdate ──────────│
+       │                                  │   (turnEnded)                  │
+       │<── stop_reason=end_turn ──────────│                                │
+```
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `server.js` | Express routes, conversation/bridge cache, `/v1/messages` orchestration |
+| `src/cursor-client.js` | Original simpler client for `/v1/chat/completions` (untouched) |
+| `src/cursor-agent.js` | Connect+proto client used by `/v1/messages`. Frame parser, tool encoding, KV/exec dispatch, stream lifecycle |
+| `src/anthropic-converter.js` | Anthropic SSE event builders, message parsing, response shaping |
+| `src/anthropic-tools.js` | Anthropic tools → MCP tool descriptors. `TOOL_INCLUDE`, `TOOL_LIMIT`, `TOOL_DESC_LIMIT`, `TOOL_SCHEMA_TRIM_BYTES` |
+| `src/proto/agent_pb.mjs` | Vendored compiled protobuf schemas (~3250 lines) from `ephraimduncan/opencode-cursor` |
+| `src/config.js` | Model name mapping (Anthropic ↔ Cursor) |
+
+---
+
+## Key wire-format facts
+
+### Content-Type matters
+
+`application/connect+json` works for plain chat but **silently fails for tool registration**: Cursor's tool dispatcher only picks up tools when the request is `application/connect+proto` (binary). We spent half a day chasing "why does the model not use my tools" before this clicked.
+
+### Protobuf encoding for `inputSchema`
+
+`McpToolDefinition.input_schema` is `bytes` in the proto. The bytes must be a `google.protobuf.Value` proto-encoded blob (not a JSON-stringified schema, not raw bytes of JSON text). We use:
+
+```js
+const inputSchema = toBinary(wkt.ValueSchema, fromJson(wkt.ValueSchema, jsonSchemaObject));
+```
+
+### The `name` vs `tool_name` distinction (critical)
+
+`McpToolDefinition` has two name-ish fields:
+- `name` → goes into Cursor's wire-level tool list, shown to the upstream Anthropic provider
+- `tool_name` → echoed back in `mcpArgs.tool_name` when the model calls it
+
+Cursor IDE's MCP integration namespaces server tools as `mcp__<server>__<tool>`, so the IDE never collides with Cursor's built-in surface. **We do collide** because Anthropic SDK clients pass tools with names like `Read`, `Write`, `Bash`. Without prefixing, the upstream provider sees duplicate `Read` (Cursor's native + ours) and returns `ERROR_PROVIDER_ERROR`.
+
+Fix in `cursor-agent.js`:
+
+```js
+const CURSOR_NATIVE_TOOL_NAMES = new Set([
+  'Read', 'Write', 'Ls', 'Grep', 'Delete', 'Shell', 'Fetch',
+  'WebFetch', 'Glob', 'Diagnostics',
+]);
+const wireName = CURSOR_NATIVE_TOOL_NAMES.has(t.name) ? 'mcp_' + t.name : t.name;
+out.push(create(McpToolDefinitionSchema, {
+  name: wireName,            // wire-level, must not collide
+  toolName: t.toolName || t.name,  // echoed back, keep original
+  ...
+}));
+```
+
+When Cursor sends `mcpArgs` back, `tool_name` is `Read` (the original) so our handler can map it back to the client's expected tool name without a translation table.
+
+### Reject native tool calls properly
+
+The model first tries Cursor's *native* tools (`readArgs`, `writeArgs`, `shellArgs`, etc.). We respond with **typed rejections**, NOT generic errors. Each tool has its own result type and rejection variant:
+
+| `*Args` | Result field | Rejection shape |
+|---------|--------------|-----------------|
+| `readArgs` | `readResult` | `rejected: { path, reason }` |
+| `lsArgs` | `lsResult` | `rejected: { path, reason }` |
+| `writeArgs` | `writeResult` | `rejected: { path, reason }` |
+| `deleteArgs` | `deleteResult` | `rejected: { path, reason }` |
+| `shellArgs` | `shellResult` | `rejected: { command, workingDirectory, reason, isReadonly: false }` |
+| `shellStreamArgs` | **`shellStream`** (NOT shellResult!) | `rejected: { command, workingDirectory, reason, isReadonly: false }` |
+| `backgroundShellSpawnArgs` | `backgroundShellSpawnResult` | `rejected: { command, workingDirectory, reason, isReadonly }` |
+| `grepArgs` | `grepResult` | `error: { error }` (note: `error`, not `rejected`) |
+| `fetchArgs` | `fetchResult` | `error: { url, error }` |
+| `writeShellStdinArgs` | `writeShellStdinResult` | `error: { error }` |
+| `diagnosticsArgs` | `diagnosticsResult` | `{ diagnostics: [] }` (silent empty) |
+| `requestContextArgs` | `requestContextResult` | `success: { requestContext: { tools, env, ... } }` |
+
+Sending the wrong rejection shape (e.g., `shellResult.rejected` for `shellStreamArgs`) causes the model to silently hang.
+
+### `max_mode` flag vs `-max` suffix in model id
+
+These are **orthogonal**:
+
+- **`-max` suffix**: part of the `model_id` itself, indicates reasoning-effort tier. `GetUsableModels` returns variants like `claude-opus-4-7-low/medium/high/xhigh/max`. We map `claude-opus-4-7` → `claude-opus-4-7-thinking-max` (max thinking effort).
+- **`max_mode` boolean**: a billing flag in `ModelDetails.max_mode = 7` and `RequestedModel.max_mode = 2`. Different concept (Cursor's "1M-context Max Mode" billing tier). We default this OFF; auto-enabling it on small accounts triggered `ERROR_PROVIDER_ERROR`.
+
+Don't conflate them.
+
+### KV blob handshake
+
+Cursor uses `kvServerMessage.setBlobArgs` to push pieces of conversation state (system prompt, user context) onto our side. **We must ACK with `setBlobResult: {}`** — without the ACK the model stalls. We also handle `getBlobArgs` by returning the cached blob (or empty if we don't have it).
+
+```js
+if (kv.setBlobArgs) {
+  blobStore.set(kv.setBlobArgs.blobId, kv.setBlobArgs.blobData);
+  writeFrame({ kvClientMessage: { id: kv.id, setBlobResult: {} } });
+}
+```
+
+### Stream lifecycle across HTTP requests
+
+For tool-use to work:
+
+1. The H2 stream to Cursor opens on the first `/v1/messages` request.
+2. When the model emits `mcpArgs`, the proxy must NOT close the stream — Cursor is paused waiting for our `mcpResult`.
+3. The proxy returns to the client with `stop_reason: tool_use` immediately (we use a 250 ms debounce so parallel tool calls in the same turn batch into one Anthropic response).
+4. The client (Claude Code) executes the tool locally and POSTs `/v1/messages` again with `tool_result` blocks.
+5. The proxy's bridge cache (keyed by `bridgeKey = sha256("bridge:" + modelId + ":" + firstUserText.slice(0,200))`) finds the open stream, sends `execClientMessage` with `mcpResult`, and continues reading.
+6. When the model finishes (`turnEnded`), we close the bridge.
+
+Heartbeats (`ClientHeartbeat` proto) every 5s keep the connection alive while we wait between turns.
+
+### Cursor synthesizes its own system prompt
+
+When you send a request, Cursor sends back `setBlobArgs` containing what looks like `{"role": "system", "content": "You are an AI coding assistant powered by Claude..."}`. This is Cursor's own system prompt, injected regardless of what your client passes in.
+
+This is what makes opencode integration awkward. Cursor's prompt tells the model "you are Cursor's assistant", which can override or confuse opencode's instructions. Claude Code's framing (`CLAUDE.md` style + tool descriptions) coexists better.
+
+---
+
+## The error message decoding
+
+This single bug masked everything else for hours.
+
+The Connect end-stream trailer for an error looks like:
+
+```json
+{
+  "error": {
+    "code": "resource_exhausted",
+    "message": "Error",
+    "details": [{
+      "type": "aiserver.v1.ErrorDetails",
+      "debug": {
+        "error": "ERROR_PROVIDER_ERROR",
+        "details": {
+          "title": "Provider Error",
+          "detail": "We're having trouble connecting to the model provider. This might be temporary - please try again in a moment.",
+          "isRetryable": false
+        }
+      }
+    }]
+  }
+}
+```
+
+Top-level `message` is the literal string `"Error"`. Useful info is in `details[].debug.details.detail` and `details[].debug.error`. Walk the array, surface the first useful detail string. Otherwise every diagnosis is a guessing game.
+
+`ERROR_PROVIDER_ERROR` itself has multiple causes, including:
+- Tool-name collision with native Cursor tools (the big one)
+- Account doesn't have agent-mode quota for the chosen model
+- Aggregate tool-schema bytes exceed Cursor's per-request budget (~30 KB after trimming)
+- Model temporarily unavailable upstream
+
+---
+
+## Tool-budget knobs
+
+Even after fixing the name collision, Claude Code's stock 49 tools (~150 KB raw, ~30 KB after our default trimming) can still trip Cursor's tool-schema budget. `src/anthropic-tools.js` exposes:
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `TOOL_INCLUDE` | (unset) | Allowlist of tool names. Only these are forwarded |
+| `TOOL_LIMIT` | `0` (unlimited) | Hard cap on tool count after `TOOL_INCLUDE` |
+| `TOOL_DESC_LIMIT` | `600` chars | Truncate `description` field on each tool |
+| `TOOL_SCHEMA_TRIM_BYTES` | `30000` | If aggregate schema bytes exceed this, strip `properties[].description` from JSON schemas |
+
+Recommended:
+
+```bash
+TOOL_INCLUDE="Read,Write,Edit,Bash,Glob,Grep,WebFetch" PORT=4141 npm start
+```
+
+---
+
+## Verified working configurations
+
+```bash
+# Server
+TOOL_INCLUDE="Read,Write,Edit,Bash,Glob,Grep,WebFetch" PORT=4141 npm start
+
+# Client — Claude Code
+ANTHROPIC_BASE_URL=http://localhost:4141 claude -p \
+  "Read test-data.txt and quote it" --model claude-opus-4-7
+# → opus calls Read → claude code executes → opus quotes the actual file content
+
+# Verified models with tools:
+#   claude-opus-4-7   (mapped to claude-opus-4-7-thinking-max)
+#   claude-sonnet-4-6 (mapped to claude-4.6-sonnet-medium)
+#   claude-haiku-4-5  (mapped to composer-2-fast)
+```
+
+For the OpenAI-compatible endpoint (no tool-use), the original `cursor-client.js` path remains:
+
+```bash
+curl http://localhost:4141/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+```
+
+---
+
+## Dead ends (so you don't repeat them)
+
+- **Switching `:authority` or `:scheme`**: doesn't change anything.
+- **Setting `x-ghost-mode`, `x-cursor-client-type=ide`, `x-cursor-client-arch`**: no effect on the provider error.
+- **Bumping `x-cursor-client-version` from 2.6.20 to 3.2.0**: no effect.
+- **Sending `runRequest.mcpTools` in addition to `RequestContext.tools`**: doubles the bytes for no benefit; the working reference (`opencode-cursor`) uses only `RequestContext.tools`.
+- **Auto-enabling `max_mode` when ≥ N tools registered**: triggers `ERROR_PROVIDER_ERROR` on accounts where the chosen model isn't entitled to max-mode. Keep it opt-in.
+- **Trying to truncate the request below "70 KB" thinking it was a size limit**: it never was. The size correlation was a coincidence — the real cause was tool-name collisions.
+- **Setting `subagent_type_name` or `agent_mode` in the runRequest**: no effect on the provider error.
+- **Changing `displayNameShort` or `aliases` on `ModelDetails`**: no effect.
+
+---
+
+## References
+
+- [`ephraimduncan/opencode-cursor`](https://github.com/ephraimduncan/opencode-cursor) — the working TypeScript reference proxy. Read its `src/proxy.ts` if anything here is unclear.
+- [`burpheart/cursor-tap`](https://github.com/burpheart/cursor-tap) — packet-capture-based reverse engineering, source of the proto definitions in `cursor_proto/agent_v1.proto` (4345 lines).
+- [Connect protocol spec](https://connectrpc.com/docs/protocol) — frame format, end-stream trailers.
+- [`@bufbuild/protobuf` docs](https://github.com/bufbuild/protobuf-es) — runtime we use for proto encode/decode.
+- This repo's `Cursor IDE API 逆向工程文档.md` — older Chinese-language reverse engineering notes (predates the connect+proto migration but still useful for non-tool flows).
+
+---
+
+## Future work / open issues
+
+- **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
+- **Stale `Blob not found`**: When the same `convKey` is reused across model switches (e.g., haiku → opus), Cursor sometimes returns "Blob not found" because the previous-model blob expired upstream. We should evict the conversation cache on model change, not just on TTL.
+- **Parallel tool calls**: The 250 ms debounce on `mcpArgs` is a heuristic. For models that call many tools in parallel (Claude can issue 5+ in one turn), this could miss some. Consider replacing with a more explicit signal — `interactionUpdate.toolCallStarted` arrives before `mcpArgs` and could be used to pre-arm the debounce.
+- **Cursor IDE's exact wire format**: We never did a side-by-side comparison of an actual Cursor-IDE-generated request vs. ours, only reasoned from the proto definitions and the working reference. If something breaks after a Cursor update, capture a real IDE request via mitmproxy and diff against `agent_pb.mjs`.
