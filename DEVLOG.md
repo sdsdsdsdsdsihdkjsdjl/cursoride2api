@@ -417,6 +417,67 @@ This matters: when a "haiku" request reaches the proxy, the user expects Claude 
 
 The user-facing model name in the response is preserved as whatever the client requested (e.g., `"model":"claude-haiku-4-5"` in the response even though the underlying upstream is sonnet). This keeps clients that key on the model id happy.
 
+## Claude Code `/btw` (side-question / fork) — wire shape
+
+Captured from Claude Code v2.1.133 with `DUMP_REQUESTS=1` enabled. Useful for debugging when `/btw` appears silent.
+
+`/btw` is **not a special endpoint**. It's a regular `POST /v1/messages` with prompt engineering. Specifically:
+
+- Endpoint: `POST /v1/messages` (the same one as a normal turn)
+- `stream: true`
+- Full conversation history is included as `messages[]`
+- The new side-question is appended as a fresh `user` message; its content is a **single string** wrapping a `<system-reminder>` tag with the side-question framing, followed by the actual question:
+
+```text
+<system-reminder>This is a side question from the user. You must answer this
+question directly in a single response.
+
+IMPORTANT CONTEXT:
+- You are a separate, lightweight agent spawned to answer this one question
+- The main agent is NOT interrupted - it continues working independently in the background
+- You share the conversation context but are a completely separate instance
+- Do NOT reference being interrupted or what you were "previously doing" - that framing is incorrect
+
+CRITICAL CONSTRAINTS:
+- You have NO tools available - you cannot read files, run commands, search, or take any actions
+- This is a one-off response - there will be no follow-up turns
+- You can ONLY provide information based on what you already know from the conversation context
+- NEVER say things like "Let me try...", "I'll now...", "Let me check...", or promise to take any action
+- If you don't know the answer, say so - do not offer to look it up or investigate
+
+Simply answer the question with the information you have.</system-reminder>
+
+what does the acronym REST stand for?
+```
+
+- `tools[]` — **still includes the full tool list** (50+ for stock Claude Code). Claude Code does NOT strip tools from `/btw` requests; it relies on the `<system-reminder>` to forbid use. The model honors this.
+- The answer comes back as plain text via the standard `message_stop` SSE flow. Claude Code displays it in a popup overlay ("↑/↓ to scroll · f to fork · Esc to dismiss").
+
+### Implications for the proxy
+
+- **No special endpoint or routing needed.** `/btw` works automatically once the regular `/v1/messages` path works.
+- **`mcp_` prefix on tool names matters here too** — even though the model won't call them, the tool list is still validated upstream. Without prefixing the request would 503 like every other tool-bearing request.
+- **Context size matters**: `/btw` adds the full history + system-reminder + tools. On long sessions this can push the request over Cursor's per-request schema budget. The default trim knobs (`TOOL_DESC_LIMIT=600`, `TOOL_SCHEMA_TRIM_BYTES=30000`) handle stock Claude Code; if `/btw` fails on your specific session, dump the request and check the encoded byte size.
+- **Subagent classification does NOT fire for `/btw`** — there's no `__SUBAGENT_MARKER__` because `/btw` is just a fork on the user's main thread, not a subagent spawn.
+
+### Debugging when `/btw` is silent
+
+The popup overlay is easy to miss when the answer is a single line. If the question genuinely got no response:
+
+1. `DUMP_REQUESTS=1 DEBUG_LOG=verbose PORT=4141 npm start`
+2. Trigger `/btw` in Claude Code
+3. Check `/tmp/v1messages-*.json` for the request body
+4. Check `logs/server-*.log` for the request_id, then `grep` everything for that request_id
+5. If you see `ERROR_PROVIDER_ERROR resource_exhausted`, the request hit Cursor's tool budget — try `TOOL_INCLUDE` to slim it
+6. If you see `❌ Connect error internal: Blob not found`, retry — the prior bridge state was stale and is now evicted (next request will succeed)
+7. If the request succeeded but Claude Code shows nothing, check whether the response was empty (model decided not to answer) or whether the SSE stream was malformed; the dumped request + verbose log should make this visible
+
+### About `/v1/messages/count_tokens`
+
+We DID implement this endpoint (commit 219f978) on the assumption that `/btw` calls it for fit-checks. Empirically Claude Code 2.1.133 does NOT call it for `/btw`. The endpoint is still useful — other Anthropic-SDK clients DO call it, and Claude Code might in future versions. Char-count heuristic at ~3.5 chars/token, returns `{input_tokens: N}`. Not exact but close-enough.
+
+---
+
 ## Conversation/bridge cache: state is per-stream, NOT per-conversation
 
 We maintain two in-memory caches on the proxy:
