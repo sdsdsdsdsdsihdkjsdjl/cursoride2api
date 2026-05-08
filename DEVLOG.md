@@ -478,6 +478,44 @@ We DID implement this endpoint (commit 219f978) on the assumption that `/btw` ca
 
 ---
 
+## Concurrency: what's safe, what's not
+
+### Concurrency-safe by design
+
+Multiple concurrent client sessions hitting the proxy are mostly fine:
+
+- **HTTP server**: standard Express; each request has its own `req`/`res`.
+- **Shared HTTP/2 client to api2.cursor.sh**: HTTP/2 multiplexes streams. Each `/v1/messages` opens its own stream via `client.request()` on the shared client. Cursor dispatches frames by stream ID; data flows to the correct `req.on('data')` listener with no cross-talk.
+- **Per-stream frame buffers**: each `startConversation()` invocation has its own `buffer` closure. No shared state between streams.
+- **SSE response writes**: each turn's callback closure captures its own `res`; events go to the right client.
+- **Per-request state machines** (`turnState`, accumulated text, pending tool calls, block indices): all local-per-request.
+
+### The bridge/conv cache is the one place to be careful
+
+`activeBridges` is keyed on a stable hash of the conversation. If two concurrent sessions hashed to the same key, they'd collide → one would orphan the other's stream OR (worse) their tool_result follow-ups would land on the wrong bridge → **actual cross-session interleaving**.
+
+Original key was `sha256("bridge:" + model + ":" + first200CharsOfFirstUserText)` — too narrow. Two sessions sending the same first prompt with the same effective model would collide.
+
+Hardened to include 4 components, all stable across continuations of the same conversation but variable across different sessions:
+
+```js
+key = sha256("bridge:" + modelId + ":" + systemFingerprint + ":" + firstUserText.slice(0,200) + ":" + remoteAddr)
+```
+
+- **`systemFingerprint`** = concat of `system` text blocks (Anthropic's system field). Mostly per-client (Claude Code injects skill list + env + project info that differ between users). Strips the `x-anthropic-billing-header` block first since that contains a per-request `cch=<hash>` that would otherwise change every turn and break continuation matching.
+- **`remoteAddr`** = `req.ip` (or `socket.remoteAddress`). Different machines diverge automatically. Behind a NAT this is shared, so same-machine collision is still possible if `system + firstUserText + model` all match — but Claude Code's system content (skill list, working dir, env) varies enough that real-world collisions are very rare.
+
+### Edge case that's still possible
+
+Two Claude Code processes started in the same working directory on the same machine, with the same skill set, both sending the exact same first prompt, would collide. Mitigation if it bites you: include socket port (`req.socket.remotePort`) in the salt, accepting the cost of cache miss when the client reconnects mid-conversation.
+
+### Verified
+
+- 4-way unit test: identical-conversation continuation matches; different IP / different system / different model all diverge.
+- End-to-end: `claude -p` with tool round-trip → both requests share `convKey`, bridge cache hit, no "Bridge cache miss" warning, correct file content returned.
+
+---
+
 ## Conversation/bridge cache: state is per-stream, NOT per-conversation
 
 We maintain two in-memory caches on the proxy:
