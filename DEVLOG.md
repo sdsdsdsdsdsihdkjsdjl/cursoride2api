@@ -664,6 +664,31 @@ Verified end-to-end:
 - 4-way unit test: identical-conversation continuation matches; different IP / different system / different model all diverge.
 - End-to-end: `claude -p` with tool round-trip → both requests share `convKey`, bridge cache hit, no "Bridge cache miss" warning, correct file content returned.
 
+### Selective `mcp_` prefix (`MCP_PREFIX=safe-only` default)
+
+The proxy used to prefix every registered tool with `mcp_` to avoid `ERROR_PROVIDER_ERROR / resource_exhausted` collisions with Cursor's built-in tool surface. That made tools the model already knows from training — `Bash`, `AskUserQuestion`, `Edit`, etc. — appear under unfamiliar prefixed names. When the model was confused (long contexts, low-effort variants, name aliases), it occasionally fell back to emitting `[Tool call: NAME({...})]` as plain text instead of as a structured tool_use block.
+
+Fix: keep the prefix only for tools whose names actually conflict with Cursor's blocklist:
+
+```
+Read, Write, Grep, Glob, WebFetch, WebSearch, Shell, Delete,
+Task, TodoWrite, AskQuestion, ListMcpResources, ReadLints,
+SwitchMode, Ls, Fetch, Diagnostics
+```
+
+Tools without conflicts (`Bash`, `AskUserQuestion`, `Edit`, `MultiEdit`, `NotebookEdit`, `BashOutput`, `KillBash`, custom MCP tools, ...) are now registered with their natural names. The model recognizes them and is significantly more likely to call them via structured tool_use.
+
+Env knob `MCP_PREFIX`:
+- `safe-only` (default) — prefix only conflict-prone names.
+- `always` — legacy behavior, prefix everything. Use this if `safe-only` ever produces `ERROR_PROVIDER_ERROR` for a tool we hadn't realized conflicts.
+- `never` — debug only, no prefix on anything.
+
+Verified:
+- `Bash`, `LS` → registered as `Bash`, `LS` (natural names); model calls structurally.
+- `Read`, `WebSearch` → registered as `mcp_Read`, `mcp_WebSearch` (still prefixed); model calls via the prefixed name.
+
+(Aborted side-attempt: tried injecting a tool-use nudge via `runRequest.customSystemPrompt`. Cursor's upstream rejected those requests with `Connect error invalid_argument: unknown option '--system-prompt'` — the field appears account-gated in ways we can't safely probe. Removed.)
+
 ### Perf review fixes
 
 A code review surfaced 8 perf/quality concerns. After verifying each against the actual code, kept 5 as real wins:

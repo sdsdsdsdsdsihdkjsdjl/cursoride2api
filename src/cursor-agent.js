@@ -312,15 +312,46 @@ function decodeMcpArgs(argsMap) {
 // tool surface. The collision triggers ERROR_PROVIDER_ERROR /
 // resource_exhausted before the model even runs.
 //
-// Cursor's native list isn't documented and is bigger than initial probing
-// suggested — it includes (at least, May 2026):
-//   Read, Write, Ls, Grep, Delete, Shell, Fetch, WebFetch, Glob,
-//   Diagnostics, TodoWrite, ...
+// Two prefix strategies (set via MCP_PREFIX env):
 //
-// Rather than maintain a brittle blocklist, we just prefix EVERY MCP tool's
-// wire `name` with `mcp_`. The proto `tool_name` field (and the original
-// name) is preserved for the dispatcher / for echoing back to the client.
+//   safe-only (default) — only prefix tool names known to conflict with
+//     Cursor's built-in surface. Tools whose names don't conflict
+//     (`Bash`, `AskUserQuestion`, `Edit`, ...) are registered with their
+//     natural names. The model recognizes these from its training and is
+//     significantly more likely to call them via structured tool_use
+//     instead of falling back to `[Tool call: ...]` text.
+//
+//   always — prefix every tool with `mcp_` (legacy behavior). Safe but
+//     causes the model to see unfamiliar names, which contributes to the
+//     hallucination of text-form tool calls. Use this if `safe-only`
+//     produces ERROR_PROVIDER_ERROR for a tool we hadn't realized
+//     conflicts.
 const MCP_NAME_PREFIX = 'mcp_';
+const MCP_PREFIX_MODE = (process.env.MCP_PREFIX || 'safe-only').toLowerCase().trim();
+// Empirically blocked names from probing (DEVLOG); update if more
+// collisions surface in the field. Anything in this set MUST be prefixed.
+const CURSOR_NATIVE_TOOL_NAMES = new Set([
+  'Read', 'Write', 'Grep', 'Glob', 'WebFetch', 'WebSearch',
+  'Shell', 'Delete', 'Task', 'TodoWrite', 'AskQuestion',
+  'ListMcpResources', 'ReadLints', 'SwitchMode',
+  // Belt-and-suspenders additions seen in Cursor's proto/UI:
+  'Ls', 'Fetch', 'Diagnostics',
+]);
+function shouldPrefixToolName(name) {
+  if (MCP_PREFIX_MODE === 'always') return true;
+  // 'never' would skip every prefix; useful for debug experiments only.
+  if (MCP_PREFIX_MODE === 'never') return false;
+  // 'safe-only' (default): prefix only tools whose names conflict.
+  return CURSOR_NATIVE_TOOL_NAMES.has(name);
+}
+
+// NOTE: an earlier attempt routed a tool-use nudge through
+// `runRequest.customSystemPrompt`, but Cursor's upstream rejected those
+// requests with `Connect error invalid_argument: unknown option
+// '--system-prompt'` — the field appears account-gated or format-
+// restricted in ways we can't safely probe. Removed. The selective
+// `mcp_` prefix below + the hallucinated-tool-call rescuer in
+// server.js are the working mitigations.
 
 function buildMcpToolDefinitions(mcpToolsRaw) {
   if (!Array.isArray(mcpToolsRaw) || mcpToolsRaw.length === 0) return [];
@@ -343,12 +374,20 @@ function buildMcpToolDefinitions(mcpToolsRaw) {
         continue;
       }
     }
-    // Always prefix `name` so the upstream tool list never collides with any
-    // of Cursor's built-in tool names (the list is bigger than initial probing
-    // suggested — Read/Write/Glob/Grep/WebFetch/TodoWrite/... — and undocumented).
-    // Keep `toolName` unchanged so Cursor's mcpArgs.toolName still matches the
-    // original name the caller registered (no mapping table needed downstream).
-    const wireName = t.name.startsWith(MCP_NAME_PREFIX) ? t.name : MCP_NAME_PREFIX + t.name;
+    // Decide wire name: prefix `mcp_` only when the name actually conflicts
+    // with Cursor's built-in tool surface (in `safe-only` mode), or always
+    // (legacy mode). Non-prefixed names match the model's training and
+    // significantly reduce text-form tool-call hallucinations.
+    // `toolName` is left unchanged so the dispatcher's mcpArgs.toolName
+    // matches the original name on the way back.
+    let wireName;
+    if (t.name.startsWith(MCP_NAME_PREFIX)) {
+      wireName = t.name; // already prefixed (e.g. mcp__playwright__*)
+    } else if (shouldPrefixToolName(t.name)) {
+      wireName = MCP_NAME_PREFIX + t.name;
+    } else {
+      wireName = t.name;
+    }
     out.push(create(agent.McpToolDefinitionSchema, {
       name: wireName,
       toolName: t.toolName || t.name,
@@ -1166,6 +1205,9 @@ function startConversation(token, options = {}) {
       modelId,
       maxMode: enableMaxMode,
     });
+    // customSystemPrompt only set if the caller explicitly provides it.
+    // Don't auto-inject — Cursor's upstream rejects unauthorized usage
+    // with `unknown option '--system-prompt'`.
     if (options.customSystemPrompt) {
       runRequestFields.customSystemPrompt = String(options.customSystemPrompt);
     }
