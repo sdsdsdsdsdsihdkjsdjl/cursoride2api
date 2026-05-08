@@ -85,7 +85,15 @@ const inputSchema = toBinary(wkt.ValueSchema, fromJson(wkt.ValueSchema, jsonSche
 
 Cursor IDE's MCP integration namespaces server tools as `mcp__<server>__<tool>`, so the IDE never collides with Cursor's built-in surface. **We do collide** because Anthropic SDK clients pass tools with names like `Read`, `Write`, `Bash`, `TodoWrite`, etc. Without prefixing, the upstream provider sees duplicates and returns `ERROR_PROVIDER_ERROR`.
 
-Cursor's full native tool list isn't documented and is bigger than initial probing suggests (we found at least: `Read`, `Write`, `Ls`, `Grep`, `Delete`, `Shell`, `Fetch`, `WebFetch`, `Glob`, `Diagnostics`, `TodoWrite`, ...). Rather than maintain a brittle blocklist, **always prefix every MCP tool's wire `name` with `mcp_`** and leave `tool_name` unchanged.
+Cursor's full native tool list isn't documented. Empirical probe of 30+ names (with `mcp_` prefix disabled) confirms the rejected set is case-exact PascalCase agent-mode tool names:
+
+**Blocked (return `ERROR_PROVIDER_ERROR resource_exhausted`):**  `Read`, `Write`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `Shell`, `Delete`, `Task`, `TodoWrite`
+
+**Pass through unchanged:** `Quack`, `xyzzy`, `Ls`, `Edit`, `Fetch`, `Diagnostics`, `NotebookEdit`, `Skill`, `TaskCreate`, `BashOutput`, `KillShell`, `bash`, `Bash`, `text_editor`, `computer`, `web_search`, `web_fetch`, `bash_20250124`, `read`, `read_file`, `readFile`, `ReadFile`, …
+
+The pattern is whole-string match of Cursor's PascalCase agent-mode tool names. **Anthropic-side reserved names** (`bash_20250124`, `text_editor_20250728`, `computer_*`, etc.) all pass — so this is NOT an Anthropic API collision (Anthropic's tool name regex is just `^[a-zA-Z0-9_-]{1,64}$` with no reservations). It's a Cursor IDE collision.
+
+Rather than maintain a brittle blocklist, **always prefix every MCP tool's wire `name` with `mcp_`** and leave `tool_name` unchanged. The reference proxy `opencode-cursor` doesn't prefix and runs into the same issue when its callers happen to use Cursor-overlapping names.
 
 Fix in `cursor-agent.js`:
 
@@ -279,9 +287,28 @@ curl http://localhost:4141/v1/chat/completions \
 
 ---
 
+## On `composer-2-fast` and Claude Haiku
+
+Cursor has **no Claude Haiku model** — `/v1/models` returns 0 matches for "haiku". The smallest real Claude on Cursor is `claude-4.5-sonnet`. We previously mapped:
+
+```
+'claude-haiku-4-5':       'composer-2-fast'  // ← this is NOT Claude Haiku
+'claude-haiku-4-5-20251001': 'composer-2-fast'
+'claude-3-5-haiku-*':     'composer-2-fast'
+```
+
+[`composer-2-fast` is Cursor's own Composer 2 in fast variant](https://cursor.com/blog/composer-2) — built on Kimi K2.5 (Moonshot AI's MoE model) with continued pre-training and RL. It's cheap and fast but it's NOT Claude.
+
+This matters: when a "haiku" request reaches the proxy, the user expects Claude tokenizer/grammar/billing. We were silently substituting Kimi K2.5. Earlier "tool use works for haiku" tests were actually proving Kimi+Cursor's MCP layer works — telling us nothing about real Claude Haiku.
+
+**Current strategy** (after the fix):
+- Detect Claude Code's startup warmup ping (no tools, max_tokens ≤ 16, single user message) and let it route to `composer-2-fast` for cheapness — that's what copilot-api does too.
+- Real `claude-haiku-*` requests with tools or non-trivial bodies upgrade to `claude-sonnet-4-6` (smallest real Claude on Cursor).
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
 - **Stale `Blob not found`**: When the same `convKey` is reused across model switches (e.g., haiku → opus), Cursor sometimes returns "Blob not found" because the previous-model blob expired upstream. We should evict the conversation cache on model change, not just on TTL.
 - **Parallel tool calls**: The 250 ms debounce on `mcpArgs` is a heuristic. For models that call many tools in parallel (Claude can issue 5+ in one turn), this could miss some. Consider replacing with a more explicit signal — `interactionUpdate.toolCallStarted` arrives before `mcpArgs` and could be used to pre-arm the debounce.
+- **`anthropic-beta` header forwarding**: copilot-api passes through specific betas (`interleaved-thinking-2025-05-14`, `context-management-2025-06-27`, `advanced-tool-use-2025-11-20`). We currently ignore them. Some Claude features may not work without them.
 - **Cursor IDE's exact wire format**: We never did a side-by-side comparison of an actual Cursor-IDE-generated request vs. ours, only reasoned from the proto definitions and the working reference. If something breaks after a Cursor update, capture a real IDE request via mitmproxy and diff against `agent_pb.mjs`.

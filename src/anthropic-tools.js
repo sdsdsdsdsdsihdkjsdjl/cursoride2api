@@ -256,13 +256,20 @@ function extractFirstUserText(messages) {
 }
 
 /**
- * 对话级稳定哈希（基于首条 user 文本）
+ * 对话级稳定哈希（基于 model + 首条 user 文本）
+ *
+ * Including modelId is important: Cursor's KV blob store is per-conversation-id
+ * and the conversationId we derive is model-independent only by convention.
+ * Different models reference different blob hashes, so reusing the same
+ * conversationId across model switches triggers "Blob not found" errors when
+ * the second model tries to load the first model's state. Keying on model
+ * keeps each model's conversation state isolated.
  */
-function deriveConversationKey(messages) {
+function deriveConversationKey(messages, modelId) {
   const first = extractFirstUserText(messages).slice(0, 200);
   return crypto
     .createHash('sha256')
-    .update('conv:' + first)
+    .update('conv:' + (modelId || '') + ':' + first)
     .digest('hex')
     .slice(0, 16);
 }
