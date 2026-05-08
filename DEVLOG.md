@@ -514,6 +514,27 @@ Two Claude Code processes started in the same working directory on the same mach
 - 4-way unit test: identical-conversation continuation matches; different IP / different system / different model all diverge.
 - End-to-end: `claude -p` with tool round-trip → both requests share `convKey`, bridge cache hit, no "Bridge cache miss" warning, correct file content returned.
 
+### Auto-retry on `NGHTTP2_REFUSED_STREAM`
+
+Symptom (observed 2026-05-07): a session running alongside others died with `[Error: Stream closed with error code NGHTTP2_REFUSED_STREAM]`. Per HTTP/2 spec this code is explicitly safe to retry — the server refused the stream before processing it (typically per-connection stream limit hit, server about to GOAWAY, or transient overload).
+
+Fix in `cursor-agent.js`:
+
+- Track `hasReceivedData` on the stream. Only retry if no data has arrived yet — past first byte we may have partial state.
+- On `req.on('error')`, dispatch through `failOrRetry(proto, msg, code)` which:
+  1. Tests the message/code for `REFUSED_STREAM`.
+  2. If retryable and under budget (`MAX_REQUEST_RETRIES = 2`):
+     - Calls `poisonSharedClient()` so the next stream uses a fresh H2 connection (the old one likely has stream-id pressure).
+     - Removes listeners + destroys the dead `req` so its trailing `end` event can't flip `closed = true` and short-circuit the retry.
+     - Schedules `attemptConnection(proto)` after `50ms × attempt` backoff.
+     - Re-sends the cached initial `runRequest` bytes (`cachedInitialEncoded`) on the new stream.
+  3. Otherwise bubbles to `fail(msg)` as before.
+- Refactored `startConnection` into `startConnection` (one-time runRequest build + send) + `attemptConnection` (re-runnable network setup) so the retry path is cheap.
+
+Verified with a fault-injection test (monkey-patched `http2.connect`): first stream emits `NGHTTP2_REFUSED_STREAM` immediately after the runRequest write → the proxy retries on a fresh client + re-sends the cached bytes. The user-visible failure mode collapses into a sub-second hiccup.
+
+Limits: only retries if zero bytes have arrived (mid-stream errors are not retried — could mask state-corruption bugs). Cap at 2 retries to avoid hammering Cursor when it's actually saturated.
+
 ---
 
 ## Conversation/bridge cache: state is per-stream, NOT per-conversation

@@ -126,6 +126,19 @@ function getSharedClient() {
   return _sharedClient;
 }
 
+// Force the shared client to be replaced on the next getSharedClient() call.
+// Used when we get a stream-level error that suggests the connection is
+// unhealthy (REFUSED_STREAM, GOAWAY, etc.) — opening a fresh TCP+TLS
+// connection clears whatever state caused the refusal.
+function poisonSharedClient(reason) {
+  if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] poisoning shared client: ${reason}`);
+  const c = _sharedClient;
+  _sharedClient = null;
+  if (c && !c.destroyed) {
+    try { c.close(); } catch { /* ignore */ }
+  }
+}
+
 function prewarmSharedClient() {
   // Ensure proto is loaded too (it's lazy-loaded otherwise)
   loadProto().catch(() => { /* logged elsewhere */ });
@@ -814,44 +827,19 @@ function startConversation(token, options = {}) {
     buffer = buffer.slice(offset);
   }
 
+  // Track first-byte arrival so we know whether a stream-level error is
+  // safe to retry. NGHTTP2_REFUSED_STREAM before any data = server didn't
+  // process the request, fully retryable on a fresh connection. Errors
+  // mid-stream might mean partial state — don't retry those.
+  let hasReceivedData = false;
+  let retryAttempts = 0;
+  const MAX_REQUEST_RETRIES = 2;
+  let cachedInitialEncoded = null;
+
   function startConnection(proto) {
     if (connectionStarted) return;
     connectionStarted = true;
-    try {
-      // Reuse the pre-warmed shared client. HTTP/2 multiplexes streams so
-      // many simultaneous /v1/messages calls share one TCP/TLS connection,
-      // and the first request after server startup pays no handshake cost.
-      client = getSharedClient();
-    } catch (e) {
-      currentCallbacks.onError(`Connection failed: ${e.message}`);
-      return;
-    }
-
-    req = client.request(buildHeaders(token));
-    req.setTimeout(config.cursor.requestTimeout);
-
-    req.on('data', parseFrames);
-    req.on('response', (headers) => {
-      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] response status=${headers[':status']}`);
-    });
-    req.on('end', () => {
-      if (closed) return;
-      clearInterval(heartbeat);
-      closed = true;
-      // Don't close the shared client — see close() above.
-    });
-    req.on('error', (e) => fail(e.message || 'Stream error'));
-    req.on('timeout', () => fail('Request timeout'));
-
-    // Heartbeat
-    heartbeat = setInterval(() => {
-      if (closed) return;
-      const { create, toBinary, agent } = proto;
-      const hb = create(agent.AgentClientMessageSchema, {
-        message: { case: 'clientHeartbeat', value: create(agent.ClientHeartbeatSchema, {}) },
-      });
-      sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, hb));
-    }, config.cursor.heartbeatInterval);
+    attemptConnection(proto);
 
     // Build mcpTools once and stash for handleExecMessage / runRequest
     state.mcpToolDefs = buildMcpToolDefinitions(tools || []);
@@ -948,6 +936,8 @@ function startConversation(token, options = {}) {
       `[cursor-agent] runRequest tools=${state.mcpToolDefs.length} ` +
       `toolBytes=${toolBytes} totalBytes=${encoded.length} maxMode=${enableMaxMode}`
     );
+    // Cache the encoded runRequest bytes so we can resend on auto-retry.
+    cachedInitialEncoded = encoded;
     sendBinaryFrame(encoded);
 
     // Drain any frames queued before req existed
@@ -962,6 +952,108 @@ function startConversation(token, options = {}) {
     if (process.env.CURSOR_AGENT_DEBUG) {
       console.log(`[cursor-agent][debug] runRequest sent`);
     }
+  }
+
+  function attemptConnection(proto) {
+    try {
+      // Reuse the pre-warmed shared client. HTTP/2 multiplexes streams so
+      // many simultaneous /v1/messages calls share one TCP/TLS connection,
+      // and the first request after server startup pays no handshake cost.
+      client = getSharedClient();
+    } catch (e) {
+      currentCallbacks.onError(`Connection failed: ${e.message}`);
+      return;
+    }
+
+    // Tear down any previous heartbeat (set by a prior attempt).
+    if (heartbeat) {
+      try { clearInterval(heartbeat); } catch { /* ignore */ }
+      heartbeat = null;
+    }
+
+    req = client.request(buildHeaders(token));
+    req.setTimeout(config.cursor.requestTimeout);
+
+    req.on('data', (chunk) => {
+      hasReceivedData = true;
+      parseFrames(chunk);
+    });
+    req.on('response', (headers) => {
+      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] response status=${headers[':status']}`);
+    });
+    req.on('end', () => {
+      if (closed) return;
+      clearInterval(heartbeat);
+      closed = true;
+      // Don't close the shared client — see close() above.
+    });
+    req.on('error', (e) => failOrRetry(proto, e.message || 'Stream error', e.code));
+    req.on('timeout', () => fail('Request timeout'));
+
+    // Heartbeat
+    heartbeat = setInterval(() => {
+      if (closed) return;
+      const { create, toBinary, agent } = proto;
+      const hb = create(agent.AgentClientMessageSchema, {
+        message: { case: 'clientHeartbeat', value: create(agent.ClientHeartbeatSchema, {}) },
+      });
+      sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, hb));
+    }, config.cursor.heartbeatInterval);
+  }
+
+  // Retry-aware error handler. Auto-retries when:
+  //   - We haven't seen any data yet (so server hasn't started processing)
+  //   - The error is REFUSED_STREAM (per H2 spec, safe to retry on fresh conn)
+  //   - We're under the retry budget
+  // Otherwise bubbles to onError as usual.
+  function failOrRetry(proto, msg, code) {
+    if (closed) return;
+    const isRefused =
+      /NGHTTP2_REFUSED_STREAM|REFUSED_STREAM/i.test(msg) ||
+      (code === 'ERR_HTTP2_STREAM_ERROR' && /REFUSED_STREAM/i.test(msg));
+    if (!hasReceivedData && retryAttempts < MAX_REQUEST_RETRIES && isRefused) {
+      retryAttempts++;
+      console.log(`[cursor-agent] retrying after ${msg} (${retryAttempts}/${MAX_REQUEST_RETRIES})`);
+      poisonSharedClient(msg);
+      // Detach from the dead stream so its trailing 'end' event doesn't
+      // flip `closed = true` and short-circuit the retry. Same for the
+      // heartbeat — it would otherwise keep writing to the destroyed req.
+      if (req) {
+        try { req.removeAllListeners(); } catch { /* ignore */ }
+        try { req.destroy(); } catch { /* ignore */ }
+      }
+      if (heartbeat) {
+        try { clearInterval(heartbeat); } catch { /* ignore */ }
+        heartbeat = null;
+      }
+      // Brief backoff (50ms × attempt) — gives the upstream a moment to
+      // free a slot and the new TLS connection time to handshake.
+      const backoffMs = 50 * retryAttempts;
+      setTimeout(() => {
+        if (closed) return;
+        try { attemptConnection(proto); } catch (e) {
+          fail(`Retry failed: ${e.message}`);
+          return;
+        }
+        // attemptConnection may have failed to get a client (signals via
+        // currentCallbacks.onError instead of throwing). Don't try to write
+        // on a stale/destroyed req in that case.
+        if (!req || req.destroyed) return;
+        // Re-send the initial runRequest on the new stream.
+        if (cachedInitialEncoded) {
+          sendBinaryFrame(cachedInitialEncoded);
+        }
+        // Re-drain anything that was queued.
+        if (pendingWrites.length > 0) {
+          const drain = pendingWrites.splice(0);
+          for (const p of drain) {
+            try { req.write(frameConnectMessage(p)); } catch { /* ignore */ }
+          }
+        }
+      }, backoffMs);
+      return;
+    }
+    fail(msg);
   }
 
   // Kick off the connection. If the proto module isn't loaded yet (pre-warm
