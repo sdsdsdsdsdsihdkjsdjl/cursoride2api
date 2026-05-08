@@ -170,13 +170,30 @@ function checkApiKey(req, res, next) {
 }
 
 // ── GET /v1/models ──
+//
+// Cursor's GetUsableModels endpoint opens a fresh H2 connection per call
+// (cursor-client.js:328). Claude Code polls /v1/models on startup and
+// occasionally afterwards; without caching every call pays a TLS+H2
+// handshake. Cache the response for 5 minutes — the model list is stable
+// over hours, not minutes.
+const _modelsCache = { ts: 0, body: null };
+const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 app.get('/v1/models', checkApiKey, async (req, res) => {
   try {
+    const now = Date.now();
+    if (_modelsCache.body && (now - _modelsCache.ts) < MODELS_CACHE_TTL_MS) {
+      return res.json(_modelsCache.body);
+    }
     const token = pickToken();
     if (!token) return res.json({ object: 'list', data: [] });
     const result = await cursorClient.getModels(token);
-    res.json(converter.buildModelsResponse(result.models || []));
+    const body = converter.buildModelsResponse(result.models || []);
+    _modelsCache.ts = now;
+    _modelsCache.body = body;
+    res.json(body);
   } catch {
+    // On error, serve stale cache if we have one rather than empty list.
+    if (_modelsCache.body) return res.json(_modelsCache.body);
     res.json({ object: 'list', data: [] });
   }
 });
@@ -208,24 +225,27 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
-    res.write(converter.buildRoleChunk(requestedModel));
+    // OpenAI clients expect one chatcmpl-id and one created timestamp
+    // across every chunk in a stream. Mint once per request and reuse.
+    const ident = converter.newStreamIdentity();
+    res.write(converter.buildRoleChunk(requestedModel, ident));
 
     try {
       const result = await cursorClient.chat(token, prompt, cursorModel, {
         stream: true,
         onDelta: (text) => {
           if (!res.writableEnded) {
-            res.write(converter.buildStreamChunk(text, requestedModel));
+            res.write(converter.buildStreamChunk(text, requestedModel, null, ident));
           }
         },
       });
 
       if (result.error && !res.writableEnded) {
-        res.write(converter.buildStreamChunk(`\n\n[Error: ${result.error}]`, requestedModel));
+        res.write(converter.buildStreamChunk(`\n\n[Error: ${result.error}]`, requestedModel, null, ident));
       }
 
       if (!res.writableEnded) {
-        res.write(converter.buildStreamChunk(null, requestedModel, 'stop'));
+        res.write(converter.buildStreamChunk(null, requestedModel, 'stop', ident));
         res.write('data: [DONE]\n\n');
         res.end();
       }
@@ -234,8 +254,8 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
     } catch (e) {
       console.error(`  ❌ stream error: ${e.message}`);
       if (!res.writableEnded) {
-        res.write(converter.buildStreamChunk(`\n\n[Error: ${e.message}]`, requestedModel));
-        res.write(converter.buildStreamChunk(null, requestedModel, 'stop'));
+        res.write(converter.buildStreamChunk(`\n\n[Error: ${e.message}]`, requestedModel, null, ident));
+        res.write(converter.buildStreamChunk(null, requestedModel, 'stop', ident));
         res.write('data: [DONE]\n\n');
         res.end();
       }
@@ -389,7 +409,12 @@ function buildTurnCallbacks(ctx) {
         }
         turnState.textBlockOpen = true;
       }
-      turnState.accumulatedText += text;
+      // Only accumulate for non-streaming responses. In stream mode the
+      // delta is already on the wire; appending to a JS string per chunk
+      // is O(n²) for long generations because strings are immutable.
+      if (!isStream) {
+        turnState.accumulatedText += text;
+      }
       if (isStream && !res.writableEnded) {
         res.write(anthropicConverter.buildContentBlockDelta(turnState.nextBlockIndex - 1, text));
       }
@@ -404,7 +429,11 @@ function buildTurnCallbacks(ctx) {
         }
         turnState.thinkingBlockOpen = true;
       }
-      turnState.accumulatedThinking += text;
+      // Same rationale as onTextDelta: skip the in-memory accumulator when
+      // we're streaming — it's not used for the response, only for diagnostics.
+      if (!isStream) {
+        turnState.accumulatedThinking += text;
+      }
       if (isStream && !res.writableEnded) {
         res.write(anthropicConverter.buildContentBlockDeltaThinking(turnState.nextBlockIndex - 1, text));
       }

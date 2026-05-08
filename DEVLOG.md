@@ -664,6 +664,30 @@ Verified end-to-end:
 - 4-way unit test: identical-conversation continuation matches; different IP / different system / different model all diverge.
 - End-to-end: `claude -p` with tool round-trip → both requests share `convKey`, bridge cache hit, no "Bridge cache miss" warning, correct file content returned.
 
+### Perf review fixes
+
+A code review surfaced 8 perf/quality concerns. After verifying each against the actual code, kept 5 as real wins:
+
+1. **`/v1/models` 5-min TTL cache.** `cursor-client.getModels` opens a fresh H2/TLS connection per call; claude-code polls /models on startup. Cache hit takes the call from ~580ms → ~30ms (20×). Stale-on-error: if the upstream call fails, serve last good response rather than empty.
+
+2. **Frame-parser O(n²) → O(n) on long streams.** `parseFrames` did `buffer = Buffer.concat([buffer, chunk])` on *every* data event, copying the entire carry buffer each time. Replaced with a "concat only when there's a leftover partial frame" pattern. Common case (chunk lands aligned to whole frames) parses straight from `chunk` with zero copies. After the loop, fully-consumed buffers reset to a shared `Buffer.alloc(0)` instead of slicing. Same fix in `cursor-client.js`.
+
+3. **Skip `accumulatedText`/`accumulatedThinking` when streaming.** JS strings are immutable; `s += chunk` is O(n²) over a long generation. The accumulator is only read for non-stream responses (which need the full text to build the JSON body). For streams, the deltas are already on the wire — no reason to also keep a growing local copy.
+
+4. **Reuse one `chatcmpl-<id>` per OpenAI stream.** `buildStreamChunk` was minting a fresh UUID per delta. OpenAI clients expect one id across the whole stream. Added `newStreamIdentity()` helper called once per request; passed into every chunk builder. (Correctness, not perf — but visible in clients that track ids.)
+
+5. **Cache `Intl.DateTimeFormat().resolvedOptions().timeZone` at module load.** Timezone never changes mid-process; was being recomputed per request in `buildHeaders`.
+
+Skipped (3 of 8) with reasoning:
+- **Backpressure on `res.write()`**: theoretical concern; not the user's current pain point. Defer until a slow-client failure is observed.
+- **Tool-schema cache**: only fires per fresh turn (not per tool call), and the encoding cost is ~2-3ms. Marginal.
+- **Async debug-log writes**: only relevant when `DEBUG_LOG=verbose` is on. Not the production path.
+
+Verified end-to-end:
+- Models cache: 580ms → 30ms.
+- Stream-id: was N distinct ids per stream, now exactly 1.
+- claude-code Anthropic flow still works after frame-parser change.
+
 ### Auto-retry extended to `NGHTTP2_INTERNAL_ERROR` + per-pool-slot eviction
 
 User log under heavy long-session load showed `Stream closed with error code NGHTTP2_INTERNAL_ERROR` firing mid-conversation on long sessions (toolResults=320+, accumulated history ~1MB). Cursor's server seems to give up on streams that stay open too long with too much state. The error fires AFTER data has flowed, so the original REFUSED_STREAM-only retry didn't apply.

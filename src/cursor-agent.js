@@ -82,6 +82,12 @@ const _clientType = process.env.CURSOR_CLIENT_TYPE || 'ide';
 const _clientOs = process.env.CURSOR_CLIENT_OS || (process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows_nt' : 'linux');
 const _clientArch = process.env.CURSOR_CLIENT_ARCH || (process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch);
 const _clientDevice = process.env.CURSOR_CLIENT_DEVICE_TYPE || 'desktop';
+// Cache the timezone string at module load — Intl.DateTimeFormat() does
+// non-trivial work and the answer never changes mid-process.
+const _cursorTimezone = (() => {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
+  catch { return 'UTC'; }
+})();
 
 function buildHeaders(token, sessionId) {
   return {
@@ -93,7 +99,7 @@ function buildHeaders(token, sessionId) {
     'authorization': `Bearer ${token.accessToken}`,
     'x-cursor-checksum': generateChecksum(token.machineId || '', token.macMachineId || ''),
     'x-cursor-client-version': config.cursor.clientVersion,
-    'x-cursor-timezone': Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    'x-cursor-timezone': _cursorTimezone,
     'x-request-id': uuidv4(),
     // Optional-but-IDE-always-sends headers. x-session-id is the load-bearing
     // one: it uniquely identifies a Cursor stream so the backend can schedule
@@ -952,15 +958,26 @@ function startConversation(token, options = {}) {
   const state = { mcpToolDefs: [] };
 
   // Frame parser: connect frames are [flags(1)][len(4 BE)][payload].
+  //
+  // Hot path optimization: the obvious `buffer = Buffer.concat([buffer, chunk])`
+  // every call is O(n²) when many chunks arrive, because each concat copies the
+  // entire carry buffer. Instead, only concat when there's a leftover partial
+  // frame from a previous chunk — the common case (chunk lands aligned to one
+  // or more whole frames) skips the copy entirely and parses straight from
+  // `chunk`. After the loop we either replace `buffer` with the trailing slice
+  // (zero-copy via Buffer.slice) or reset to the empty buffer.
+  const _emptyBuf = Buffer.alloc(0);
   function parseFrames(chunk) {
     if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] data chunk ${chunk.length}B`);
-    buffer = Buffer.concat([buffer, chunk]);
+    // If we have leftover partial-frame bytes from last call, glue them onto
+    // this chunk; otherwise parse from the chunk directly.
+    const work = (buffer.length > 0) ? Buffer.concat([buffer, chunk]) : chunk;
     let offset = 0;
-    while (offset + 5 <= buffer.length) {
-      const flags = buffer[offset];
-      const len = buffer.readUInt32BE(offset + 1);
-      if (offset + 5 + len > buffer.length) break;
-      const payload = buffer.slice(offset + 5, offset + 5 + len);
+    while (offset + 5 <= work.length) {
+      const flags = work[offset];
+      const len = work.readUInt32BE(offset + 1);
+      if (offset + 5 + len > work.length) break;
+      const payload = work.slice(offset + 5, offset + 5 + len);
       offset += 5 + len;
 
       if (flags & CONNECT_END_STREAM_FLAG) {
@@ -1006,7 +1023,11 @@ function startConversation(token, options = {}) {
         if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] decode failed: ${e.message}`);
       }
     }
-    buffer = buffer.slice(offset);
+    // Keep only the trailing partial-frame bytes for next call. If we
+    // consumed everything, drop the buffer to the shared empty constant
+    // — avoids holding a reference to a long Buffer just because we
+    // sliced off the end.
+    buffer = (offset < work.length) ? work.slice(offset) : _emptyBuf;
   }
 
   // Track first-byte arrival so we know whether a stream-level error is
