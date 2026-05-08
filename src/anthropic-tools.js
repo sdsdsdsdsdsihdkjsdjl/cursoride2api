@@ -155,23 +155,62 @@ function decodeToolUseId(toolUseId) {
 }
 
 /**
- * 把 tool_result content 标准化为字符串
+ * Normalize tool_result.content into a list of MCP-compatible content items.
+ * Preserves both text and image blocks. Returns an array of either:
+ *   { kind: 'text', text: string }
+ *   { kind: 'image', mediaType: string, data: Buffer }
+ *
+ * Anthropic tool_result.content can be:
+ *   - a plain string                                    → one text item
+ *   - [{type:'text',text:'...'}]                        → text items
+ *   - [{type:'image',source:{type:'base64',media_type:'image/png',data:'<b64>'}}]
+ *                                                       → image items (with bytes decoded)
+ *   - mixed arrays of the two
+ */
+function normalizeToolResultContent(content) {
+  const items = [];
+  if (content == null) return items;
+  if (typeof content === 'string') {
+    if (content) items.push({ kind: 'text', text: content });
+    return items;
+  }
+  if (!Array.isArray(content)) {
+    try { items.push({ kind: 'text', text: JSON.stringify(content) }); } catch (e) {
+      items.push({ kind: 'text', text: String(content) });
+    }
+    return items;
+  }
+  for (const b of content) {
+    if (!b || typeof b !== 'object') continue;
+    if (b.type === 'text' && typeof b.text === 'string') {
+      if (b.text) items.push({ kind: 'text', text: b.text });
+      continue;
+    }
+    if (b.type === 'image' && b.source && b.source.type === 'base64') {
+      const mediaType = b.source.media_type || 'image/png';
+      let data;
+      try { data = Buffer.from(b.source.data || '', 'base64'); }
+      catch (e) { data = null; }
+      if (data && data.length > 0) {
+        items.push({ kind: 'image', mediaType, data });
+      }
+      continue;
+    }
+    // Future-proof: forward unknown block types as their JSON serialization
+    try { items.push({ kind: 'text', text: JSON.stringify(b) }); } catch (e) { /* skip */ }
+  }
+  return items;
+}
+
+/**
+ * Legacy text-only stringifier — kept for callers that don't yet handle
+ * the structured content list.
  */
 function stringifyToolResultContent(content) {
-  if (content == null) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter(b => b && b.type === 'text' && typeof b.text === 'string')
-      .map(b => b.text)
-      .join('\n');
-  }
-  // 兜底：对象/其他类型直接 JSON 序列化
-  try {
-    return JSON.stringify(content);
-  } catch (e) {
-    return String(content);
-  }
+  return normalizeToolResultContent(content)
+    .filter(it => it.kind === 'text')
+    .map(it => it.text)
+    .join('\n');
 }
 
 /**
@@ -200,7 +239,13 @@ function extractToolResults(messages) {
         conversationKey: decoded.conversationKey,
         execId: decoded.execId,
         toolCallId: decoded.toolCallId,
+        // Legacy field — text-only flattening for callers that haven't
+        // adopted `contentItems`.
         content: stringifyToolResultContent(block.content),
+        // Structured items preserving image blocks. Use this in the
+        // cursor-agent.sendToolResult path so screenshots and other
+        // media survive the round-trip.
+        contentItems: normalizeToolResultContent(block.content),
         isError: !!block.is_error,
       });
     }

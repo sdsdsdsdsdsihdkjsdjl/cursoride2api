@@ -425,6 +425,18 @@ function buildTurnCallbacks(ctx) {
     onError: (errMsg) => {
       console.error(`  ❌ ${errMsg}`);
       activeBridges.delete(bridgeKey);
+
+      // "Blob not found" means our cached conversationState references blobs
+      // Cursor's KV store has evicted. The state is no longer usable — drop
+      // it so the NEXT request from this client re-derives a fresh context
+      // instead of hitting the same error again.
+      if (/blob not found/i.test(errMsg)) {
+        conversationStates.delete(convKey);
+        if (process.env.CURSOR_AGENT_DEBUG) {
+          console.log(`  ↩️  evicted stale conversationState for convKey=${convKey} (blob expired upstream)`);
+        }
+      }
+
       const bridge = getBridge();
       try { bridge && bridge.close(); } catch {}
 
@@ -507,6 +519,10 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
     if (matching) {
       if (matching.isError) {
         payload = { error: matching.content || 'Tool execution failed' };
+      } else if (Array.isArray(matching.contentItems) && matching.contentItems.length > 0) {
+        // Pass the structured items so image blocks survive the round-trip
+        // (otherwise screenshots/PNG content from Read or Bash get dropped).
+        payload = { items: matching.contentItems };
       } else {
         payload = matching.content;
       }
@@ -604,20 +620,15 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
 
   const requestedModel = model || 'claude-sonnet-4-6';
 
-  // Cursor doesn't have a Claude Haiku model. We previously mapped haiku
-  // requests to `composer-2-fast` (Cursor's own Kimi-K2.5-derived Composer 2,
-  // not Claude). That's fine for the no-tool warmup ping that Claude Code
-  // 2.0.28+ sends, but for real haiku-with-tools requests we should fall
-  // back to real Claude. Detect warmup heuristically: a haiku request with
-  // no tools is almost certainly a warmup or quick-classification ping that
-  // never needs Claude semantics.
-  const isLikelyWarmup = (
-    /^claude-haiku/i.test(requestedModel) &&
-    (!tools || tools.length === 0)
-  );
+  // Cursor has no Claude Haiku model. We previously routed warmup pings to
+  // `composer-2-fast` (Cursor's own Kimi-K2.5-derived Composer 2, not Claude),
+  // but that means even cheap probes returned non-Claude tokens — confusing
+  // when surfaced in logs. Always upgrade haiku to the smallest real Claude
+  // on Cursor (`claude-sonnet-4-6`). Warmup pings are tiny anyway so the cost
+  // bump is negligible, and behavior is honest: every claude-* request
+  // returns actual Claude.
   let effectiveModel = requestedModel;
-  if (/^claude-haiku/i.test(requestedModel) && !isLikelyWarmup) {
-    // Real Claude Haiku doesn't exist on Cursor. Upgrade to smallest real Claude.
+  if (/^claude-haiku/i.test(requestedModel)) {
     effectiveModel = 'claude-sonnet-4-6';
   }
   const cursorModel = anthropicConverter.mapAnthropicModel(effectiveModel, config.anthropicModelMapping);

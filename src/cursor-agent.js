@@ -533,37 +533,77 @@ function startConversation(token, options = {}) {
   let heartbeat = null;
 
   // sendToolResult: write mcpResult into the live stream
+  //
+  // `content` may be:
+  //   - a string                                       → single text item
+  //   - { error: 'msg' }                                → mcpResult.error
+  //   - { items: [{kind:'text',text:''} | {kind:'image',mediaType:'',data:Buffer}, ...] }
+  //                                                     → preserves multimodal
+  //                                                       output (e.g., screenshots
+  //                                                       returned by Read on a PNG).
+  //   - any other value                                 → JSON-stringified text
   function sendToolResult(id, execId, content) {
     if (closed) return;
     const { create, toBinary, agent } = _requireProto();
-    let mcpResult;
-    if (typeof content === 'string') {
-      mcpResult = create(agent.McpResultSchema, {
-        result: {
-          case: 'success',
-          value: create(agent.McpSuccessSchema, {
-            content: [
-              create(agent.McpToolResultContentItemSchema, {
-                content: { case: 'text', value: create(agent.McpTextContentSchema, { text: content }) },
+
+    // Build the content[] array of MCP items
+    function buildContentItems(items) {
+      const out = [];
+      for (const it of items || []) {
+        if (!it) continue;
+        if (it.kind === 'image' && it.data && it.data.length > 0) {
+          out.push(create(agent.McpToolResultContentItemSchema, {
+            content: {
+              case: 'image',
+              value: create(agent.McpImageContentSchema, {
+                mimeType: it.mediaType || 'image/png',
+                data: it.data instanceof Uint8Array ? it.data : new Uint8Array(it.data),
               }),
-            ],
-            isError: false,
-          }),
-        },
-      });
-    } else if (content && typeof content === 'object' && content.error) {
+            },
+          }));
+        } else if (it.kind === 'text' && it.text) {
+          out.push(create(agent.McpToolResultContentItemSchema, {
+            content: { case: 'text', value: create(agent.McpTextContentSchema, { text: it.text }) },
+          }));
+        }
+      }
+      // Fallback if everything was filtered out
+      if (out.length === 0) {
+        out.push(create(agent.McpToolResultContentItemSchema, {
+          content: { case: 'text', value: create(agent.McpTextContentSchema, { text: '' }) },
+        }));
+      }
+      return out;
+    }
+
+    let mcpResult;
+    let summary = 'ok';
+    if (content && typeof content === 'object' && content.error) {
       mcpResult = create(agent.McpResultSchema, {
         result: { case: 'error', value: create(agent.McpErrorSchema, { error: String(content.error) }) },
       });
+      summary = `error: ${String(content.error).slice(0, 60)}`;
+    } else if (content && typeof content === 'object' && Array.isArray(content.items)) {
+      const items = buildContentItems(content.items);
+      mcpResult = create(agent.McpResultSchema, {
+        result: {
+          case: 'success',
+          value: create(agent.McpSuccessSchema, { content: items, isError: false }),
+        },
+      });
+      const text = content.items.filter(i => i.kind === 'text').length;
+      const image = content.items.filter(i => i.kind === 'image').length;
+      summary = `text=${text} image=${image}`;
     } else {
-      const s = content == null ? '' : (typeof content === 'string' ? content : JSON.stringify(content));
+      const text = typeof content === 'string' ? content
+        : (content == null ? '' : JSON.stringify(content));
       mcpResult = create(agent.McpResultSchema, {
         result: {
           case: 'success',
           value: create(agent.McpSuccessSchema, {
             content: [
               create(agent.McpToolResultContentItemSchema, {
-                content: { case: 'text', value: create(agent.McpTextContentSchema, { text: s }) },
+                content: { case: 'text', value: create(agent.McpTextContentSchema, { text }) },
               }),
             ],
             isError: false,
@@ -571,7 +611,7 @@ function startConversation(token, options = {}) {
         },
       });
     }
-    console.log(`[cursor-agent] sending tool result execId=${execId} ok=${!content?.error}`);
+    console.log(`[cursor-agent] sending tool result execId=${execId} ${summary}`);
     sendExecClientMessage(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
   }
 

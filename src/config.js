@@ -48,11 +48,14 @@ const config = {
     'claude-sonnet-4-5': 'claude-4.5-sonnet',
     // Claude 4 Sonnet
     'claude-sonnet-4-20250514': 'claude-4-sonnet-thinking',
-    // Claude Haiku (no Cursor haiku, use fast alternatives)
-    'claude-haiku-4-5-20251001': 'composer-2-fast',
-    'claude-haiku-4-5': 'composer-2-fast',
-    'claude-3-5-haiku-20241022': 'composer-2-fast',
-    'claude-3-5-haiku-latest': 'composer-2-fast',
+    // Claude Haiku — Cursor has no Haiku model. server.js intercepts haiku
+    // requests and rewrites them to claude-sonnet-4-6 (smallest real Claude)
+    // BEFORE reaching this mapping, so these entries are belt-and-suspenders.
+    'claude-haiku-4-5-20251001': 'claude-4.6-sonnet-medium',
+    'claude-haiku-4-5': 'claude-4.6-sonnet-medium',
+    'claude-3-5-haiku-20241022': 'claude-4.6-sonnet-medium',
+    'claude-3-5-haiku-latest': 'claude-4.6-sonnet-medium',
+    'claude-3-haiku-20240307': 'claude-4.6-sonnet-medium',
     // Claude 3.5 family
     'claude-3-5-sonnet-20241022': 'claude-4.5-sonnet',
     'claude-3-5-sonnet-latest': 'claude-4.5-sonnet',
@@ -60,7 +63,6 @@ const config = {
     'claude-3-opus-20240229': 'claude-4.6-opus-max-thinking',
     'claude-3-opus-latest': 'claude-4.6-opus-max-thinking',
     'claude-3-sonnet-20240229': 'claude-4.6-sonnet-medium',
-    'claude-3-haiku-20240307': 'gemini-3-flash',
     // Short aliases (point to latest)
     'claude-opus-4': 'claude-opus-4-7-thinking-max',
     'claude-sonnet-4': 'claude-4-sonnet-thinking',
