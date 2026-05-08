@@ -130,13 +130,18 @@ function getSharedClient() {
 // Used when we get a stream-level error that suggests the connection is
 // unhealthy (REFUSED_STREAM, GOAWAY, etc.) — opening a fresh TCP+TLS
 // connection clears whatever state caused the refusal.
+//
+// We deliberately do NOT call `c.close()` here. Other claude-code sessions
+// are sharing this same H2 client (that's the whole point of pre-warming
+// it). Closing it would send GOAWAY to Cursor and could cascade-fail their
+// in-flight streams. Instead just null the reference: future getSharedClient
+// calls open a fresh client, the old one's existing streams complete on
+// their own, and GC reaps it once they all end.
 function poisonSharedClient(reason) {
-  if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] poisoning shared client: ${reason}`);
-  const c = _sharedClient;
+  if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] poisoning shared client (will be replaced for new streams): ${reason}`);
   _sharedClient = null;
-  if (c && !c.destroyed) {
-    try { c.close(); } catch { /* ignore */ }
-  }
+  // The old client object is now unreferenced from this module; Node keeps
+  // it alive while it still has open streams, then frees it.
 }
 
 function prewarmSharedClient() {
@@ -515,6 +520,7 @@ function startConversation(token, options = {}) {
     onTextDelta,
     onThinkingDelta,
     onMcpCall,
+    onStepCompleted,
     onTurnEnded,
     onError,
   } = options;
@@ -523,13 +529,14 @@ function startConversation(token, options = {}) {
     onTextDelta: onTextDelta || (() => {}),
     onThinkingDelta: onThinkingDelta || (() => {}),
     onMcpCall: onMcpCall || (() => {}),
+    onStepCompleted: onStepCompleted || (() => {}),
     onTurnEnded: onTurnEnded || (() => {}),
     onError: onError || (() => {}),
   };
 
   function setCallbacks(newCallbacks) {
     if (!newCallbacks || typeof newCallbacks !== 'object') return;
-    for (const k of ['onTextDelta', 'onThinkingDelta', 'onMcpCall', 'onTurnEnded', 'onError']) {
+    for (const k of ['onTextDelta', 'onThinkingDelta', 'onMcpCall', 'onStepCompleted', 'onTurnEnded', 'onError']) {
       if (typeof newCallbacks[k] === 'function') {
         currentCallbacks[k] = newCallbacks[k];
       }
@@ -555,6 +562,11 @@ function startConversation(token, options = {}) {
   let inputTokens = 0;
   let outputTokens = 0;
   let capturedState = null;
+  // Tracks whether Cursor sent us a turnEnded message. If req.on('end') fires
+  // before this is set, the upstream cut us off mid-conversation and we need
+  // to surface that as an error so the proxy's HTTP response gets a clean
+  // 5xx (or stream error) instead of hanging forever.
+  let turnEndedFired = false;
   // Blob store keyed by blobId hex string
   const blobStore = new Map();
 
@@ -729,6 +741,7 @@ function startConversation(token, options = {}) {
           `[cursor-agent] turn ended in=${inputTokens} out=${outputTokens} ` +
           `state=${capturedState ? capturedState.length + 'B' : 'null'}`
         );
+        turnEndedFired = true;
         try {
           currentCallbacks.onTurnEnded({ inputTokens, outputTokens, conversationState: capturedState });
         } catch (e) {
@@ -983,9 +996,19 @@ function startConversation(token, options = {}) {
     });
     req.on('end', () => {
       if (closed) return;
-      clearInterval(heartbeat);
-      closed = true;
-      // Don't close the shared client — see close() above.
+      // If turnEnded already fired we're in the normal teardown window:
+      // close() will run momentarily and clean up. Just stop the heartbeat
+      // and mark closed so we don't double-handle.
+      if (turnEndedFired) {
+        clearInterval(heartbeat);
+        closed = true;
+        return;
+      }
+      // Premature end. Cursor cut the stream before delivering turnEnded
+      // — likely upstream shutdown, GOAWAY drain, or a transient hiccup.
+      // Don't silently mark closed; surface it so the proxy's HTTP
+      // response gets a 5xx instead of hanging. fail() handles cleanup.
+      fail('Upstream stream ended before turnEnded');
     });
     req.on('error', (e) => failOrRetry(proto, e.message || 'Stream error', e.code));
     req.on('timeout', () => fail('Request timeout'));
