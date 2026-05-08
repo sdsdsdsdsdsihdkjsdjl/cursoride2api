@@ -248,6 +248,62 @@ function buildTurnCallbacks(ctx) {
     }
   }
 
+  function finalizeToolUseTurn() {
+    if (turnState.toolUseFinished) return;
+    if (turnState.toolUseFinishTimer) {
+      clearTimeout(turnState.toolUseFinishTimer);
+      turnState.toolUseFinishTimer = null;
+    }
+    turnState.toolUseFinished = true;
+    closeOpenBlock();
+
+    // Cache the bridge for the client's follow-up tool_result POST.
+    const bridge = getBridge();
+    activeBridges.set(bridgeKey, {
+      bridge,
+      lastAccessMs: Date.now(),
+      mcpTools,
+      pendingExecs: turnState.pendingToolCalls.slice(),
+      convKey,
+      conversationId,
+      requestedModel,
+      cursorModel,
+      requestId,
+    });
+
+    if (isStream) {
+      if (!res.writableEnded) {
+        res.write(anthropicConverter.buildMessageDelta('tool_use', 0));
+        res.write(anthropicConverter.buildMessageStop());
+        res.end();
+      }
+    } else if (!res.headersSent) {
+      const toolUses = turnState.pendingToolCalls.map(tc => ({
+        id: tc.anthropicToolUseId,
+        name: tc.toolName,
+        input: tc.args,
+      }));
+      res.json(anthropicConverter.buildAnthropicResponse(
+        turnState.accumulatedText,
+        requestedModel,
+        0, 0,
+        { stopReason: 'tool_use', toolUses }
+      ));
+    }
+
+    console.log(
+      `  ✅ turn ended (tool_use finalize) | toolCalls=${turnState.pendingToolCalls.length}`
+    );
+  }
+
+  // Backstop debounce — fires if no `stepCompleted` arrives. The common
+  // case (stepCompleted comes ~10ms after the last mcpArgs) finalizes
+  // immediately via onStepCompleted; this 250ms is just a safety net.
+  function armToolUseFinalizer() {
+    if (turnState.toolUseFinishTimer) clearTimeout(turnState.toolUseFinishTimer);
+    turnState.toolUseFinishTimer = setTimeout(finalizeToolUseTurn, 250);
+  }
+
   return {
     closeOpenBlock,
 
@@ -310,54 +366,23 @@ function buildTurnCallbacks(ctx) {
       );
 
       // The Cursor stream is now paused waiting for our mcpResult — Cursor
-      // will NOT emit turnEnded until we send tool results. So when we get an
-      // mcpArgs we synthesize a turn-end with stop_reason=tool_use after a
-      // small debounce window (in case more parallel tool calls land).
-      if (turnState.toolUseFinishTimer) clearTimeout(turnState.toolUseFinishTimer);
-      turnState.toolUseFinishTimer = setTimeout(() => {
-        turnState.toolUseFinishTimer = null;
-        if (turnState.toolUseFinished) return;
-        turnState.toolUseFinished = true;
-        closeOpenBlock();
+      // will NOT emit turnEnded until we send tool results. So we synthesize
+      // a turn-end with stop_reason=tool_use either:
+      //   - immediately on `stepCompleted` (the model has finished emitting
+      //     tool calls for this step), or
+      //   - after a 250 ms backstop debounce in case stepCompleted is
+      //     delayed or missing.
+      // The first signal wins; the other is no-op'd by `toolUseFinished`.
+      armToolUseFinalizer();
+    },
 
-        // Cache the bridge for the client's follow-up tool_result POST.
-        const bridge = getBridge();
-        activeBridges.set(bridgeKey, {
-          bridge,
-          lastAccessMs: Date.now(),
-          mcpTools,
-          pendingExecs: turnState.pendingToolCalls.slice(),
-          convKey,
-          conversationId,
-          requestedModel,
-          cursorModel,
-          requestId,
-        });
-
-        if (isStream) {
-          if (!res.writableEnded) {
-            res.write(anthropicConverter.buildMessageDelta('tool_use', 0));
-            res.write(anthropicConverter.buildMessageStop());
-            res.end();
-          }
-        } else if (!res.headersSent) {
-          const toolUses = turnState.pendingToolCalls.map(tc => ({
-            id: tc.anthropicToolUseId,
-            name: tc.toolName,
-            input: tc.args,
-          }));
-          res.json(anthropicConverter.buildAnthropicResponse(
-            turnState.accumulatedText,
-            requestedModel,
-            0, 0,
-            { stopReason: 'tool_use', toolUses }
-          ));
-        }
-
-        console.log(
-          `  ✅ turn ended (tool_use finalize) | toolCalls=${turnState.pendingToolCalls.length}`
-        );
-      }, 250);
+    onStepCompleted: () => {
+      // Cursor finished a step; if we have pending tool calls, this is the
+      // signal that the model is done emitting them and is now waiting for
+      // the result. Fire the finalize immediately — saves the 250 ms debounce.
+      if (turnState.pendingToolCalls.length > 0 && !turnState.toolUseFinished) {
+        finalizeToolUseTurn();
+      }
     },
 
     onTurnEnded: ({ inputTokens, outputTokens, conversationState: newState }) => {
@@ -533,6 +558,7 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
     onTextDelta: callbacks.onTextDelta,
     onThinkingDelta: callbacks.onThinkingDelta,
     onMcpCall: callbacks.onMcpCall,
+    onStepCompleted: callbacks.onStepCompleted,
     onTurnEnded: callbacks.onTurnEnded,
     onError: callbacks.onError,
   });
@@ -614,6 +640,7 @@ async function handleFreshTurn(req, res, token, params) {
     onTextDelta: callbacks.onTextDelta,
     onThinkingDelta: callbacks.onThinkingDelta,
     onMcpCall: callbacks.onMcpCall,
+    onStepCompleted: callbacks.onStepCompleted,
     onTurnEnded: callbacks.onTurnEnded,
     onError: callbacks.onError,
   });
@@ -725,6 +752,10 @@ app.get('/health', (req, res) => {
 // ── 启动 ──
 const count = loadTokens();
 watchTokenFile();
+
+// Pre-warm the shared H2 client + proto schemas so the first /v1/messages
+// request doesn't pay the TLS handshake / proto load latency.
+cursorAgent.prewarmSharedClient();
 
 app.listen(PORT, HOST, () => {
   console.log('');

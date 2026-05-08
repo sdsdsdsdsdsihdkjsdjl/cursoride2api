@@ -85,6 +85,53 @@ function buildHeaders(token) {
   };
 }
 
+// ═══════════════════════════════════════════════
+//  Shared H2 client pool
+// ═══════════════════════════════════════════════
+//
+// HTTP/2 multiplexes streams, so a single client to api2.cursor.sh can
+// serve every request concurrently. Pre-warming the connection at server
+// startup hides the ~200-500 ms TLS+H2 handshake from the first request.
+// We keep one client alive and lazy-recreate it on close/error.
+
+let _sharedClient = null;
+let _sharedClientPromise = null;
+const _baseUrl = config.cursor.baseUrl;
+
+function getSharedClient() {
+  if (_sharedClient && !_sharedClient.destroyed && !_sharedClient.closed) {
+    return _sharedClient;
+  }
+  // Open a new one
+  if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] opening shared H2 client → ${_baseUrl}`);
+  _sharedClient = http2.connect(_baseUrl, {
+    // Cursor's server multiplexes >> 100 streams comfortably; bump from
+    // Node's default 100 just in case.
+    settings: { initialWindowSize: 1024 * 1024 * 8 },
+  });
+  _sharedClient.setMaxListeners(0); // every request adds listeners
+  _sharedClient.unref(); // don't keep the process alive on the client alone
+  _sharedClient.on('error', (e) => {
+    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] shared client error: ${e.message}`);
+    _sharedClient = null;
+  });
+  _sharedClient.on('close', () => {
+    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] shared client closed`);
+    _sharedClient = null;
+  });
+  _sharedClient.on('goaway', () => {
+    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] shared client goaway`);
+    _sharedClient = null;
+  });
+  return _sharedClient;
+}
+
+function prewarmSharedClient() {
+  // Ensure proto is loaded too (it's lazy-loaded otherwise)
+  loadProto().catch(() => { /* logged elsewhere */ });
+  try { getSharedClient(); } catch (e) { /* swallow */ }
+}
+
 // ── Deterministic conversation UUID derived from a key ──
 function deterministicConversationId(convKey) {
   const hex = crypto.createHash('sha256')
@@ -511,7 +558,9 @@ function startConversation(token, options = {}) {
     try { if (req) req.end(); } catch { /* ignore */ }
     setTimeout(() => {
       try { if (req) req.close(); } catch { /* ignore */ }
-      try { if (client) client.close(); } catch { /* ignore */ }
+      // NOTE: do NOT close `client` — it's the shared H2 client serving
+      // every request via stream multiplexing. Closing it would break
+      // every other in-flight conversation.
     }, 200);
   }
 
@@ -650,7 +699,15 @@ function startConversation(token, options = {}) {
         outputTokens += iuVal?.tokens || 0;
         return;
       }
-      if (iuCase === 'stepCompleted' || iuCase === 'stepStarted') return;
+      if (iuCase === 'stepStarted') return;
+      if (iuCase === 'stepCompleted') {
+        // Bubble up so server.js can finalize a tool_use turn immediately
+        // when a step finishes — saves the 250 ms parallel-tool debounce on
+        // the common single-tool case.
+        try { currentCallbacks.onStepCompleted && currentCallbacks.onStepCompleted(); }
+        catch (e) { /* ignore */ }
+        return;
+      }
       if (iuCase === 'turnEnded') {
         // Note: turnEnded message has no fields per the proto def.
         // Token counts have been accumulated via tokenDelta and the
@@ -761,23 +818,14 @@ function startConversation(token, options = {}) {
     if (connectionStarted) return;
     connectionStarted = true;
     try {
-      client = http2.connect(config.cursor.baseUrl);
+      // Reuse the pre-warmed shared client. HTTP/2 multiplexes streams so
+      // many simultaneous /v1/messages calls share one TCP/TLS connection,
+      // and the first request after server startup pays no handshake cost.
+      client = getSharedClient();
     } catch (e) {
       currentCallbacks.onError(`Connection failed: ${e.message}`);
       return;
     }
-    client.on('error', (e) => {
-      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client error: ${e.message}`);
-    });
-    client.on('close', () => {
-      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client closed`);
-    });
-    client.on('connect', () => {
-      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client connected`);
-    });
-    client.on('goaway', () => {
-      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] client goaway`);
-    });
 
     req = client.request(buildHeaders(token));
     req.setTimeout(config.cursor.requestTimeout);
@@ -789,10 +837,8 @@ function startConversation(token, options = {}) {
     req.on('end', () => {
       if (closed) return;
       clearInterval(heartbeat);
-      if (!closed) {
-        closed = true;
-        try { client.close(); } catch { /* ignore */ }
-      }
+      closed = true;
+      // Don't close the shared client — see close() above.
     });
     req.on('error', (e) => fail(e.message || 'Stream error'));
     req.on('timeout', () => fail('Request timeout'));
@@ -946,4 +992,5 @@ module.exports = {
   encodeFrame,
   buildHeaders,
   loadProto,
+  prewarmSharedClient,
 };
