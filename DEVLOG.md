@@ -529,11 +529,42 @@ key = sha256("bridge:"
 - **`remotePort`** = `req.socket.remotePort`. A claude-code process keeps a single keep-alive socket, so the port is stable within a session. Two concurrent processes get distinct ports → distinct keys → no collision.
 - **`sortedToolNamesHash`** = SHA-256 of comma-joined sorted tool names, truncated to 8 hex chars. Stable within a session (tool list doesn't change across continuations). Diverges across sessions with different tool sets (one with `mcp__playwright_*`, one without) even on the same TCP socket. Tool order doesn't matter.
 
-**Cost:** if a client's keep-alive times out and reconnects mid-conversation (e.g., undici's default 4 s `keepAliveTimeout` elapses during a long model-thinking pause), the new socket has a different port → bridge cache miss. The proxy gracefully falls through to `handleFreshTurn`, which rebuilds the conversation from the full message history. Slower than a cache hit (one extra H2 stream + context re-upload) but correct.
+**Cost (mitigated below):** if a client's keep-alive times out and reconnects mid-conversation (e.g., undici's default 4 s `keepAliveTimeout` elapses during a long model-thinking pause), the new socket has a different port → bridgeKey lookup misses. We added a *second* cache index keyed on a per-bridge `sessionId` (uuid) embedded into every `tool_use_id` we mint, so continuations resolve via sessionId regardless of TCP socket. See next subsection.
 
 Verified:
 - Unit test (8 cases): same client / continuation matches; different port / IP / model / tools / system all diverge; tool order is stable.
 - E2E: two parallel `claude -p` invocations with **identical** prompts on the same machine got distinct convKeys (`11eb2c30221071d5` vs `58aa770ea5201950`) and both completed cleanly. Pre-fix they would have collided.
+
+### Bridge cache, second index: by sessionId
+
+After the salted-key fix, real-world traces showed `Bridge cache miss for continuation; starting fresh` firing on roughly every other continuation in long sessions. Cause: undici's default `keepAliveTimeout` is 4 s, and a single Opus thinking turn often lasts longer. The follow-up POST lands on a fresh TCP socket → new `remotePort` → the `bridgeKey` (which now includes `remotePort`) doesn't match. The fallback works — it rebuilds the conversation from the message history — but at 100 KB+ of context, every miss costs an extra H2 stream and a re-upload.
+
+Fix: every `tool_use_id` minted by the proxy now carries a per-bridge `sessionId` (uuid v4) in its `si` field. We maintain two indices over the same bridge entry:
+
+```
+activeBridges:      bridgeKey   → entry   (works when client reuses keep-alive socket)
+bridgesBySessionId: sessionId   → entry   (works across TCP reconnects — sessionId is stable)
+```
+
+Continuation lookup tries sessionId first (extracted from the first `tool_result`'s `tool_use_id`) and falls back to `bridgeKey`. The two pointers are kept in sync on insert / delete / TTL-evict.
+
+Why uuid: even if two concurrent sessions hash to the same `bridgeKey`, their bridges get distinct uuids → no aliasing across sessions. So sessionId carries both stability (per-bridge identity) and uniqueness (per-bridge nonce) — properties the salt alone could only approximate.
+
+Format:
+```js
+toolu_<base64url(JSON({
+  ck: convKey,    // legacy — still encoded for debug/logs
+  ei: execId,     // Cursor's execution id
+  tc: toolCallId, // Cursor's tool call id
+  si: sessionId,  // NEW: per-bridge uuid; old IDs without `si` decode as sessionId=""
+}))>
+```
+
+Backward compat: `decodeToolUseId` returns `sessionId: ""` for any `toolu_` minted before this field existed; the lookup then falls through to bridgeKey as before.
+
+Verified:
+- Targeted test: drove 2 turns with explicit `Connection: close` between them (force a fresh TCP). Pre-fix: cache miss + fallback. Post-fix: log line `↪️ continuation cache hit via sessionId=…` and zero misses.
+- E2E parallel test: two identical-prompt `claude -p` sessions completed with **0 cache misses** and 3 sessionId hits across their continuations.
 
 ### Verified
 

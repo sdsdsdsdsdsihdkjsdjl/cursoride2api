@@ -36,10 +36,16 @@ const CLIENT_VERSION = process.env.CURSOR_CLIENT_VERSION || '2.6.20';
 
 // ── Bridge / conversation caches (Anthropic tool-use flow) ──
 //
-// activeBridges:    bridgeKey  -> { bridge, lastAccessMs, mcpTools, pendingExecs, convKey, conversationId, requestedModel, cursorModel }
+// activeBridges:    bridgeKey  -> { bridge, lastAccessMs, mcpTools, pendingExecs, convKey, conversationId, sessionId, requestedModel, cursorModel }
 //                   pendingExecs: [{ execMsgId, execId, toolCallId, toolName, args, anthropicToolUseId, blockIndex }]
+// bridgesBySessionId: sessionId -> same entry as above (alternate index — same
+//                   object, two pointers). Used to find the bridge across TCP
+//                   socket changes: the client's tool_use_id encodes the
+//                   sessionId, which stays stable through keepAliveTimeout
+//                   reconnects on a new remotePort.
 // conversationStates: convKey  -> { conversationId, state: Buffer, lastAccessMs }
 const activeBridges = new Map();
+const bridgesBySessionId = new Map();
 const conversationStates = new Map();
 
 const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 min
@@ -53,6 +59,7 @@ function evictStale() {
     if (now - v.lastAccessMs > CONVERSATION_TTL_MS) {
       try { v.bridge.close(); } catch {}
       activeBridges.delete(k);
+      if (v.sessionId) bridgesBySessionId.delete(v.sessionId);
     }
   }
 }
@@ -237,7 +244,7 @@ function setSSEHeaders(res) {
 function buildTurnCallbacks(ctx) {
   const {
     res, isStream, turnState,
-    convKey, bridgeKey, conversationId,
+    convKey, bridgeKey, conversationId, sessionId,
     requestedModel, cursorModel, mcpTools,
     getBridge, requestId,
   } = ctx;
@@ -266,19 +273,26 @@ function buildTurnCallbacks(ctx) {
     turnState.toolUseFinished = true;
     closeOpenBlock();
 
-    // Cache the bridge for the client's follow-up tool_result POST.
+    // Cache the bridge for the client's follow-up tool_result POST. We store
+    // the SAME entry object under two indices: bridgeKey (the salted hash —
+    // works when the client reuses its keep-alive socket) and sessionId (the
+    // per-bridge uuid — works across TCP socket reconnects, since the
+    // tool_use_id we just minted carries this sessionId).
     const bridge = getBridge();
-    activeBridges.set(bridgeKey, {
+    const entry = {
       bridge,
       lastAccessMs: Date.now(),
       mcpTools,
       pendingExecs: turnState.pendingToolCalls.slice(),
       convKey,
       conversationId,
+      sessionId,
       requestedModel,
       cursorModel,
       requestId,
-    });
+    };
+    activeBridges.set(bridgeKey, entry);
+    if (sessionId) bridgesBySessionId.set(sessionId, entry);
 
     if (isStream) {
       if (!res.writableEnded) {
@@ -349,7 +363,7 @@ function buildTurnCallbacks(ctx) {
     onMcpCall: ({ id, execId, toolCallId, toolName, args }) => {
       closeOpenBlock();
       const blockIndex = turnState.nextBlockIndex++;
-      const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, execId, toolCallId);
+      const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, execId, toolCallId, sessionId);
 
       turnState.pendingToolCalls.push({
         execMsgId: id, execId, toolCallId, toolName, args,
@@ -421,19 +435,23 @@ function buildTurnCallbacks(ctx) {
       const bridge = getBridge();
 
       if (hasTools) {
-        activeBridges.set(bridgeKey, {
+        const entry = {
           bridge,
           lastAccessMs: Date.now(),
           mcpTools,
           pendingExecs: turnState.pendingToolCalls.slice(),
           convKey,
           conversationId,
+          sessionId,
           requestedModel,
           cursorModel,
           requestId,
-        });
+        };
+        activeBridges.set(bridgeKey, entry);
+        if (sessionId) bridgesBySessionId.set(sessionId, entry);
       } else {
         activeBridges.delete(bridgeKey);
+        if (sessionId) bridgesBySessionId.delete(sessionId);
         try { bridge && bridge.close(); } catch {}
       }
 
@@ -473,6 +491,7 @@ function buildTurnCallbacks(ctx) {
     onError: (errMsg) => {
       console.error(`  ❌ ${errMsg}`);
       activeBridges.delete(bridgeKey);
+      if (sessionId) bridgesBySessionId.delete(sessionId);
 
       debugLog.logCursorError({
         request_id: requestId,
@@ -558,6 +577,7 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
     // the original entry.
     bridgeKey,
     conversationId: cached.conversationId,
+    sessionId: cached.sessionId,
     requestedModel, cursorModel,
     mcpTools: cached.mcpTools,
     getBridge: () => cached.bridge,
@@ -632,12 +652,18 @@ async function handleFreshTurn(req, res, token, params) {
 
   const turnState = makeTurnState();
 
+  // sessionId is a per-bridge uuid baked into every tool_use_id we mint. It
+  // lets continuations find this bridge across TCP socket reconnects (the
+  // bridgeKey lookup misses when the client's keepAliveTimeout expires and
+  // it reconnects on a new remotePort).
+  const sessionId = uuidv4();
+
   // Forward declaration — `bridge` is assigned below but the callbacks need
   // a stable getter so `getBridge()` returns the right object.
   let bridge = null;
   const callbacks = buildTurnCallbacks({
     res, isStream, turnState,
-    convKey, bridgeKey, conversationId,
+    convKey, bridgeKey, conversationId, sessionId,
     requestedModel, cursorModel, mcpTools,
     getBridge: () => bridge,
     requestId: params.requestId,
@@ -769,10 +795,25 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
 
   // Path A: continuation — caller is delivering tool_result blocks.
   if (isContinuation) {
-    const cached = activeBridges.get(bridgeKey);
+    // Try sessionId-based lookup first. The client's tool_use_id encodes the
+    // bridge's sessionId — stable across TCP reconnects (undici closes idle
+    // sockets after 4 s, the next request lands on a new remotePort, which
+    // would otherwise miss the bridgeKey-indexed cache).
+    let cached = null;
+    let cacheHitVia = '';
+    const probeResults = anthropicTools.extractToolResults(messages);
+    if (probeResults.length > 0 && probeResults[0].sessionId) {
+      cached = bridgesBySessionId.get(probeResults[0].sessionId);
+      if (cached) cacheHitVia = `sessionId=${probeResults[0].sessionId.slice(0,8)}`;
+    }
+    if (!cached) {
+      cached = activeBridges.get(bridgeKey);
+      if (cached) cacheHitVia = `bridgeKey=${bridgeKey}`;
+    }
     if (cached) {
       cached.lastAccessMs = Date.now();
       cached.requestId = requestId;
+      if (process.env.CURSOR_AGENT_DEBUG) console.log(`  ↪️  continuation cache hit via ${cacheHitVia}`);
       return handleContinuation(req, res, cached, messages, requestedModel, cursorModel, isStream, bridgeKey);
     }
     // Cache miss — bridge died or was evicted. Fall through to a fresh turn

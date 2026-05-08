@@ -116,22 +116,34 @@ function anthropicToolsToMcpTools(tools, providerIdentifier) {
 
 /**
  * 生成可逆的 tool_use_id
- * 把 conversationKey/execId/toolCallId 打包成 base64url，便于后续解析
+ * 把 conversationKey/execId/toolCallId/sessionId 打包成 base64url，便于后续解析
  * 格式: toolu_<base64url(JSON)>
+ *
+ * `sessionId` (optional, encoded as `si`) is a per-bridge UUID minted by the
+ * proxy. Continuations carrying any tool_use_id let us look up the original
+ * bridge by sessionId, which is stable even when the client reconnects on a
+ * fresh TCP socket (undici's 4 s keepAliveTimeout closes idle conns; the
+ * follow-up request lands on a new remotePort and would otherwise miss the
+ * bridge cache). sessionId is a uuid → unique across concurrent sessions even
+ * when their salted bridgeKey would have collided.
  */
-function encodeToolUseId(conversationKey, execId, toolCallId) {
-  const payload = JSON.stringify({
+function encodeToolUseId(conversationKey, execId, toolCallId, sessionId) {
+  const obj = {
     ck: String(conversationKey || ''),
     ei: String(execId || ''),
     tc: String(toolCallId || ''),
-  });
-  const packed = Buffer.from(payload, 'utf8').toString('base64url');
+  };
+  if (sessionId) obj.si = String(sessionId);
+  const packed = Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
   return `toolu_${packed}`;
 }
 
 /**
- * 解析 tool_use_id → { conversationKey, execId, toolCallId }
+ * 解析 tool_use_id → { conversationKey, execId, toolCallId, sessionId }
  * 解析失败返回 null
+ *
+ * `sessionId` is empty for tool_use_ids minted before this field existed,
+ * so callers must treat it as optional and fall back to bridgeKey lookup.
  */
 function decodeToolUseId(toolUseId) {
   if (!toolUseId || typeof toolUseId !== 'string') return null;
@@ -148,6 +160,7 @@ function decodeToolUseId(toolUseId) {
       conversationKey: obj.ck || '',
       execId: obj.ei || '',
       toolCallId: obj.tc || '',
+      sessionId: obj.si || '',
     };
   } catch (e) {
     return null;
@@ -232,6 +245,7 @@ function extractToolResults(messages) {
         conversationKey: '',
         execId: '',
         toolCallId: '',
+        sessionId: '',
       };
 
       out.push({
@@ -239,6 +253,7 @@ function extractToolResults(messages) {
         conversationKey: decoded.conversationKey,
         execId: decoded.execId,
         toolCallId: decoded.toolCallId,
+        sessionId: decoded.sessionId,
         // Legacy field — text-only flattening for callers that haven't
         // adopted `contentItems`.
         content: stringifyToolResultContent(block.content),
