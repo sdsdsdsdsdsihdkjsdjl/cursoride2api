@@ -415,6 +415,9 @@ function buildTurnCallbacks(ctx) {
       if (!isStream) {
         turnState.accumulatedText += text;
       }
+      // Always append to the hallucination-detection buffer (cheap; bounded
+      // by total text size of one turn). Used at end_turn time only.
+      turnState.emittedTextForDetection += text;
       if (isStream && !res.writableEnded) {
         res.write(anthropicConverter.buildContentBlockDelta(turnState.nextBlockIndex - 1, text));
       }
@@ -510,12 +513,61 @@ function buildTurnCallbacks(ctx) {
         return;
       }
 
+      // Hallucinated-tool-call rescue: if the turn ended without any
+      // structured tool_use AND the model emitted text matching
+      // `[Tool call: NAME({...})]`, synthesize tool_use blocks so the tool
+      // actually runs. Without this, claude-code shows the bracketed string
+      // as text and the conversation stalls. See parseHallucinatedToolCalls
+      // for the parser; this is a workaround for Cursor's model occasionally
+      // falling out of structured-tool-use mode (especially with low effort
+      // or long contexts where tool-name aliases like AskQuestion vs
+      // mcp_AskUserQuestion get muddled).
+      if (turnState.pendingToolCalls.length === 0 && turnState.emittedTextForDetection) {
+        const hits = anthropicTools.parseHallucinatedToolCalls(turnState.emittedTextForDetection);
+        if (hits.length > 0) {
+          const registered = new Set((mcpTools || []).map(t => t.name).concat((mcpTools || []).map(t => t.toolName)));
+          for (const hit of hits) {
+            const canonical = anthropicTools.canonicalizeHallucinatedToolName(hit.name, registered);
+            const synthExecId = '';
+            const synthToolCallId = `toolu_synth_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
+            const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, synthExecId, synthToolCallId, sessionId);
+            const blockIndex = turnState.nextBlockIndex++;
+            turnState.pendingToolCalls.push({
+              execMsgId: 0,
+              execId: synthExecId,
+              toolCallId: synthToolCallId,
+              toolName: canonical,
+              args: hit.args || {},
+              anthropicToolUseId,
+              blockIndex,
+              synthetic: true,
+            });
+            // Emit the tool_use as new content blocks AFTER the text the
+            // client already saw. Slightly cluttered (text + tool_use in
+            // the same response) but lets the tool actually run.
+            if (isStream && !res.writableEnded) {
+              res.write(anthropicConverter.buildContentBlockStartToolUse(blockIndex, anthropicToolUseId, canonical));
+              try { res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, JSON.stringify(hit.args || {}))); }
+              catch { res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, '{}')); }
+              res.write(anthropicConverter.buildContentBlockStop(blockIndex));
+            }
+            console.log(`  🩹 hallucinated-tool-call rescued: ${hit.name}${canonical !== hit.name ? ' → ' + canonical : ''}`);
+          }
+        }
+      }
+
       const hasTools = turnState.pendingToolCalls.length > 0;
       const stopReason = hasTools ? 'tool_use' : 'end_turn';
+      // If every pending tool call is synthetic (rescued from hallucinated
+      // text), Cursor's stream wasn't actually waiting on these. Don't keep
+      // the bridge — force the client's continuation to cache-miss into a
+      // fresh-turn rebuild that includes the synthetic tool_use + tool_result
+      // in the message history.
+      const allSynthetic = hasTools && turnState.pendingToolCalls.every(tc => tc.synthetic);
 
       const bridge = getBridge();
 
-      if (hasTools) {
+      if (hasTools && !allSynthetic) {
         const entry = cachedEntry || {
           bridge,
           mcpTools,
@@ -530,11 +582,11 @@ function buildTurnCallbacks(ctx) {
         entry.requestId = requestId;
         indexBridgeEntry(entry, bridgeKey);
       } else {
-        // Conversation finished cleanly. If we had a cached entry (this was a
-        // continuation), drop ALL aliases via dropBridgeEntry. Otherwise just
-        // close the standalone bridge.
+        // Either a clean end_turn OR a fully-synthetic-tools turn that we
+        // can't serve via the existing bridge. Drop the cached entry (if
+        // any) so the next continuation cache-misses and rebuilds.
         if (cachedEntry) {
-          dropBridgeEntry(cachedEntry, 'end_turn');
+          dropBridgeEntry(cachedEntry, allSynthetic ? 'synthetic-tool-use' : 'end_turn');
         } else {
           try { bridge && bridge.close(); } catch {}
         }
@@ -637,6 +689,11 @@ function makeTurnState() {
   return {
     textBlockOpen: false,
     thinkingBlockOpen: false,
+    // Buffer of every text delta we've forwarded this turn — kept regardless
+    // of isStream because we need it at end_turn to detect hallucinated
+    // tool calls (`[Tool call: NAME({...})]`) the model emitted as text
+    // instead of as structured tool_use. See parseHallucinatedToolCalls.
+    emittedTextForDetection: '',
     nextBlockIndex: 0,
     pendingToolCalls: [],   // { execMsgId, execId, toolCallId, toolName, args, anthropicToolUseId, blockIndex }
     accumulatedText: '',

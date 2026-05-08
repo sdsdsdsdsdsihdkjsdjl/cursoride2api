@@ -432,6 +432,104 @@ function hasToolResults(messages) {
   return last.content.some(b => b && b.type === 'tool_result');
 }
 
+/**
+ * Detect "hallucinated tool calls" — text content matching the pattern
+ * `[Tool call: NAME]` or `[Tool call: NAME({...json...})]` that the model
+ * sometimes emits as a *text block* instead of a structured tool_use.
+ * Cursor's model can fall out of "tool-use mode" (especially on long
+ * contexts or when tool-name conflicts confuse it, e.g. the model wants
+ * Cursor's native `AskQuestion` but we registered it as `mcp_AskUserQuestion`)
+ * and describe the call in text. claude-code shows the bracketed string
+ * verbatim and the conversation stalls because no tool was actually invoked.
+ *
+ * Returns an array of { name, args } for each match.
+ *
+ * Uses a brace-depth-counting parser for the JSON args so embedded `{}/`}`
+ * chars don't confuse it (a naive regex would). Quoted strings inside the
+ * JSON are tracked so braces inside strings don't perturb depth.
+ *
+ * Returns [] if no matches.
+ */
+function parseHallucinatedToolCalls(text) {
+  const results = [];
+  if (!text || typeof text !== 'string') return results;
+  const TAG = '[Tool call: ';
+  let i = 0;
+  while (i < text.length) {
+    const start = text.indexOf(TAG, i);
+    if (start === -1) break;
+    let p = start + TAG.length;
+    // Read tool name up to '(' or ']'.
+    let nameEnd = p;
+    while (nameEnd < text.length && text[nameEnd] !== '(' && text[nameEnd] !== ']') nameEnd++;
+    const name = text.slice(p, nameEnd).trim();
+    p = nameEnd;
+
+    let args = {};
+    let parseOk = true;
+    if (text[p] === '(' && text[p + 1] === '{') {
+      // Find the matching '}' for the JSON arg object using brace counting,
+      // respecting string literals (so `"description":"})"` inside doesn't fool us).
+      let depth = 0;
+      let inStr = false;
+      let escape = false;
+      let jsonStart = p + 1;
+      let jsonEnd = jsonStart;
+      while (jsonEnd < text.length) {
+        const c = text[jsonEnd];
+        if (escape) { escape = false; jsonEnd++; continue; }
+        if (c === '\\' && inStr) { escape = true; jsonEnd++; continue; }
+        if (c === '"') { inStr = !inStr; jsonEnd++; continue; }
+        if (!inStr) {
+          if (c === '{') depth++;
+          else if (c === '}') { depth--; if (depth === 0) { jsonEnd++; break; } }
+        }
+        jsonEnd++;
+      }
+      if (depth !== 0) { parseOk = false; }
+      else {
+        const jsonStr = text.slice(jsonStart, jsonEnd);
+        try { args = JSON.parse(jsonStr); }
+        catch { parseOk = false; }
+      }
+      p = jsonEnd;
+      if (text[p] === ')') p++;
+    } else if (text[p] === ']') {
+      // No args — keep args = {}.
+    } else if (text[p] === '(' && text[p + 1] !== '{') {
+      // Malformed — skip past the start tag and keep scanning.
+      parseOk = false;
+    }
+    if (text[p] === ']') p++;
+
+    if (parseOk && name) results.push({ name, args, span: [start, p] });
+    // Always advance past the start tag at minimum to avoid infinite loop.
+    i = Math.max(p, start + TAG.length);
+  }
+  return results;
+}
+
+// Common Cursor-native → claude-code-tool-name mappings, used when a
+// hallucinated tool call references a name we don't have but for which a
+// claude-code equivalent exists. Preserves the model's intent without
+// requiring an exact name match.
+const HALLUCINATED_NAME_ALIASES = {
+  'AskQuestion': 'AskUserQuestion',
+  'Shell': 'Bash',
+  'Ls': 'LS',
+  'Fetch': 'WebFetch',
+};
+
+function canonicalizeHallucinatedToolName(name, registeredNames) {
+  if (!name) return name;
+  if (registeredNames && registeredNames.has(name)) return name;
+  const aliased = HALLUCINATED_NAME_ALIASES[name];
+  if (aliased && registeredNames && registeredNames.has(aliased)) return aliased;
+  // Caller decides whether to forward as-is and let claude-code report
+  // "tool not found", or to drop. Default: forward as-is.
+  return name;
+}
+
 module.exports = {
   anthropicToolsToMcpTools,
   encodeToolUseId, decodeToolUseId,
@@ -440,4 +538,5 @@ module.exports = {
   deriveConversationKey, deriveBridgeKey,
   deterministicConversationId,
   hasToolResults,
+  parseHallucinatedToolCalls, canonicalizeHallucinatedToolName,
 };
