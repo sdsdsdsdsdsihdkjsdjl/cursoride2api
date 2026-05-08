@@ -566,6 +566,32 @@ Verified:
 - Targeted test: drove 2 turns with explicit `Connection: close` between them (force a fresh TCP). Pre-fix: cache miss + fallback. Post-fix: log line `↪️ continuation cache hit via sessionId=…` and zero misses.
 - E2E parallel test: two identical-prompt `claude -p` sessions completed with **0 cache misses** and 3 sessionId hits across their continuations.
 
+### Bridge cache, third refinement: alias tracking
+
+Subtle leak surfaced in code review: when a continuation hits via sessionId on a different remotePort, `finalizeToolUseTurn` re-caches the entry under the *new* bridgeKey but the *old* alias persists in `activeBridges`. Long sessions accumulate stale aliases that block on TTL eviction (which can also try to close the bridge twice).
+
+Fix: track every bridgeKey an entry has ever been indexed under in `entry.bridgeKeys` (a `Set`). On bridge close — whether via end_turn, error, or TTL eviction — `dropBridgeEntry` walks the set and deletes every alias. `indexBridgeEntry` is the only path that writes to either map, ensuring the set stays in sync. Same pattern applies to fresh-turn vs continuation paths in `buildTurnCallbacks`: continuations mutate the existing entry in place (preserving its alias set) instead of creating a new one.
+
+### H2 client pool
+
+A second concern surfaced in review: a single shared HTTP/2 connection means every claude-code session competes on one connection-level flow-control budget and one upstream scheduling context. Even though HTTP/2 multiplexes streams, in practice a long tool-heavy turn can degrade scheduling fairness for a sibling no-tool query.
+
+Fix: replace the single `_sharedClient` with a pool of `H2_POOL_SIZE` (default 3) pre-warmed clients. Round-robin assignment per fresh stream gives each lane its own flow-control budget. `poisonSharedClient(reason, client)` only nulls the specific failing client's slot; sibling slots are untouched. Refill is lazy.
+
+Continuations stay on whichever client opened their original stream (the bridge holds the `req` reference), so sessionId-based cache hits don't bounce between connections.
+
+### Per-request timing logs
+
+Every turn end now logs a compact `⏱` line with milestones relative to `t0` (request received): `firstFrame`, `firstText` or `firstTool`, `turnEnded`, `respEnded`. Lets the user see at a glance whether a slow request was upstream Cursor latency (large `firstFrame`) or local proxy work (`turnEnded → respEnded` gap). Sample line:
+
+```
+✅ turn ended | in=16586 out=56 | stopReason=end_turn | toolCalls=0 | ⏱ firstFrame=4606ms firstText=4606ms turnEnded=5038ms respEnded=5038ms
+```
+
+### `pickToken` deferred until fresh-turn path
+
+Previously `pickToken()` ran on every `/v1/messages` POST, including continuations that don't actually use a fresh token. Each unused call advanced `roundRobinIndex`, skewing token assignment for unrelated fresh requests. Moved the call to after continuation cache lookup so cache-hits are token-agnostic.
+
 ### Verified
 
 - 4-way unit test: identical-conversation continuation matches; different IP / different system / different model all diverge.

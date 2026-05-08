@@ -50,18 +50,52 @@ const conversationStates = new Map();
 
 const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 min
 
+// Tear an entry down completely: close the bridge, drop every bridgeKey
+// alias the entry was ever stored under, and drop the sessionId index. We
+// track aliases on the entry itself (entry.bridgeKeys, a Set) because a
+// continuation that arrives on a new TCP socket re-caches under a different
+// bridgeKey while reusing the same entry; without alias tracking the old
+// key would dangle and a future eviction pass could double-close the bridge.
+function dropBridgeEntry(entry, reason) {
+  if (!entry || entry._dropped) return;
+  entry._dropped = true;
+  try { entry.bridge && entry.bridge.close(); } catch { /* ignore */ }
+  if (entry.bridgeKeys) {
+    for (const bk of entry.bridgeKeys) {
+      // Only delete if the map still points at THIS entry — a different
+      // entry may have legitimately taken the same bridgeKey since.
+      if (activeBridges.get(bk) === entry) activeBridges.delete(bk);
+    }
+  }
+  if (entry.sessionId && bridgesBySessionId.get(entry.sessionId) === entry) {
+    bridgesBySessionId.delete(entry.sessionId);
+  }
+  if (process.env.CURSOR_AGENT_DEBUG && reason) {
+    console.log(`  🧹 dropped bridge entry sessionId=${(entry.sessionId || '').slice(0, 8)} reason=${reason}`);
+  }
+}
+
+// Insert/refresh a bridge entry under a given bridgeKey. Maintains the
+// entry.bridgeKeys alias set so dropBridgeEntry can clean up everything.
+function indexBridgeEntry(entry, bridgeKey) {
+  if (!entry.bridgeKeys) entry.bridgeKeys = new Set();
+  entry.bridgeKeys.add(bridgeKey);
+  activeBridges.set(bridgeKey, entry);
+  if (entry.sessionId) bridgesBySessionId.set(entry.sessionId, entry);
+}
+
 function evictStale() {
   const now = Date.now();
   for (const [k, v] of conversationStates) {
     if (now - v.lastAccessMs > CONVERSATION_TTL_MS) conversationStates.delete(k);
   }
-  for (const [k, v] of activeBridges) {
-    if (now - v.lastAccessMs > CONVERSATION_TTL_MS) {
-      try { v.bridge.close(); } catch {}
-      activeBridges.delete(k);
-      if (v.sessionId) bridgesBySessionId.delete(v.sessionId);
-    }
+  // Collect victims first; drop them outside the iteration so we never
+  // mutate activeBridges while iterating.
+  const victims = new Set();
+  for (const [, v] of activeBridges) {
+    if (now - v.lastAccessMs > CONVERSATION_TTL_MS) victims.add(v);
   }
+  for (const v of victims) dropBridgeEntry(v, 'ttl');
 }
 setInterval(evictStale, 60 * 1000).unref();
 
@@ -247,7 +281,19 @@ function buildTurnCallbacks(ctx) {
     convKey, bridgeKey, conversationId, sessionId,
     requestedModel, cursorModel, mcpTools,
     getBridge, requestId,
+    // Optional — present for continuation turns. When set we update the
+    // existing entry in place (preserving its bridgeKey alias set) instead
+    // of creating a new one.
+    cachedEntry,
+    // Timings object — populated by callbacks; logged on turn end so the
+    // user can see where time went (local proxy work vs upstream Cursor).
+    timings,
   } = ctx;
+  function stamp(name) {
+    if (timings && timings.t0 != null && timings[name] == null) {
+      timings[name] = Date.now() - timings.t0;
+    }
+  }
 
   function closeOpenBlock() {
     if (turnState.textBlockOpen) {
@@ -273,26 +319,25 @@ function buildTurnCallbacks(ctx) {
     turnState.toolUseFinished = true;
     closeOpenBlock();
 
-    // Cache the bridge for the client's follow-up tool_result POST. We store
-    // the SAME entry object under two indices: bridgeKey (the salted hash —
-    // works when the client reuses its keep-alive socket) and sessionId (the
-    // per-bridge uuid — works across TCP socket reconnects, since the
-    // tool_use_id we just minted carries this sessionId).
+    // Cache the bridge for the client's follow-up tool_result POST. For a
+    // continuation turn we mutate the existing entry in place so the alias
+    // set (entry.bridgeKeys) accumulates across socket reconnects. For a
+    // fresh turn we create a new entry. Either way indexBridgeEntry adds
+    // the current bridgeKey to the alias set and refreshes both indices.
     const bridge = getBridge();
-    const entry = {
+    const entry = cachedEntry || {
       bridge,
-      lastAccessMs: Date.now(),
       mcpTools,
-      pendingExecs: turnState.pendingToolCalls.slice(),
       convKey,
       conversationId,
       sessionId,
       requestedModel,
       cursorModel,
-      requestId,
     };
-    activeBridges.set(bridgeKey, entry);
-    if (sessionId) bridgesBySessionId.set(sessionId, entry);
+    entry.lastAccessMs = Date.now();
+    entry.pendingExecs = turnState.pendingToolCalls.slice();
+    entry.requestId = requestId;
+    indexBridgeEntry(entry, bridgeKey);
 
     if (isStream) {
       if (!res.writableEnded) {
@@ -314,8 +359,11 @@ function buildTurnCallbacks(ctx) {
       ));
     }
 
+    stamp('turnEnded');
+    stamp('respEnded');
     console.log(
-      `  ✅ turn ended (tool_use finalize) | toolCalls=${turnState.pendingToolCalls.length}`
+      `  ✅ turn ended (tool_use finalize) | toolCalls=${turnState.pendingToolCalls.length}` +
+      (timings ? ` | ${formatTimings(timings)}` : '')
     );
   }
 
@@ -331,6 +379,8 @@ function buildTurnCallbacks(ctx) {
     closeOpenBlock,
 
     onTextDelta: (text) => {
+      stamp('firstFrame');
+      stamp('firstText');
       if (turnState.thinkingBlockOpen) closeOpenBlock();
       if (!turnState.textBlockOpen) {
         const idx = turnState.nextBlockIndex++;
@@ -361,6 +411,8 @@ function buildTurnCallbacks(ctx) {
     },
 
     onMcpCall: ({ id, execId, toolCallId, toolName, args }) => {
+      stamp('firstFrame');
+      stamp('firstTool');
       closeOpenBlock();
       const blockIndex = turnState.nextBlockIndex++;
       const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, execId, toolCallId, sessionId);
@@ -435,24 +487,28 @@ function buildTurnCallbacks(ctx) {
       const bridge = getBridge();
 
       if (hasTools) {
-        const entry = {
+        const entry = cachedEntry || {
           bridge,
-          lastAccessMs: Date.now(),
           mcpTools,
-          pendingExecs: turnState.pendingToolCalls.slice(),
           convKey,
           conversationId,
           sessionId,
           requestedModel,
           cursorModel,
-          requestId,
         };
-        activeBridges.set(bridgeKey, entry);
-        if (sessionId) bridgesBySessionId.set(sessionId, entry);
+        entry.lastAccessMs = Date.now();
+        entry.pendingExecs = turnState.pendingToolCalls.slice();
+        entry.requestId = requestId;
+        indexBridgeEntry(entry, bridgeKey);
       } else {
-        activeBridges.delete(bridgeKey);
-        if (sessionId) bridgesBySessionId.delete(sessionId);
-        try { bridge && bridge.close(); } catch {}
+        // Conversation finished cleanly. If we had a cached entry (this was a
+        // continuation), drop ALL aliases via dropBridgeEntry. Otherwise just
+        // close the standalone bridge.
+        if (cachedEntry) {
+          dropBridgeEntry(cachedEntry, 'end_turn');
+        } else {
+          try { bridge && bridge.close(); } catch {}
+        }
       }
 
       if (isStream) {
@@ -476,9 +532,12 @@ function buildTurnCallbacks(ctx) {
         ));
       }
 
+      stamp('turnEnded');
+      stamp('respEnded');
       console.log(
         `  ✅ turn ended | in=${inputTokens} out=${outputTokens} | ` +
-        `stopReason=${stopReason} | toolCalls=${turnState.pendingToolCalls.length}`
+        `stopReason=${stopReason} | toolCalls=${turnState.pendingToolCalls.length}` +
+        (timings ? ` | ${formatTimings(timings)}` : '')
       );
       debugLog.logTurnEnded(
         { request_id: requestId, conv_key: convKey, model_cursor: cursorModel },
@@ -490,8 +549,15 @@ function buildTurnCallbacks(ctx) {
 
     onError: (errMsg) => {
       console.error(`  ❌ ${errMsg}`);
-      activeBridges.delete(bridgeKey);
-      if (sessionId) bridgesBySessionId.delete(sessionId);
+      if (cachedEntry) {
+        dropBridgeEntry(cachedEntry, 'error');
+      } else {
+        // Fresh-turn error before any entry was indexed — nothing in the
+        // maps to clean up. We still try to delete bridgeKey/sessionId in
+        // case a partial entry slipped in.
+        activeBridges.delete(bridgeKey);
+        if (sessionId) bridgesBySessionId.delete(sessionId);
+      }
 
       debugLog.logCursorError({
         request_id: requestId,
@@ -549,8 +615,20 @@ function makeTurnState() {
   };
 }
 
+// Format a timings object as `⏱ key=ms,…`. Skips unstamped entries so the
+// output stays compact even when only a subset of milestones fire (e.g. a
+// no-text response has no firstText stamp).
+function formatTimings(t) {
+  if (!t || t.t0 == null) return '';
+  const order = ['firstFrame', 'firstText', 'firstTool', 'turnEnded', 'respEnded'];
+  const parts = [];
+  for (const k of order) if (t[k] != null) parts.push(`${k}=${t[k]}ms`);
+  return `⏱ ${parts.join(' ')}`;
+}
+
 // ── Path A: Resume the cached bridge with tool results ──
 async function handleContinuation(req, res, cached, messages, requestedModel, cursorModel, isStream, bridgeKey) {
+  const timings = { t0: Date.now() };
   const toolResults = anthropicTools.extractToolResults(messages);
 
   if (toolResults.length === 0) {
@@ -582,6 +660,10 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
     mcpTools: cached.mcpTools,
     getBridge: () => cached.bridge,
     requestId: cached.requestId,
+    // Pass the existing entry so finalize/onTurnEnded mutate it in place
+    // (preserving the bridgeKeys alias set) instead of creating a new one.
+    cachedEntry: cached,
+    timings,
   });
 
   // Re-bind bridge callbacks so events from this resumed turn drive the
@@ -637,6 +719,7 @@ async function handleFreshTurn(req, res, token, params) {
     convKey, bridgeKey, conversationId, tools,
   } = params;
 
+  const timings = { t0: Date.now() };
   const prompt = anthropicConverter.anthropicMessagesToPrompt(messages, system);
   const mcpTools = anthropicTools.anthropicToolsToMcpTools(tools, 'cursoride2api');
 
@@ -667,6 +750,7 @@ async function handleFreshTurn(req, res, token, params) {
     requestedModel, cursorModel, mcpTools,
     getBridge: () => bridge,
     requestId: params.requestId,
+    timings,
   });
 
   bridge = cursorAgent.startConversation(token, {
@@ -711,15 +795,6 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
       body_keys: Object.keys(body),
     });
     return res.status(400).json(anthropicConverter.buildAnthropicErrorResponse('messages is required', 'invalid_request_error'));
-  }
-
-  const token = pickToken();
-  if (!token) {
-    debugLog.error('no_tokens_available', {
-      reason: 'No available tokens',
-      method: req.method, path: req.path,
-    });
-    return res.status(503).json(anthropicConverter.buildAnthropicErrorResponse('No available tokens', 'api_error'));
   }
 
   const requestedModel = model || 'claude-sonnet-4-6';
@@ -822,7 +897,15 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
     debugLog.warn('continuation_cache_miss', { request_id: requestId, conv_key: convKey, bridge_key: bridgeKey });
   }
 
-  // Path B: fresh turn.
+  // Path B: fresh turn — only NOW do we burn a token. Cache-hit continuations
+  // reuse the bridge's existing connection; calling pickToken() upfront would
+  // advance roundRobinIndex without using the token and skew load distribution
+  // for unrelated fresh requests.
+  const token = pickToken();
+  if (!token) {
+    debugLog.error('no_tokens_available', { reason: 'No available tokens', method: req.method, path: req.path });
+    return res.status(503).json(anthropicConverter.buildAnthropicErrorResponse('No available tokens', 'api_error'));
+  }
   return handleFreshTurn(req, res, token, {
     messages, system, requestedModel, cursorModel, isStream,
     convKey, bridgeKey, conversationId, tools, requestId,

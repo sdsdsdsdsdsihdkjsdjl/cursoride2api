@@ -89,65 +89,89 @@ function buildHeaders(token) {
 //  Shared H2 client pool
 // ═══════════════════════════════════════════════
 //
-// HTTP/2 multiplexes streams, so a single client to api2.cursor.sh can
-// serve every request concurrently. Pre-warming the connection at server
-// startup hides the ~200-500 ms TLS+H2 handshake from the first request.
-// We keep one client alive and lazy-recreate it on close/error.
-
-let _sharedClient = null;
-let _sharedClientPromise = null;
+// HTTP/2 multiplexes streams, so one TCP/TLS connection can serve many
+// concurrent requests. But each connection has its own flow-control budget
+// and one upstream scheduling context — which means a single shared client
+// can produce unfair scheduling under load (a long tool-heavy turn can
+// starve a simple no-tool question on the same connection).
+//
+// We keep a small pool of pre-warmed clients (default 3, override with
+// H2_POOL_SIZE) and round-robin fresh streams across them. Continuations
+// reuse the bridge they were originally bound to (so they stay on whichever
+// client opened the original stream). Pre-warming hides the ~200-500ms
+// TLS+H2 handshake from the first requests.
 const _baseUrl = config.cursor.baseUrl;
+const _poolSize = (() => {
+  const raw = process.env.H2_POOL_SIZE;
+  if (raw == null || raw === '') return 3;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 3;
+})();
+const _pool = new Array(_poolSize).fill(null);
+let _poolCursor = 0;
 
-function getSharedClient() {
-  if (_sharedClient && !_sharedClient.destroyed && !_sharedClient.closed) {
-    return _sharedClient;
-  }
-  // Open a new one
-  if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] opening shared H2 client → ${_baseUrl}`);
-  _sharedClient = http2.connect(_baseUrl, {
-    // Cursor's server multiplexes >> 100 streams comfortably; bump from
-    // Node's default 100 just in case.
+function _openClient(slot) {
+  if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] opening pool client #${slot} → ${_baseUrl}`);
+  const c = http2.connect(_baseUrl, {
     settings: { initialWindowSize: 1024 * 1024 * 8 },
   });
-  _sharedClient.setMaxListeners(0); // every request adds listeners
-  _sharedClient.unref(); // don't keep the process alive on the client alone
-  _sharedClient.on('error', (e) => {
-    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] shared client error: ${e.message}`);
-    _sharedClient = null;
-  });
-  _sharedClient.on('close', () => {
-    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] shared client closed`);
-    _sharedClient = null;
-  });
-  _sharedClient.on('goaway', () => {
-    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] shared client goaway`);
-    _sharedClient = null;
-  });
-  return _sharedClient;
+  c.setMaxListeners(0);
+  c.unref();
+  const drop = (why) => {
+    if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] pool client #${slot} ${why}`);
+    if (_pool[slot] === c) _pool[slot] = null;
+  };
+  c.on('error', (e) => drop(`error: ${e.message}`));
+  c.on('close', () => drop('closed'));
+  c.on('goaway', () => drop('goaway'));
+  _pool[slot] = c;
+  return c;
 }
 
-// Force the shared client to be replaced on the next getSharedClient() call.
-// Used when we get a stream-level error that suggests the connection is
-// unhealthy (REFUSED_STREAM, GOAWAY, etc.) — opening a fresh TCP+TLS
-// connection clears whatever state caused the refusal.
+// Get a client from the pool. Round-robins across all live slots; opens a
+// fresh one in the chosen slot if it's empty (lazy refill on poison/close).
+function getSharedClient() {
+  for (let attempt = 0; attempt < _poolSize; attempt++) {
+    const slot = _poolCursor % _poolSize;
+    _poolCursor = (_poolCursor + 1) % _poolSize;
+    const c = _pool[slot];
+    if (c && !c.destroyed && !c.closed) return c;
+    return _openClient(slot);
+  }
+  // Should be unreachable — _poolSize >= 1.
+  return _openClient(0);
+}
+
+// Mark a specific pool client as bad so the next request opens a fresh one
+// in its slot. Called when a stream on `client` errors with REFUSED_STREAM
+// (or similar). Other pool slots are untouched, so sibling sessions on
+// healthy connections are unaffected.
 //
-// We deliberately do NOT call `c.close()` here. Other claude-code sessions
-// are sharing this same H2 client (that's the whole point of pre-warming
-// it). Closing it would send GOAWAY to Cursor and could cascade-fail their
-// in-flight streams. Instead just null the reference: future getSharedClient
-// calls open a fresh client, the old one's existing streams complete on
-// their own, and GC reaps it once they all end.
-function poisonSharedClient(reason) {
-  if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] poisoning shared client (will be replaced for new streams): ${reason}`);
-  _sharedClient = null;
-  // The old client object is now unreferenced from this module; Node keeps
-  // it alive while it still has open streams, then frees it.
+// We deliberately do NOT call `client.close()` here. The bad client may
+// still have other in-flight streams from sibling sessions; closing would
+// send GOAWAY to Cursor and cascade-fail them. Just null the slot: future
+// requests skip past it (or refill it), and the old client's streams
+// complete on their own. GC reaps the orphan once they end.
+function poisonSharedClient(reason, client) {
+  for (let i = 0; i < _poolSize; i++) {
+    if (_pool[i] === client) {
+      if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] poisoning pool slot #${i}: ${reason}`);
+      _pool[i] = null;
+      return;
+    }
+  }
+  // Client wasn't in the pool (already replaced, or detached). Nothing to do.
+  if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] poison called for unknown client: ${reason}`);
 }
 
 function prewarmSharedClient() {
   // Ensure proto is loaded too (it's lazy-loaded otherwise)
   loadProto().catch(() => { /* logged elsewhere */ });
-  try { getSharedClient(); } catch (e) { /* swallow */ }
+  // Pre-warm every pool slot so the first N concurrent requests don't pay
+  // the TLS+H2 handshake on the hot path.
+  for (let i = 0; i < _poolSize; i++) {
+    try { getSharedClient(); } catch (e) { /* swallow */ }
+  }
 }
 
 // ── Deterministic conversation UUID derived from a key ──
@@ -1037,7 +1061,7 @@ function startConversation(token, options = {}) {
     if (!hasReceivedData && retryAttempts < MAX_REQUEST_RETRIES && isRefused) {
       retryAttempts++;
       console.log(`[cursor-agent] retrying after ${msg} (${retryAttempts}/${MAX_REQUEST_RETRIES})`);
-      poisonSharedClient(msg);
+      poisonSharedClient(msg, client);
       // Detach from the dead stream so its trailing 'end' event doesn't
       // flip `closed = true` and short-circuit the retry. Same for the
       // heartbeat — it would otherwise keep writing to the destroyed req.
