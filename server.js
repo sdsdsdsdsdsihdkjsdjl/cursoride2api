@@ -775,6 +775,69 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
   });
 });
 
+// ── POST /v1/messages/count_tokens (Anthropic Messages API) ──
+//
+// Claude Code calls this to plan things like whether a /btw fork can fit
+// in the context window. Without it the call 404s and Claude Code can
+// silently abort the operation. Anthropic's real endpoint returns
+//   { "input_tokens": <int> }
+// We approximate by character-count heuristic (~3.5 chars per token for
+// Claude). Good enough for fit-check purposes; not for billing.
+function _countCharsRecursive(value) {
+  if (value == null) return 0;
+  if (typeof value === 'string') return value.length;
+  if (typeof value === 'number') return String(value).length;
+  if (Array.isArray(value)) {
+    let n = 0;
+    for (const item of value) n += _countCharsRecursive(item);
+    return n;
+  }
+  if (typeof value === 'object') {
+    let n = 0;
+    for (const k of Object.keys(value)) {
+      // Field-name overhead matters slightly — count it
+      n += k.length;
+      n += _countCharsRecursive(value[k]);
+    }
+    return n;
+  }
+  return 0;
+}
+
+app.post('/v1/messages/count_tokens', checkApiKey, async (req, res) => {
+  const body = req.body || {};
+  const { messages, system, tools } = body;
+
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json(anthropicConverter.buildAnthropicErrorResponse(
+      'messages is required', 'invalid_request_error'
+    ));
+  }
+
+  // Sum chars across system, messages, tools.
+  let chars = 0;
+  if (system != null) chars += _countCharsRecursive(system);
+  chars += _countCharsRecursive(messages);
+  if (Array.isArray(tools)) chars += _countCharsRecursive(tools);
+
+  // ~3.5 chars per token for Claude is a decent estimate for English code/text.
+  // Round up so we never under-report (which could cause Claude Code to
+  // think a fork fits when it doesn't).
+  const inputTokens = Math.ceil(chars / 3.5);
+
+  if (debugLog.isEnabled()) {
+    debugLog.info('count_tokens', {
+      msg_count: messages.length,
+      tool_count: Array.isArray(tools) ? tools.length : 0,
+      has_system: system != null,
+      chars,
+      input_tokens: inputTokens,
+    });
+  }
+
+  res.json({ input_tokens: inputTokens });
+});
+
 // ── 健康检查 ──
 app.get('/health', (req, res) => {
   res.json({
@@ -801,6 +864,7 @@ app.listen(PORT, HOST, () => {
   console.log(`  ║  🌐 http://${HOST}:${PORT}                     ║`);
   console.log(`  ║  🔌 /v1/chat/completions                  ║`);
   console.log(`  ║  🔌 /v1/messages (Anthropic)               ║`);
+  console.log(`  ║  🔌 /v1/messages/count_tokens             ║`);
   console.log(`  ║  📋 /v1/models                            ║`);
   console.log('  ╠═══════════════════════════════════════════╣');
   console.log(`  ║  🔑 Tokens: ${String(count).padEnd(30)}║`);
