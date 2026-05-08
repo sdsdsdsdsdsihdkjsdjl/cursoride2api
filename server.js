@@ -14,6 +14,8 @@ const anthropicConverter = require('./src/anthropic-converter');
 const config = require('./src/config');
 const cursorAgent = require('./src/cursor-agent');
 const anthropicTools = require('./src/anthropic-tools');
+const debugLog = require('./src/debug-log');
+debugLog.init();
 
 // ── 配置 ──
 const PORT = parseInt(process.env.PORT || '3000');
@@ -228,7 +230,7 @@ function buildTurnCallbacks(ctx) {
     res, isStream, turnState,
     convKey, bridgeKey, conversationId,
     requestedModel, cursorModel, mcpTools,
-    getBridge,
+    getBridge, requestId,
   } = ctx;
 
   function closeOpenBlock() {
@@ -302,6 +304,10 @@ function buildTurnCallbacks(ctx) {
       let argsPreview = '';
       try { argsPreview = JSON.stringify(args || {}).slice(0, 80); } catch { argsPreview = '{...}'; }
       console.log(`  🔧 tool call: ${toolName}(${argsPreview}) → ${anthropicToolUseId}`);
+      debugLog.logToolCall(
+        { request_id: requestId, conv_key: convKey, model_cursor: cursorModel },
+        toolName, args
+      );
 
       // The Cursor stream is now paused waiting for our mcpResult — Cursor
       // will NOT emit turnEnded until we send tool results. So when we get an
@@ -325,6 +331,7 @@ function buildTurnCallbacks(ctx) {
           conversationId,
           requestedModel,
           cursorModel,
+          requestId,
         });
 
         if (isStream) {
@@ -389,6 +396,7 @@ function buildTurnCallbacks(ctx) {
           conversationId,
           requestedModel,
           cursorModel,
+          requestId,
         });
       } else {
         activeBridges.delete(bridgeKey);
@@ -420,12 +428,30 @@ function buildTurnCallbacks(ctx) {
         `  ✅ turn ended | in=${inputTokens} out=${outputTokens} | ` +
         `stopReason=${stopReason} | toolCalls=${turnState.pendingToolCalls.length}`
       );
+      debugLog.logTurnEnded(
+        { request_id: requestId, conv_key: convKey, model_cursor: cursorModel },
+        { inputTokens, outputTokens },
+        stopReason, turnState.pendingToolCalls.length
+      );
     },
 
 
     onError: (errMsg) => {
       console.error(`  ❌ ${errMsg}`);
       activeBridges.delete(bridgeKey);
+
+      debugLog.logCursorError({
+        request_id: requestId,
+        conv_key: convKey,
+        bridge_key: bridgeKey,
+        model_requested: requestedModel,
+        model_cursor: cursorModel,
+        is_stream: isStream,
+        accumulated_text_len: (turnState.accumulatedText || '').length,
+        accumulated_thinking_len: (turnState.accumulatedThinking || '').length,
+        pending_tool_calls: turnState.pendingToolCalls.length,
+        next_block_index: turnState.nextBlockIndex,
+      }, errMsg);
 
       // "Blob not found" means our cached conversationState references blobs
       // Cursor's KV store has evicted. The state is no longer usable — drop
@@ -498,6 +524,7 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
     requestedModel, cursorModel,
     mcpTools: cached.mcpTools,
     getBridge: () => cached.bridge,
+    requestId: cached.requestId,
   });
 
   // Re-bind bridge callbacks so events from this resumed turn drive the
@@ -575,6 +602,7 @@ async function handleFreshTurn(req, res, token, params) {
     convKey, bridgeKey, conversationId,
     requestedModel, cursorModel, mcpTools,
     getBridge: () => bridge,
+    requestId: params.requestId,
   });
 
   bridge = cursorAgent.startConversation(token, {
@@ -612,11 +640,20 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
   }
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    debugLog.warn('rejected_request', {
+      reason: 'messages is required',
+      method: req.method, path: req.path, remote: req.ip,
+      body_keys: Object.keys(body),
+    });
     return res.status(400).json(anthropicConverter.buildAnthropicErrorResponse('messages is required', 'invalid_request_error'));
   }
 
   const token = pickToken();
   if (!token) {
+    debugLog.error('no_tokens_available', {
+      reason: 'No available tokens',
+      method: req.method, path: req.path,
+    });
     return res.status(503).json(anthropicConverter.buildAnthropicErrorResponse('No available tokens', 'api_error'));
   }
 
@@ -642,27 +679,36 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
 
   const isContinuation = anthropicTools.hasToolResults(messages);
 
+  const requestId = uuidv4().slice(0, 8);
   console.log(
     `  📨 [${new Date().toLocaleTimeString()}] (Anthropic) ${requestedModel} → ${cursorModel} | ` +
-    `stream=${isStream} | continuation=${isContinuation} | convKey=${convKey}`
+    `stream=${isStream} | continuation=${isContinuation} | convKey=${convKey} | reqId=${requestId}`
   );
+
+  debugLog.logRequest(req, body, {
+    requestId,
+    requestedModel, effectiveModel, cursorModel,
+    convKey, bridgeKey, isContinuation,
+  });
 
   // Path A: continuation — caller is delivering tool_result blocks.
   if (isContinuation) {
     const cached = activeBridges.get(bridgeKey);
     if (cached) {
       cached.lastAccessMs = Date.now();
+      cached.requestId = requestId;
       return handleContinuation(req, res, cached, messages, requestedModel, cursorModel, isStream);
     }
     // Cache miss — bridge died or was evicted. Fall through to a fresh turn
     // using the full message history (system + alternations) as the prompt.
     console.log('  ⚠️  Bridge cache miss for continuation; starting fresh');
+    debugLog.warn('continuation_cache_miss', { request_id: requestId, conv_key: convKey, bridge_key: bridgeKey });
   }
 
   // Path B: fresh turn.
   return handleFreshTurn(req, res, token, {
     messages, system, requestedModel, cursorModel, isStream,
-    convKey, bridgeKey, conversationId, tools,
+    convKey, bridgeKey, conversationId, tools, requestId,
   });
 });
 
@@ -693,6 +739,9 @@ app.listen(PORT, HOST, () => {
   console.log(`  ║  🔑 Tokens: ${String(count).padEnd(30)}║`);
   console.log(`  ║  🤖 Default: ${DEFAULT_MODEL.padEnd(29)}║`);
   console.log(`  ║  🔐 API Key: ${(API_KEY ? 'SET' : 'OPEN (no key)').padEnd(29)}║`);
+  if (debugLog.isEnabled()) {
+    console.log(`  ║  📝 Debug: ${(debugLog.isVerbose() ? 'verbose' : 'on').padEnd(31)}║`);
+  }
   console.log('  ╚═══════════════════════════════════════════╝');
   console.log('');
 });

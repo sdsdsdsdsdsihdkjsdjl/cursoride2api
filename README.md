@@ -171,6 +171,12 @@ for chunk in resp:
 | `DEFAULT_MODEL` | `claude-4.5-sonnet` | 默认 Cursor 模型 |
 | `CURSOR_CLIENT_VERSION` | `2.6.20` | Cursor 客户端版本号 |
 | `REQUEST_TIMEOUT` | `120000` | 请求超时 (ms) |
+| `DEBUG_LOG` | _(空=关)_ | `1` 写错误日志到 `logs/`；`verbose` 也记录请求体 |
+| `DEBUG_LOG_DIR` | `./logs` | 日志目录覆盖 |
+| `TOOL_INCLUDE` | _(空)_ | Anthropic 工具白名单（按工具名） |
+| `TOOL_LIMIT` | `0` | 工具数量上限 |
+| `TOOL_DESC_LIMIT` | `600` | 工具描述截断长度（字符） |
+| `TOOL_SCHEMA_TRIM_BYTES` | `30000` | 总 schema 超过此值则剥离 properties[].description |
 
 ## 🗺️ 模型映射
 

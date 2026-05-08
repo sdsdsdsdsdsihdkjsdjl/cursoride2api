@@ -249,6 +249,41 @@ Top-level `message` is the literal string `"Error"`. Useful info is in `details[
 
 ---
 
+## Debug logging
+
+Set `DEBUG_LOG=1` (or `DEBUG_LOG=verbose`) to write structured JSON logs to a file. One line per event, easy to grep / `jq`. Useful while debugging — captures errors with full context (request id, model, conversation/bridge keys, body summary, decoded Cursor wire errors).
+
+```bash
+DEBUG_LOG=1 PORT=4141 npm start
+# logs at ./logs/server-YYYY-MM-DD.log
+
+DEBUG_LOG=verbose PORT=4141 npm start
+# also includes the full request body and tool-call args
+```
+
+Events captured:
+
+| event | level | when |
+|-------|-------|------|
+| `request_received` | info | every `/v1/messages` request after validation |
+| `tool_call` | info | every MCP tool call routed back to the client |
+| `turn_ended` | info | every successful turn (with tokens + stop_reason) |
+| `cursor_upstream_error` | error | every Cursor wire error (with the decoded `error.details[].debug.details.detail` chain) |
+| `proxy_error` | error | proxy-side exceptions |
+| `rejected_request` | warn | malformed body (e.g. missing `messages`) |
+| `no_tokens_available` | error | `token.json` empty / out of valid tokens |
+| `continuation_cache_miss` | warn | bridge cache evicted before client posted tool_result |
+
+Each entry includes a per-request `request_id` (8-char UUID) so you can grep all events for a single request:
+
+```bash
+grep '"request_id":"abc12345"' logs/server-*.log | jq .
+```
+
+Override the directory with `DEBUG_LOG_DIR=/var/log/cursoride2api`.
+
+---
+
 ## Tool-budget knobs
 
 Claude Code's stock 49 tools (~150 KB raw) work fine through the proxy now — defaults trim them under Cursor's per-request schema budget automatically. `src/anthropic-tools.js` exposes these as escape hatches for unusual cases:
