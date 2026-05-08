@@ -607,6 +607,31 @@ Per the reverse-engineering doc (Cursor IDE API 逆向工程文档.md §2), Curs
 
 `x-session-id` is the one we hypothesize matters most: without it, multiple concurrent claude-code sessions share the same identity from Cursor's backend perspective and may share whatever per-session scheduling buckets exist there. With it set to a fresh UUID per bridge, each session looks distinct.
 
+### Honoring `--effort` and `thinking.type` per request
+
+Static model mapping in `src/config.js` always sent Opus 4.7 to `claude-opus-4-7-thinking-max` regardless of what the client asked for, so claude-code's `--effort` flag was a no-op through the proxy. The live model list (`/v1/models`) shows Cursor exposes a full grid for Opus 4.7:
+
+```
+claude-opus-4-7-{low,medium,high,xhigh,max}            # non-thinking
+claude-opus-4-7-thinking-{low,medium,high,xhigh,max}   # thinking
+```
+
+…and Sonnet 4.6 exposes `claude-4.6-sonnet-medium` and `-medium-thinking`.
+
+claude-code's request body carries:
+- `output_config.effort` ∈ `{low,medium,high,xhigh,max}` — set by `--effort`. Default is `low`.
+- `thinking.type` ∈ `{adaptive,enabled,disabled}` — claude-code sets `adaptive` by default.
+
+`extractModelOverrides(body)` reads both fields. `applyModelOverrides(model, opts)` rebuilds the suffix for known model families (Opus 4.7 full grid, Sonnet 4.6 thinking on/off, Sonnet 4.5/4, Opus 4.6/4.5). Unknown families pass through unchanged so misconfigured clients don't end up at invalid model names.
+
+Env-var force-overrides win over the body for ops scenarios:
+- `CURSOR_FORCE_EFFORT=low|medium|high|xhigh|max` — pin effort regardless of client.
+- `CURSOR_FORCE_THINKING=on|off|adaptive` — pin thinking regardless of client.
+
+The routing log now shows `override(effort=…, thinking=…): old → new` whenever the per-request override changes the model.
+
+Verified: `--effort low/medium/high/xhigh/max` each route to the matching Cursor variant; `CURSOR_FORCE_EFFORT=max` overrides client `--effort low` back to max; `CURSOR_FORCE_THINKING=off` strips the `-thinking-` segment.
+
 ### `interactionQuery` handler — fixes hangs on WebSearch / WebFetch / similar
 
 Cursor uses **two** separate channels for native tool calls:

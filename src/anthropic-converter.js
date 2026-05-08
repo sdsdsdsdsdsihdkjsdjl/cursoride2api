@@ -95,6 +95,120 @@ function mapAnthropicModel(model, configMapping) {
   return model;
 }
 
+// Effort levels supported by Cursor's per-model variants. Sorted longest-first
+// so the regex-based suffix strip matches `xhigh` before `high`.
+const EFFORT_LEVELS = ['xhigh', 'medium', 'high', 'low', 'max'];
+const EFFORT_REGEX = new RegExp(`-(${EFFORT_LEVELS.sort((a,b)=>b.length-a.length).join('|')})$`);
+
+/**
+ * Apply per-request overrides to a Cursor model name based on Anthropic
+ * request body fields:
+ *   - body.output_config.effort   ∈ {low,medium,high,xhigh,max}  (claude-code's --effort)
+ *   - body.thinking.type          ∈ {adaptive,enabled,disabled}  (claude-code's extended-thinking signal)
+ *
+ * Without this hook, every `claude-opus-4-7` request gets the static
+ * `claude-opus-4-7-thinking-max` mapping regardless of the user's --effort.
+ *
+ * Strategy: detect known model families that have full effort/thinking
+ * variant suites and rebuild the suffix; for families with restricted
+ * variants (Sonnet 4.6 only has -medium and -medium-thinking) toggle
+ * just the thinking segment; for unknown families, leave alone.
+ *
+ * Returns the (possibly adjusted) cursor model name.
+ */
+function applyModelOverrides(cursorModel, opts = {}) {
+  if (!cursorModel) return cursorModel;
+  const { effort, thinkingType } = opts;
+
+  // thinkingType semantics:
+  //   'adaptive' (claude-code default) — model decides → use thinking variant
+  //   'enabled'                          — force thinking
+  //   'disabled' / undefined / 'none'    — no thinking
+  let wantThinking;
+  if (thinkingType == null || thinkingType === 'disabled' || thinkingType === 'none') {
+    wantThinking = false;
+  } else {
+    wantThinking = true;
+  }
+
+  const wantEffort = effort && EFFORT_LEVELS.includes(effort) ? effort : null;
+
+  // Family: claude-opus-4-7 — full grid (5 effort × 2 thinking).
+  if (/^claude-opus-4-7(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?$/.test(cursorModel)) {
+    const e = wantEffort || 'max';
+    return wantThinking ? `claude-opus-4-7-thinking-${e}` : `claude-opus-4-7-${e}`;
+  }
+
+  // Family: claude-4.6-opus-{high,max-thinking,high-thinking} — known to exist.
+  if (/^claude-4\.6-opus(?:-high|-max)?(?:-thinking)?$/.test(cursorModel)) {
+    // Only -high and -max-thinking are documented; preserve unless explicitly set.
+    if (wantEffort === 'max' && wantThinking) return 'claude-4.6-opus-max-thinking';
+    if (wantThinking) return 'claude-4.6-opus-high-thinking';
+    return 'claude-4.6-opus-high';
+  }
+
+  // Family: claude-4.6-sonnet-medium — only thinking on/off available.
+  if (/^claude-4\.6-sonnet-medium(?:-thinking)?$/.test(cursorModel)) {
+    return wantThinking ? 'claude-4.6-sonnet-medium-thinking' : 'claude-4.6-sonnet-medium';
+  }
+
+  // Family: claude-4.5-sonnet[-thinking]
+  if (/^claude-4\.5-sonnet(?:-thinking)?$/.test(cursorModel)) {
+    return wantThinking ? 'claude-4.5-sonnet-thinking' : 'claude-4.5-sonnet';
+  }
+
+  // Family: claude-4.5-opus-high[-thinking]
+  if (/^claude-4\.5-opus-high(?:-thinking)?$/.test(cursorModel)) {
+    return wantThinking ? 'claude-4.5-opus-high-thinking' : 'claude-4.5-opus-high';
+  }
+
+  // Family: claude-4-sonnet[-thinking]
+  if (/^claude-4-sonnet(?:-thinking)?$/.test(cursorModel)) {
+    return wantThinking ? 'claude-4-sonnet-thinking' : 'claude-4-sonnet';
+  }
+
+  // Unknown family — don't touch, just pass through.
+  return cursorModel;
+}
+
+/**
+ * Extract the override signals from an Anthropic /v1/messages body.
+ * Returns `{ effort, thinkingType }` (either may be undefined).
+ *
+ * Precedence:
+ *   CURSOR_FORCE_EFFORT     (env)        — overrides body
+ *   CURSOR_FORCE_THINKING   (env)        — overrides body
+ *   body.output_config.effort           — claude-code's --effort
+ *   body.thinking.type                  — Anthropic API thinking signal
+ */
+function extractModelOverrides(body) {
+  const out = {};
+  if (body && typeof body === 'object') {
+    // claude-code stores --effort under `output_config.effort`.
+    if (body.output_config && typeof body.output_config.effort === 'string') {
+      out.effort = body.output_config.effort.toLowerCase();
+    }
+    // Anthropic API: `thinking: { type: 'adaptive'|'enabled'|'disabled', budget_tokens?: N }`.
+    if (body.thinking && typeof body.thinking === 'object' && typeof body.thinking.type === 'string') {
+      out.thinkingType = body.thinking.type.toLowerCase();
+    }
+  }
+
+  // Env overrides win over body. Useful for "always max" or "never thinking"
+  // policies independent of the client.
+  const envEffort = (process.env.CURSOR_FORCE_EFFORT || '').toLowerCase().trim();
+  if (envEffort) out.effort = envEffort;
+  const envThinking = (process.env.CURSOR_FORCE_THINKING || '').toLowerCase().trim();
+  if (envThinking === 'on' || envThinking === 'enabled' || envThinking === 'true' || envThinking === '1') {
+    out.thinkingType = 'enabled';
+  } else if (envThinking === 'off' || envThinking === 'disabled' || envThinking === 'false' || envThinking === '0') {
+    out.thinkingType = 'disabled';
+  } else if (envThinking === 'adaptive' || envThinking === 'auto') {
+    out.thinkingType = 'adaptive';
+  }
+  return out;
+}
+
 /**
  * 构建非流式 Anthropic 响应
  *
@@ -298,6 +412,7 @@ function buildPing() {
 
 module.exports = {
   anthropicMessagesToPrompt, mapAnthropicModel,
+  applyModelOverrides, extractModelOverrides,
   buildAnthropicResponse, buildAnthropicErrorResponse,
   formatSSE,
   buildMessageStart, buildContentBlockStart, buildContentBlockDelta,

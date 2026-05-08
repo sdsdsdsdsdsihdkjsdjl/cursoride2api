@@ -837,7 +837,22 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
       routingReason = `subagent passthrough (${pre.subagentMarker.agent_type})`;
     }
   }
-  const cursorModel = anthropicConverter.mapAnthropicModel(effectiveModel, config.anthropicModelMapping);
+  let cursorModel = anthropicConverter.mapAnthropicModel(effectiveModel, config.anthropicModelMapping);
+  // Honor claude-code's --effort flag (carried in body.output_config.effort)
+  // and the Anthropic-API thinking parameter. Without this hook every
+  // request gets the static thinking-max mapping regardless of what the
+  // user asked for.
+  const overrides = anthropicConverter.extractModelOverrides(body);
+  if (overrides.effort || overrides.thinkingType) {
+    const before = cursorModel;
+    cursorModel = anthropicConverter.applyModelOverrides(cursorModel, overrides);
+    if (before !== cursorModel) {
+      const segs = [];
+      if (overrides.effort) segs.push(`effort=${overrides.effort}`);
+      if (overrides.thinkingType) segs.push(`thinking=${overrides.thinkingType}`);
+      routingReason = (routingReason ? routingReason + ' | ' : '') + `override(${segs.join(', ')}): ${before} → ${cursorModel}`;
+    }
+  }
   const isStream = stream === true;
 
   // Salt the cache keys with the client's remote address + remote port + tool
