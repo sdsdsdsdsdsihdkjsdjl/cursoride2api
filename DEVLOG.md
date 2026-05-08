@@ -85,15 +85,57 @@ const inputSchema = toBinary(wkt.ValueSchema, fromJson(wkt.ValueSchema, jsonSche
 
 Cursor IDE's MCP integration namespaces server tools as `mcp__<server>__<tool>`, so the IDE never collides with Cursor's built-in surface. **We do collide** because Anthropic SDK clients pass tools with names like `Read`, `Write`, `Bash`, `TodoWrite`, etc. Without prefixing, the upstream provider sees duplicates and returns `ERROR_PROVIDER_ERROR`.
 
-Cursor's full native tool list isn't documented. Empirical probe of 30+ names (with `mcp_` prefix disabled) confirms the rejected set is case-exact PascalCase agent-mode tool names:
+Cursor's full native tool list isn't documented anywhere we found. Cross-referencing the proto schema (`agent_v1.proto` lines 3855-3893 list 36 `*ToolCall` messages), the compiled `agent_pb.mjs`, the reference proxy `opencode-cursor`, and direct probing produced this empirical list as of May 2026:
 
-**Blocked (return `ERROR_PROVIDER_ERROR resource_exhausted`):**  `Read`, `Write`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `Shell`, `Delete`, `Task`, `TodoWrite`
+#### Blocked names (14)
 
-**Pass through unchanged:** `Quack`, `xyzzy`, `Ls`, `Edit`, `Fetch`, `Diagnostics`, `NotebookEdit`, `Skill`, `TaskCreate`, `BashOutput`, `KillShell`, `bash`, `Bash`, `text_editor`, `computer`, `web_search`, `web_fetch`, `bash_20250124`, `read`, `read_file`, `readFile`, `ReadFile`, …
+These return `ERROR_PROVIDER_ERROR resource_exhausted` when registered as an MCP tool without the `mcp_` prefix:
 
-The pattern is whole-string match of Cursor's PascalCase agent-mode tool names. **Anthropic-side reserved names** (`bash_20250124`, `text_editor_20250728`, `computer_*`, etc.) all pass — so this is NOT an Anthropic API collision (Anthropic's tool name regex is just `^[a-zA-Z0-9_-]{1,64}$` with no reservations). It's a Cursor IDE collision.
+```
+Read         Write          Grep             Glob
+WebFetch     WebSearch      Shell            Delete
+Task         TodoWrite      AskQuestion      ListMcpResources
+ReadLints    SwitchMode
+```
 
-Rather than maintain a brittle blocklist, **always prefix every MCP tool's wire `name` with `mcp_`** and leave `tool_name` unchanged. The reference proxy `opencode-cursor` doesn't prefix and runs into the same issue when its callers happen to use Cursor-overlapping names.
+#### Pass-through (sample of ~70 verified non-colliding)
+
+```
+Apply         ApplyAgentDiff   Bash            BackgroundShell
+CommitChanges Compose          ComputerUse     Create
+CreatePlan    CreatePR         Curl            Diagnostics
+Edit          EditFile         ExaFetch        ExaSearch
+ExecuteHook   Fetch            Find            Format
+Generate      GenerateImage    GetBlob         GetDefinition
+GlobTool      HTTP             Lint            Ls
+Lookup        Mcp              MultiEdit       NotebookEdit
+NotebookRead  OpenBrowser      OpenFile        Patch
+Plan          Quack            Reflect         Refactor
+ReadMcpResource  ReadTodos     ReadTool        RecordScreen
+RemoveFile    RenameFile       ReportBugfixResults  RequestContext
+RunCell       RunCommand       RunInTerminal   RunTerminal
+Search        SearchFiles      SearchSymbols   SemSearch
+SemSearchTool SetBlob          SetupVmEnvironment   StartGrindExecution
+StartGrindPlanning   Test      Todo            TodoRead
+TruncatedToolCall    Update    UpdateTodos     WriteShellStdin
+xyzzy         (plus all-lowercase variants of every blocked name)
+```
+
+#### Pattern observations
+
+- **Whole-string PascalCase match.** `read`, `write`, `grep`, `glob`, `webfetch`, `shell`, `delete`, `task`, `todowrite` (lowercase) all pass. `Bash` passes (Cursor uses `Shell`). `ReadTool`, `GlobTool` pass (suffixed forms).
+- **Anthropic-reserved names pass.** `bash_20250124`, `text_editor_20250728`, `computer`, `web_search`, `web_fetch` all go through. So the blocklist isn't from the Anthropic API side (whose tool regex is just `^[a-zA-Z0-9_-]{1,64}$` with no reservations).
+- **Most proto-defined tools DON'T block.** Of 36 `*ToolCall` messages in the proto, only 14 are actually reserved upstream. Cursor's IDE seems to surface only a subset to the upstream Anthropic provider.
+
+#### What this means for the proxy
+
+Always prefix every MCP tool's wire `name` field with `mcp_` and leave `tool_name` unchanged. The blocklist above is documentation only — the proxy doesn't consult it. The reference `opencode-cursor` doesn't prefix and would hit this on any of the 14 names if a client happens to use one.
+
+If you ever need to disable prefixing (e.g., to test a name directly), the toggle is in `cursor-agent.js`:
+
+```js
+const wireName = t.name.startsWith(MCP_NAME_PREFIX) ? t.name : MCP_NAME_PREFIX + t.name;
+```
 
 Fix in `cursor-agent.js`:
 
