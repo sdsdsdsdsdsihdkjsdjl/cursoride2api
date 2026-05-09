@@ -809,6 +809,29 @@ async function handleFreshTurn(req, res, token, params) {
   const prompt = anthropicConverter.anthropicMessagesToPrompt(messages, system);
   const mcpTools = anthropicTools.anthropicToolsToMcpTools(tools, 'cursoride2api');
 
+  // Diagnostic-only: dump the EXACT flattened prompt we send to Cursor so we
+  // can verify our tagging / framing actually reaches the model. Off by default;
+  // set DUMP_PROMPTS=1 to enable. Each file is timestamped + reqId-tagged for
+  // easy correlation with /tmp/v1messages-*.json bodies.
+  if (process.env.DUMP_PROMPTS) {
+    try {
+      const reqId = params.requestId || 'unk';
+      const dumpFile = `/tmp/prompt-${Date.now()}-${reqId}.txt`;
+      const header =
+        `# request_id=${reqId}\n` +
+        `# conv_key=${convKey}\n` +
+        `# bridge_key=${bridgeKey}\n` +
+        `# requested_model=${requestedModel}\n` +
+        `# cursor_model=${cursorModel}\n` +
+        `# message_count=${messages.length}\n` +
+        `# prompt_bytes=${prompt.length}\n` +
+        `# tool_count=${(tools||[]).length}\n` +
+        `# ─── BEGIN PROMPT ───\n`;
+      require('fs').writeFileSync(dumpFile, header + prompt);
+      console.log(`  📋 dumped prompt to ${dumpFile} | bytes=${prompt.length} | msgs=${messages.length}`);
+    } catch (e) { /* ignore */ }
+  }
+
   // Do NOT load cached state — see onTurnEnded note. Cursor's blob store is
   // per-H2-stream and replaying a stale checkpoint triggers Blob not found.
   const conversationState = null;

@@ -55,14 +55,24 @@ function anthropicMessagesToPrompt(messages, system) {
     const role = msg.role || 'user';
     let content = '';
 
+    // Track whether this user message has any actual user-typed content
+    // (text/image) vs. being purely tool_results. A pure-tool_result user
+    // message is the proxy reconstructing a continuation after a cache
+    // miss — there's no "new user instruction" to pivot on, just data
+    // the model needs to continue with.
+    let userHasOriginalContent = false;
     if (typeof msg.content === 'string') {
       content = msg.content;
+      if (role === 'user' && msg.content.trim()) userHasOriginalContent = true;
     } else if (Array.isArray(msg.content)) {
       const segments = [];
       for (const b of msg.content) {
         if (!b || !b.type) continue;
         if (b.type === 'text') {
-          if (b.text) segments.push(b.text);
+          if (b.text) {
+            segments.push(b.text);
+            if (role === 'user') userHasOriginalContent = true;
+          }
         } else if (b.type === 'tool_use') {
           let argStr = '';
           try {
@@ -84,6 +94,7 @@ function anthropicMessagesToPrompt(messages, system) {
           segments.push(`[Tool result for ${b.tool_use_id || ''}]:\n${resultText}`);
         } else if (b.type === 'image') {
           segments.push('[image]');
+          if (role === 'user') userHasOriginalContent = true;
         }
       }
       content = segments.join('\n');
@@ -97,7 +108,7 @@ function anthropicMessagesToPrompt(messages, system) {
       // Tag every user turn so the model can see role boundaries; mark
       // the latest one so it doesn't drown in 1000+ messages of history.
       if (i === lastUserIdx) {
-        parts.push(_wrapLatestUser(content, messages.length));
+        parts.push(_wrapLatestUser(content, messages.length, userHasOriginalContent));
       } else {
         parts.push(`<user>\n${content}\n</user>`);
       }
@@ -128,7 +139,18 @@ const LONG_HISTORY_THRESHOLD = (() => {
 const INTERRUPT_PATTERN = /\[Request interrupted by user\]/i;
 const PIVOT_KEYWORDS = /\b(stop|halt|abort|cancel|instead|nevermind|never mind|actually do|forget (that|the|previous)|switch to|do .{0,20} instead|change of plans|new plan|forget everything|start over)\b/i;
 
-function _wrapLatestUser(content, totalMessages) {
+function _wrapLatestUser(content, totalMessages, hasOriginalUserContent) {
+  // Don't add the ATTENTION directive when the latest user message is
+  // PURELY tool_results (no user-typed text/image). That happens on
+  // cache-miss continuation rebuilds — we'd be telling the model "do NOT
+  // auto-continue the prior plan" exactly when continuing IS the correct
+  // response. Mixed signal trains the model in-context that the directive
+  // is noise. Only trigger when there's actual new user content to
+  // anchor on.
+  if (!hasOriginalUserContent) {
+    return `<user latest="true">\n${content}\n</user>`;
+  }
+
   const isInterrupt = INTERRUPT_PATTERN.test(content);
   const isPivot = PIVOT_KEYWORDS.test(content);
   const isLong = totalMessages >= LONG_HISTORY_THRESHOLD;
