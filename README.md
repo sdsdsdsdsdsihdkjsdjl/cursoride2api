@@ -210,7 +210,7 @@ for chunk in resp:
 4. 自动回复 `execServerMessage` (headless 模式)
 5. 实时解析 `interactionUpdate` 流并转为 OpenAI SSE 格式
 
-详细逆向文档见 [Cursor IDE API 逆向工程文档](Cursor%20IDE%20API%20逆向工程文档.md)；近期开发笔记见 [DEVLOG.md](DEVLOG.md)。
+详细逆向文档见 [Cursor IDE API 逆向工程文档](Cursor%20IDE%20API%20逆向工程文档.md)；近期开发笔记见 [DEVLOG.md](DEVLOG.md)；调试方法（live-monitoring）见 [DEBUGGING.md](DEBUGGING.md)。
 
 ## 🔗 相关项目 / Related Projects
 

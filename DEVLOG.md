@@ -943,6 +943,12 @@ What we explicitly chose **not** to copy:
 
 ---
 
+## Debugging methodology
+
+When chasing stalls, slow turns, or "stuck" sessions, the high-leverage move is to start the proxy in the background with logs to a file, then live-tail-and-filter for turn lifecycle markers (`📨` / `✅ turn ended` / `❌` / `Upstream stalled` / `pool slot` / `429` etc.). One notification per real event; silence between `📨` and `✅` is itself the signal. The grep alternation must cover failure modes — silence is not success. See [DEBUGGING.md](DEBUGGING.md) for the recipe and the list of bugs we caught with it.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
