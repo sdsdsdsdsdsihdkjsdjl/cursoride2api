@@ -217,22 +217,35 @@ function anthropicMessagesToPrompt(messages, system) {
             const oldS = input.old_string;
             const newS = input.new_string;
             if (typeof cur === 'string' && typeof oldS === 'string' && typeof newS === 'string') {
-              let next;
-              if (input.replace_all) {
-                next = cur.split(oldS).join(newS);
+              const idx = cur.indexOf(oldS);
+              if (idx >= 0 || input.replace_all) {
+                // Apply succeeded — record post-state.
+                let next;
+                if (input.replace_all) {
+                  next = cur.split(oldS).join(newS);
+                } else {
+                  next = cur.slice(0, idx) + newS + cur.slice(idx + oldS.length);
+                }
+                fileStateNow.set(filePath, next);
+                fileStateAfterTool.set(b.id, next);
               } else {
-                const idx = cur.indexOf(oldS);
-                next = idx >= 0 ? cur.slice(0, idx) + newS + cur.slice(idx + oldS.length) : cur;
+                // old_string not in our cached state. The Edit may have
+                // succeeded on the actual file (claude-code matched the
+                // real content), but our cache is now wrong. Drop our
+                // belief about this file rather than echo stale content
+                // that misleads the model into a re-read.
+                fileStateNow.delete(filePath);
+                // Don't set fileStateAfterTool — echo will fall back to
+                // the diff-only "[You edited X: replaced Y → Z]" form,
+                // which is honest about not knowing the full state.
               }
-              fileStateNow.set(filePath, next);
-              fileStateAfterTool.set(b.id, next);
-            } else if (typeof cur === 'string') {
-              // Couldn't apply (missing strings); preserve prior state
-              fileStateAfterTool.set(b.id, cur);
             }
+            // else: types missing or cur unknown — fall through; echo logic
+            // handles the diff-only fallback when fileStateAfterTool is unset.
             lastTouchByFile.set(filePath, b.id);
           } else if ((name === 'MultiEdit' || name === 'mcp_MultiEdit') && filePath) {
             let cur = fileStateNow.get(filePath);
+            let allApplied = true;
             if (typeof cur === 'string' && Array.isArray(input.edits)) {
               for (const e of input.edits) {
                 if (!e || typeof e.old_string !== 'string' || typeof e.new_string !== 'string') continue;
@@ -240,11 +253,24 @@ function anthropicMessagesToPrompt(messages, system) {
                   cur = cur.split(e.old_string).join(e.new_string);
                 } else {
                   const idx = cur.indexOf(e.old_string);
-                  if (idx >= 0) cur = cur.slice(0, idx) + e.new_string + cur.slice(idx + e.old_string.length);
+                  if (idx >= 0) {
+                    cur = cur.slice(0, idx) + e.new_string + cur.slice(idx + e.old_string.length);
+                  } else {
+                    // One of the edits couldn't be applied — our state
+                    // is now out of sync with reality. Bail.
+                    allApplied = false;
+                    break;
+                  }
                 }
               }
-              fileStateNow.set(filePath, cur);
-              fileStateAfterTool.set(b.id, cur);
+              if (allApplied) {
+                fileStateNow.set(filePath, cur);
+                fileStateAfterTool.set(b.id, cur);
+              } else {
+                // Same reasoning as Edit: drop the cached belief rather
+                // than echo stale content.
+                fileStateNow.delete(filePath);
+              }
             }
             lastTouchByFile.set(filePath, b.id);
           } else if ((name === 'Read' || name === 'mcp_Read') && filePath) {
@@ -362,9 +388,16 @@ function anthropicMessagesToPrompt(messages, system) {
               const isMultiEdit = info.name === 'MultiEdit' || info.name === 'mcp_MultiEdit';
               const isRead = info.name === 'Read' || info.name === 'mcp_Read';
 
-              if (isLatestForThisFile && (isWrite || isEdit || isMultiEdit)) {
-                // Echo full current state at the latest write-side touch.
-                // Read tool_results already contain content — no echo needed.
+              if (!isLatestForThisFile && (isWrite || isEdit || isMultiEdit)) {
+                // Earlier touch on a file that gets overwritten later.
+                // Skip bulky content; just leave a breadcrumb pointing
+                // forward to the authoritative latest tool_result.
+                echoSuffix = `\n\n[Note: ${fp} was modified again later; refer to the most recent tool_result for that file for current state.]`;
+              } else if (isLatestForThisFile && (isWrite || isEdit || isMultiEdit)) {
+                // This is the latest touch — echo full state if computed,
+                // otherwise fall back to a diff-only or content-only echo
+                // depending on what we have. Order matters: prefer full
+                // state, then specific tool fallbacks.
                 const cur = fileStateAfterTool.get(b.tool_use_id);
                 if (typeof cur === 'string' && cur.length > 0) {
                   const truncated = cur.length > echoMaxBytes
@@ -373,28 +406,37 @@ function anthropicMessagesToPrompt(messages, system) {
                   echoSuffix =
                     `\n\n[Current believed content of ${fp} (after this op) — use this directly, do NOT re-read the file:\n` +
                     '```\n' + truncated + '\n```]';
+                } else if (isWrite && typeof info.input?.content === 'string') {
+                  // Write with a content arg we just couldn't reach via
+                  // fileStateAfterTool (rare). Echo input.content directly.
+                  const c = info.input.content;
+                  const truncated = c.length > echoMaxBytes
+                    ? c.slice(0, echoMaxBytes) + `\n... [truncated; full file is ${c.length} bytes]`
+                    : c;
+                  echoSuffix =
+                    `\n\n[You wrote this content to ${fp}:\n` +
+                    '```\n' + truncated + '\n```]';
+                } else if ((isEdit || isMultiEdit) && info.input) {
+                  // State-tracking failed (old_string didn't match our
+                  // cached content, etc.). Fall back to diff-only — be
+                  // honest about not knowing the full file state. The
+                  // model can re-read if it needs full state, but at
+                  // least we don't mislead it with stale content.
+                  if (isEdit && typeof info.input.old_string === 'string' && typeof info.input.new_string === 'string') {
+                    const trim = (s) => (s.length > 512 ? s.slice(0, 512) + '…' : s);
+                    echoSuffix =
+                      `\n\n[You edited ${fp}: replaced\n` +
+                      '```\n' + trim(info.input.old_string) + '\n```\n→\n```\n' + trim(info.input.new_string) + '\n```\n' +
+                      `(Full post-edit file state not cached; re-read if needed.)]`;
+                  } else if (isMultiEdit && Array.isArray(info.input.edits)) {
+                    const lines = info.input.edits.slice(0, 3).map((e, i) => {
+                      const trim = (s) => (s.length > 256 ? s.slice(0, 256) + '…' : s);
+                      return `  edit ${i + 1}: ${JSON.stringify(trim(e.old_string || ''))} → ${JSON.stringify(trim(e.new_string || ''))}`;
+                    });
+                    const more = info.input.edits.length > 3 ? `\n  ... ${info.input.edits.length - 3} more edits` : '';
+                    echoSuffix = `\n\n[You multi-edited ${fp} with ${info.input.edits.length} edits:\n${lines.join('\n')}${more}\n(Full post-edit file state not cached; re-read if needed.)]`;
+                  }
                 }
-              } else if (!isLatestForThisFile && (isWrite || isEdit || isMultiEdit)) {
-                // Earlier touch on a file that gets overwritten later.
-                // Skip the bulky echo — the latest touch will carry the
-                // authoritative state. Just leave a breadcrumb so the
-                // model knows there's a more recent version downstream.
-                echoSuffix = `\n\n[Note: ${fp} was modified again later; refer to the most recent tool_result for that file for current state.]`;
-              } else if (isWrite && info.input?.content) {
-                // Fallback for Write whose state we couldn't compute.
-                const c = info.input.content;
-                const truncated = c.length > echoMaxBytes
-                  ? c.slice(0, echoMaxBytes) + `\n... [truncated; full file is ${c.length} bytes]`
-                  : c;
-                echoSuffix =
-                  `\n\n[You wrote this content to ${fp}:\n` +
-                  '```\n' + truncated + '\n```]';
-              } else if (isEdit && typeof info.input?.old_string === 'string' && typeof info.input?.new_string === 'string') {
-                // Fallback for Edit when state-tracking failed.
-                const trim = (s) => (s.length > 512 ? s.slice(0, 512) + '…' : s);
-                echoSuffix =
-                  `\n\n[You edited ${fp}: replaced\n` +
-                  '```\n' + trim(info.input.old_string) + '\n```\n→\n```\n' + trim(info.input.new_string) + '\n```]';
               }
             }
             // Bash with file writes — emit one echo block per file written.
