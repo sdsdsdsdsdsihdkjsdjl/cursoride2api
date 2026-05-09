@@ -594,17 +594,27 @@ function applyModelOverrides(cursorModel, opts = {}) {
   if (!cursorModel) return cursorModel;
   const { effort, thinkingType } = opts;
 
-  // thinkingType semantics — default to thinking ON. Cursor's `-thinking-`
-  // variants are strictly more capable (model still skips trivial reasoning
-  // when not needed), and claude-code never sends `disabled` from the CLI
-  // anyway, so this is the most useful default. Explicit opt-out paths:
-  //   body.thinking.type === 'disabled' / 'none'      → off
-  //   CURSOR_FORCE_THINKING=off|disabled|false|0     → off (env, wins over body)
+  // thinkingType semantics:
+  //   'disabled' / 'none'    → thinking off (explicit opt-out)
+  //   'enabled'              → thinking on  (explicit opt-in)
+  //   'adaptive' / undefined → preserve whatever the input model encodes
+  //
+  // claude-code sends 'adaptive' as its default. Older code defaulted that
+  // to thinking ON, which clobbered explicit non-thinking literals like
+  // `--model claude-opus-4-7-max`. Now 'adaptive' means "follow the input"
+  // — bare aliases (claude-opus-4-7 → mapped to ...-thinking-max) keep
+  // thinking; explicit literals (claude-opus-4-7-max) keep no-thinking.
+  // Env overrides and explicit body fields still win when set.
   let wantThinking;
   if (thinkingType === 'disabled' || thinkingType === 'none') {
     wantThinking = false;
-  } else {
+  } else if (thinkingType === 'enabled') {
     wantThinking = true;
+  } else {
+    // 'adaptive' or undefined → input-preserving. Detect any -thinking
+    // segment: covers Opus-4.7's `-thinking-{effort}`, 4.6's `{effort}-thinking[-fast]`,
+    // and Sonnet's bare `-thinking` suffix.
+    wantThinking = /-thinking(?:-|$)/.test(cursorModel);
   }
 
   const wantEffort = effort && EFFORT_LEVELS.includes(effort) ? effort : null;
