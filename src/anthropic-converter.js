@@ -6,7 +6,17 @@ const { v4: uuidv4 } = require('uuid');
 
 /**
  * Anthropic messages → Cursor 单一 prompt
- * 将 Anthropic 格式的 messages + system 拼接为 Cursor 需要的单一文本
+ * 将 Anthropic 格式的 messages + system 拼接为 Cursor 需要的单一文本.
+ *
+ * Cursor's `agent.v1.AgentService/Run` accepts a single user-message text
+ * field per runRequest, so we have to flatten the entire Anthropic
+ * `messages` array into one string. To preserve the conversational
+ * structure the model relies on, we wrap each turn with explicit role
+ * tags (`<system>`, `<user>`, `<assistant>`) and mark the last user
+ * message specifically. Without `latest="true"`, on long sessions
+ * (thousands of tool_results accumulated) the model treats the latest
+ * "do something different now" instruction as just more history text
+ * and continues the prior plan instead of pivoting.
  */
 function anthropicMessagesToPrompt(messages, system) {
   if (!messages || messages.length === 0) return '';
@@ -29,8 +39,19 @@ function anthropicMessagesToPrompt(messages, system) {
     }
   }
 
+  // Find the index of the latest user message so we can tag it as the
+  // "current turn". This is the most important signal on long histories
+  // — without it, every <user> tag looks the same and the model has no
+  // structural cue for "what the user just asked."
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && (m.role || 'user') === 'user') { lastUserIdx = i; break; }
+  }
+
   // 处理 messages
-  for (const msg of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
     const role = msg.role || 'user';
     let content = '';
 
@@ -72,6 +93,14 @@ function anthropicMessagesToPrompt(messages, system) {
 
     if (role === 'assistant') {
       parts.push(`<assistant>\n${content}\n</assistant>`);
+    } else if (role === 'user') {
+      // Tag every user turn so the model can see role boundaries; mark
+      // the latest one so it doesn't drown in 1000+ messages of history.
+      if (i === lastUserIdx) {
+        parts.push(`<user latest="true">\n${content}\n</user>`);
+      } else {
+        parts.push(`<user>\n${content}\n</user>`);
+      }
     } else {
       parts.push(content);
     }

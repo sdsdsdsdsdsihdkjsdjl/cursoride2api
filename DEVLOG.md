@@ -664,6 +664,47 @@ Verified end-to-end:
 - 4-way unit test: identical-conversation continuation matches; different IP / different system / different model all diverge.
 - End-to-end: `claude -p` with tool round-trip → both requests share `convKey`, bridge cache hit, no "Bridge cache miss" warning, correct file content returned.
 
+### Tag user messages in flattened prompt (and mark the latest)
+
+**Bug.** Cursor's `agent.v1.AgentService/Run` accepts a single user-message text per runRequest, so we flatten the entire Anthropic `messages` array into one string via `anthropicMessagesToPrompt`. For years the function tagged `<system>...</system>` and `<assistant>...</assistant>` but emitted user messages as **bare text with no role marker**. On long sessions (1000+ messages of accumulated tool_result history), the model couldn't distinguish "what the user just said" from "more user content embedded in history" — every user turn looked identical.
+
+User-visible symptom: the user issues a mid-session pivot ("do handover instead"), claude-code dutifully POSTs `messages` with the new instruction as the latest user turn, the proxy faithfully forwards everything — and the model continues the prior plan as if the new instruction were just more context. Direct claude-code → Anthropic doesn't have this problem because the structured `messages` array preserves explicit role boundaries.
+
+**Fix.** Wrap every user turn with `<user>...</user>`, and mark the most recent one with `<user latest="true">...</user>`. Three lines of new logic; the rest of the function unchanged. Now the model sees clear role boundaries throughout the history and a structural cue for "this is the user's current ask" at the end.
+
+Before:
+```
+<system>...</system>
+
+first prompt           ← bare text, role unclear
+
+<assistant>...</assistant>
+
+[Tool result for t1]:  ← bare text, role unclear
+hostname-value
+...
+[Request interrupted]  ← bare text — buried in history, no signal it's NEW
+do handover instead
+```
+
+After:
+```
+<system>...</system>
+
+<user>first prompt</user>
+
+<assistant>...</assistant>
+
+<user>[Tool result for t1]: hostname-value</user>
+...
+<user latest="true">
+[Request interrupted by user]
+do handover instead
+</user>
+```
+
+Verified: short prompts, tool round-trips, and the synthetic pivot test (continuation with text alongside tool_result) all work. The model sees the latest user turn clearly; pivot success rate on long sessions should improve dramatically.
+
 ### User-injection rescue: text alongside tool_result on continuation
 
 A user reported: starting a session, queuing a "do a handover instead" instruction mid-task, hitting run, and watching the model continue the original work as if the new instruction never arrived.
