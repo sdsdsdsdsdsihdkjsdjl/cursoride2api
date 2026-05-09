@@ -664,6 +664,48 @@ Verified end-to-end:
 - 4-way unit test: identical-conversation continuation matches; different IP / different system / different model all diverge.
 - End-to-end: `claude -p` with tool round-trip → both requests share `convKey`, bridge cache hit, no "Bridge cache miss" warning, correct file content returned.
 
+### Strengthen latest-user framing on long histories
+
+**Why this was needed.** After tagging user messages with `<user>` and marking the latest with `<user latest="true">` (see next section), the user reported pivots on a 2051-message session *still* failed. Captured request body:
+
+```
+msg count: 2051
+last role: user
+  block[0] text='do handover instead'
+```
+
+Proxy correctly forwarded everything; the model saw `<user latest="true">do handover instead</user>` at the end of 2051 messages of accumulated plan-state and **still kept executing the prior plan**. The structural tag was insufficient against that much context inertia.
+
+**Fix.** When *any* of these is true for the latest user message, inject an explicit directive inside the wrapper telling the model the content is the active request and not to auto-continue prior plans:
+
+- Total message count ≥ `LATEST_USER_FRAMING_THRESHOLD` (default 50).
+- Content matches `[Request interrupted by user]` (claude-code's interrupt marker).
+- Content matches a pivot-keyword regex: `stop|halt|abort|cancel|instead|nevermind|forget (that|the|previous)|switch to|do … instead|change of plans|new plan|forget everything|start over`.
+
+The directive is short and semantic, with three flavor variants depending on which signal fired:
+
+```
+<user latest="true">
+[ATTENTION — CURRENT USER TURN. {flavor}. Respond directly to it;
+do NOT auto-continue the prior plan unless the user explicitly asks
+you to.]
+
+do handover instead
+</user>
+```
+
+`{flavor}` is one of:
+- `The user has interrupted the prior plan. The message below is the new directive.` (interrupt marker)
+- `The message below appears to redirect or override the prior plan.` (pivot keywords)
+- `The conversation above is history; the message below is the user's active request.` (long history)
+
+**Verified end-to-end:** 3-message synthetic with "do handover instead" → model now correctly responds about handover instead of continuing prior task. Short prompts without pivot signals are unchanged (no ATTENTION line emitted). Tool round-trip continues to work normally.
+
+**Knobs:**
+- `LATEST_USER_FRAMING_THRESHOLD=N` — message count threshold (default 50). Set higher to make the directive rarer.
+
+**Trade-off:** the directive is text we inject into the prompt; the model could in theory quote it back. Kept terse and semantic to minimize that risk. If false positives become a problem (e.g., user's "instead" wasn't actually a pivot), make the regex stricter or expose an `off` switch.
+
 ### Tag user messages in flattened prompt (and mark the latest)
 
 **Bug.** Cursor's `agent.v1.AgentService/Run` accepts a single user-message text per runRequest, so we flatten the entire Anthropic `messages` array into one string via `anthropicMessagesToPrompt`. For years the function tagged `<system>...</system>` and `<assistant>...</assistant>` but emitted user messages as **bare text with no role marker**. On long sessions (1000+ messages of accumulated tool_result history), the model couldn't distinguish "what the user just said" from "more user content embedded in history" — every user turn looked identical.

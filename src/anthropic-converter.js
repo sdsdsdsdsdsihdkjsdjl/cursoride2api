@@ -97,7 +97,7 @@ function anthropicMessagesToPrompt(messages, system) {
       // Tag every user turn so the model can see role boundaries; mark
       // the latest one so it doesn't drown in 1000+ messages of history.
       if (i === lastUserIdx) {
-        parts.push(`<user latest="true">\n${content}\n</user>`);
+        parts.push(_wrapLatestUser(content, messages.length));
       } else {
         parts.push(`<user>\n${content}\n</user>`);
       }
@@ -107,6 +107,54 @@ function anthropicMessagesToPrompt(messages, system) {
   }
 
   return parts.join('\n\n');
+}
+
+// Threshold above which we add an explicit pivot directive inside the
+// latest-user wrapper. On short conversations the structural tag is
+// enough; on long ones (~50+ messages, common in agentic sessions),
+// model attention gets dominated by accumulated tool_results and
+// plan-state, and a brief "do handover" instruction at the end is
+// frequently ignored. The directive coaches the model to treat the
+// content as a fresh ask rather than continuation context.
+const LONG_HISTORY_THRESHOLD = (() => {
+  const raw = process.env.LATEST_USER_FRAMING_THRESHOLD;
+  if (raw == null || raw === '') return 50;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 50;
+})();
+
+// Patterns that indicate the user explicitly interrupted or is pivoting
+// hard. When present, strengthen even on short histories.
+const INTERRUPT_PATTERN = /\[Request interrupted by user\]/i;
+const PIVOT_KEYWORDS = /\b(stop|halt|abort|cancel|instead|nevermind|never mind|actually do|forget (that|the|previous)|switch to|do .{0,20} instead|change of plans|new plan|forget everything|start over)\b/i;
+
+function _wrapLatestUser(content, totalMessages) {
+  const isInterrupt = INTERRUPT_PATTERN.test(content);
+  const isPivot = PIVOT_KEYWORDS.test(content);
+  const isLong = totalMessages >= LONG_HISTORY_THRESHOLD;
+  const needsDirective = isInterrupt || isPivot || isLong;
+
+  if (!needsDirective) {
+    return `<user latest="true">\n${content}\n</user>`;
+  }
+
+  // Short, semantic directive. Kept terse to minimize the chance the
+  // model quotes it back or treats it as part of the user's content.
+  // The double-rule ("CURRENT TURN" + "high priority") + the explicit
+  // anti-stickiness clause is the combination that overcomes long-
+  // history task anchoring.
+  const flavor = isInterrupt
+    ? 'The user has interrupted the prior plan. The message below is the new directive.'
+    : isPivot
+      ? 'The message below appears to redirect or override the prior plan.'
+      : 'The conversation above is history; the message below is the user\'s active request.';
+
+  return (
+    `<user latest="true">\n` +
+    `[ATTENTION — CURRENT USER TURN. ${flavor} Respond directly to it; do NOT auto-continue the prior plan unless the user explicitly asks you to.]\n\n` +
+    `${content}\n` +
+    `</user>`
+  );
 }
 
 /**
