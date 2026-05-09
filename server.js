@@ -985,7 +985,13 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
       routingReason = `subagent passthrough (${pre.subagentMarker.agent_type})`;
     }
   }
-  let cursorModel = anthropicConverter.mapAnthropicModel(effectiveModel, config.anthropicModelMapping);
+  // Strip the `-no-thinking` client-side marker before mapping. claude-code's
+  // CLI lacks a --no-thinking flag, so users embed the signal in --model.
+  // extractModelOverrides below also detects it (and sets thinkingType=disabled);
+  // here we just normalize the lookup name so e.g. claude-opus-4-7-no-thinking
+  // hits the claude-opus-4-7 entry in anthropicModelMapping.
+  const modelForLookup = anthropicConverter.stripNoThinkingSuffix(effectiveModel);
+  let cursorModel = anthropicConverter.mapAnthropicModel(modelForLookup, config.anthropicModelMapping);
   // Honor claude-code's --effort flag (carried in body.output_config.effort)
   // and the Anthropic-API thinking parameter. Without this hook every
   // request gets the static thinking-max mapping regardless of what the

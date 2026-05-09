@@ -611,7 +611,17 @@ function applyModelOverrides(cursorModel, opts = {}) {
 
   // Family: claude-opus-4-7 — full grid (5 effort × 2 thinking).
   if (/^claude-opus-4-7(?:-thinking)?(?:-(?:low|medium|high|xhigh|max))?$/.test(cursorModel)) {
-    const e = wantEffort || 'max';
+    // When the caller doesn't specify effort, preserve whatever the input
+    // model already encodes — this matters for the `-no-thinking` path
+    // where we want to flip thinking off without lowering effort. Falls
+    // back to 'max' if the input is bare (e.g., raw "claude-opus-4-7").
+    let e;
+    if (wantEffort) {
+      e = wantEffort;
+    } else {
+      const m = /-(low|medium|high|xhigh|max)$/.exec(cursorModel);
+      e = m ? m[1] : 'max';
+    }
     return wantThinking ? `claude-opus-4-7-thinking-${e}` : `claude-opus-4-7-${e}`;
   }
 
@@ -620,10 +630,18 @@ function applyModelOverrides(cursorModel, opts = {}) {
   // Effort dimension is binary (high|max), thinking is on/off, and there's
   // a -fast accelerator (only valid combined with thinking). We collapse
   // claude-code's 5-level effort onto the 2 levels Cursor exposes:
-  // low/medium/high/xhigh → 'high'; max → 'max'.
+  // low/medium/high/xhigh → 'high'; max → 'max'. When effort isn't
+  // requested, preserve the input model's effort (so `-no-thinking` on a
+  // mapping-default `-max-thinking` keeps `-max`).
   if (/^claude-4\.6-opus(?:-high|-max)(?:-thinking(?:-fast)?)?$/.test(cursorModel) ||
       /^claude-4\.6-opus$/.test(cursorModel)) {
-    const effortAxis = wantEffort === 'max' ? 'max' : 'high';
+    let effortAxis;
+    if (wantEffort) {
+      effortAxis = wantEffort === 'max' ? 'max' : 'high';
+    } else {
+      const m = /^claude-4\.6-opus-(high|max)/.exec(cursorModel);
+      effortAxis = m ? m[1] : 'high';
+    }
     if (wantThinking) {
       // Preserve -fast suffix from the input model if present (caller opted in).
       const isFast = /-fast$/.test(cursorModel);
@@ -666,6 +684,24 @@ function applyModelOverrides(cursorModel, opts = {}) {
  *   body.output_config.effort           — claude-code's --effort
  *   body.thinking.type                  — Anthropic API thinking signal
  */
+// Marker suffix on body.model for client-side opt-out of thinking. claude-code's
+// CLI doesn't have a --no-thinking flag, but it does pass arbitrary --model
+// strings through verbatim, so we use the model name itself as the channel.
+//
+//   --model claude-opus-4-7-no-thinking         → thinking forced off, effort=max
+//   --model claude-opus-4-7-no-thinking --effort low   → thinking off, effort=low
+//
+// Accepts both `-no-thinking` and `-nothinking` for typo tolerance. The stripped
+// base name is what gets handed to mapAnthropicModel; thinkingType='disabled' is
+// returned alongside the other overrides so applyModelOverrides skips the
+// `-thinking-` axis.
+const NO_THINKING_SUFFIX = /-no-?thinking$/i;
+
+function stripNoThinkingSuffix(model) {
+  if (typeof model !== 'string') return model;
+  return model.replace(NO_THINKING_SUFFIX, '');
+}
+
 function extractModelOverrides(body) {
   const out = {};
   if (body && typeof body === 'object') {
@@ -676,6 +712,12 @@ function extractModelOverrides(body) {
     // Anthropic API: `thinking: { type: 'adaptive'|'enabled'|'disabled', budget_tokens?: N }`.
     if (body.thinking && typeof body.thinking === 'object' && typeof body.thinking.type === 'string') {
       out.thinkingType = body.thinking.type.toLowerCase();
+    }
+    // Client-side `-no-thinking` model-name marker. Wins over body.thinking
+    // when present (the model name is the more explicit signal — the user
+    // typed it on the CLI), but loses to env vars.
+    if (typeof body.model === 'string' && NO_THINKING_SUFFIX.test(body.model)) {
+      out.thinkingType = 'disabled';
     }
   }
 
@@ -915,7 +957,7 @@ function buildPing() {
 
 module.exports = {
   anthropicMessagesToPrompt, mapAnthropicModel,
-  applyModelOverrides, extractModelOverrides,
+  applyModelOverrides, extractModelOverrides, stripNoThinkingSuffix,
   buildAnthropicResponse, buildAnthropicErrorResponse,
   formatSSE,
   buildMessageStart, buildContentBlockStart, buildContentBlockDelta,
