@@ -1499,7 +1499,12 @@ function startConversation(token, options = {}) {
       }, backoffMs);
       return;
     }
-    fail(msg);
+    // No retry — surface a clean error to claude-code. Stalls were wrapped
+    // in `NGHTTP2_INTERNAL_ERROR (...)` to flow through the retry path,
+    // but if we're falling through to fail() the H2 framing is misleading.
+    // Strip it back to the original "Upstream stalled — ..." message.
+    const stallMatch = /^NGHTTP2_INTERNAL_ERROR \((Upstream stalled — [^)]+)\)$/.exec(msg);
+    fail(stallMatch ? stallMatch[1] : msg);
   }
 
   // Kick off the connection. If the proto module isn't loaded yet (pre-warm
