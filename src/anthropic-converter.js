@@ -240,12 +240,21 @@ function applyModelOverrides(cursorModel, opts = {}) {
     return wantThinking ? `claude-opus-4-7-thinking-${e}` : `claude-opus-4-7-${e}`;
   }
 
-  // Family: claude-4.6-opus-{high,max-thinking,high-thinking} — known to exist.
-  if (/^claude-4\.6-opus(?:-high|-max)?(?:-thinking)?$/.test(cursorModel)) {
-    // Only -high and -max-thinking are documented; preserve unless explicitly set.
-    if (wantEffort === 'max' && wantThinking) return 'claude-4.6-opus-max-thinking';
-    if (wantThinking) return 'claude-4.6-opus-high-thinking';
-    return 'claude-4.6-opus-high';
+  // Family: claude-4.6-opus — Cursor exposes 6 variants: -high, -high-thinking,
+  // -high-thinking-fast, -max, -max-thinking, -max-thinking-fast.
+  // Effort dimension is binary (high|max), thinking is on/off, and there's
+  // a -fast accelerator (only valid combined with thinking). We collapse
+  // claude-code's 5-level effort onto the 2 levels Cursor exposes:
+  // low/medium/high/xhigh → 'high'; max → 'max'.
+  if (/^claude-4\.6-opus(?:-high|-max)(?:-thinking(?:-fast)?)?$/.test(cursorModel) ||
+      /^claude-4\.6-opus$/.test(cursorModel)) {
+    const effortAxis = wantEffort === 'max' ? 'max' : 'high';
+    if (wantThinking) {
+      // Preserve -fast suffix from the input model if present (caller opted in).
+      const isFast = /-fast$/.test(cursorModel);
+      return `claude-4.6-opus-${effortAxis}-thinking${isFast ? '-fast' : ''}`;
+    }
+    return `claude-4.6-opus-${effortAxis}`;
   }
 
   // Family: claude-4.6-sonnet-medium — only thinking on/off available.
