@@ -684,19 +684,41 @@ function buildTurnCallbacks(ctx) {
       const bridge = getBridge();
       try { bridge && bridge.close(); } catch {}
 
+      // Classify the error — transient upstream failures (stalls, GOAWAY
+      // cascades, REFUSED_STREAM) get an Anthropic-style mid-stream
+      // `error` event so claude-code's SDK can recognize them as
+      // retryable rather than treating the partial response as a
+      // completed turn. Hard errors (auth, permission, validation, etc)
+      // still land as content blocks the user can read directly.
+      const isTransientUpstream =
+        /Upstream stalled/i.test(errMsg) ||
+        /Upstream stream ended before turnEnded/i.test(errMsg) ||
+        /REFUSED_STREAM|INTERNAL_ERROR|GOAWAY|client (goaway|closed)/i.test(errMsg);
+
       if (isStream) {
         if (!res.writableEnded) {
           closeOpenBlock();
-          const idx = turnState.nextBlockIndex++;
-          res.write(anthropicConverter.buildContentBlockStart(idx));
-          res.write(anthropicConverter.buildContentBlockDelta(idx, `\n\n[Error: ${errMsg}]`));
-          res.write(anthropicConverter.buildContentBlockStop(idx));
-          res.write(anthropicConverter.buildMessageDelta('end_turn', 0));
-          res.write(anthropicConverter.buildMessageStop());
-          res.end();
+          if (isTransientUpstream && process.env.STALL_AS_OVERLOADED !== '0') {
+            // Mid-stream `error` event — terminal per Anthropic SSE spec.
+            // No message_delta/message_stop after this; the partial
+            // response is implicitly discarded by the client.
+            res.write(anthropicConverter.buildSseErrorEvent(errMsg, 'overloaded_error'));
+            res.end();
+          } else {
+            // Legacy path: append error as content + end_turn.
+            const idx = turnState.nextBlockIndex++;
+            res.write(anthropicConverter.buildContentBlockStart(idx));
+            res.write(anthropicConverter.buildContentBlockDelta(idx, `\n\n[Error: ${errMsg}]`));
+            res.write(anthropicConverter.buildContentBlockStop(idx));
+            res.write(anthropicConverter.buildMessageDelta('end_turn', 0));
+            res.write(anthropicConverter.buildMessageStop());
+            res.end();
+          }
         }
       } else if (!res.headersSent) {
-        res.status(500).json(anthropicConverter.buildAnthropicErrorResponse(errMsg, 'api_error'));
+        const errType = isTransientUpstream ? 'overloaded_error' : 'api_error';
+        const status = isTransientUpstream ? 529 : 500;
+        res.status(status).json(anthropicConverter.buildAnthropicErrorResponse(errMsg, errType));
       }
     },
   };

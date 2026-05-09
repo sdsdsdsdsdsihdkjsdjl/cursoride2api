@@ -887,6 +887,24 @@ function buildMessageStop() {
 }
 
 /**
+ * Mid-stream `error` SSE event per Anthropic Messages spec. This is a
+ * terminal event — the client should discard the partial response and
+ * may retry depending on the error type:
+ *   - overloaded_error (529) → typically auto-retried by Anthropic SDK
+ *   - api_error (500)         → may be retried per client policy
+ *   - rate_limit_error (429)  → retried with backoff
+ * We use this for upstream stalls so claude-code sees a transient,
+ * potentially retryable failure instead of an opaque "[Error: ...]"
+ * appended as content (which it interprets as end_turn — terminal).
+ */
+function buildSseErrorEvent(message, type = 'overloaded_error') {
+  return formatSSE('error', {
+    type: 'error',
+    error: { type, message },
+  });
+}
+
+/**
  * ping 事件
  */
 function buildPing() {
@@ -904,4 +922,5 @@ module.exports = {
   buildContentBlockStartToolUse, buildContentBlockDeltaInputJson,
   buildContentBlockStartThinking, buildContentBlockDeltaThinking,
   buildContentBlockStop, buildMessageDelta, buildMessageStop, buildPing,
+  buildSseErrorEvent,
 };
