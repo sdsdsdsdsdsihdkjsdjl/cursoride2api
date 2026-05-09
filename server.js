@@ -991,13 +991,35 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
       if (cached) cacheHitVia = `bridgeKey=${bridgeKey}`;
     }
     if (cached) {
+      // User-injected-content rescue. handleContinuation forwards only
+      // tool_result blocks to Cursor's open stream; any text/image/etc.
+      // content the user attached alongside the tool_results would be
+      // silently dropped. Detect that case and force a cache miss so the
+      // request flows through handleFreshTurn with the full message
+      // history. Cursor then sees the new instruction in the rebuilt
+      // prompt. Verified failure mode: model continues prior task,
+      // ignoring the new user instruction.
+      const lastUser = anthropicTools.findLatestUserMessage(messages);
+      const hasUserInjection =
+        lastUser && Array.isArray(lastUser.content) &&
+        lastUser.content.some(b => b && b.type && b.type !== 'tool_result');
+      if (hasUserInjection) {
+        const injectedTypes = [...new Set(lastUser.content.map(b => b && b.type).filter(t => t && t !== 'tool_result'))];
+        console.log(`  ↪️  user-injected content alongside tool_result (${injectedTypes.join(',')}); forcing fresh-turn so the new instruction reaches the model`);
+        dropBridgeEntry(cached, 'user-injected-content');
+        cached = null;
+      }
+    }
+    if (cached) {
       cached.lastAccessMs = Date.now();
       cached.requestId = requestId;
       if (process.env.CURSOR_AGENT_DEBUG) console.log(`  ↪️  continuation cache hit via ${cacheHitVia}`);
       return handleContinuation(req, res, cached, messages, requestedModel, cursorModel, isStream, bridgeKey);
     }
-    // Cache miss — bridge died or was evicted. Fall through to a fresh turn
-    // using the full message history (system + alternations) as the prompt.
+    // Cache miss — bridge died, was evicted, or we just dropped it on
+    // purpose because the user injected new content alongside the
+    // tool_results. Fall through to a fresh turn using the full message
+    // history (system + alternations) as the prompt.
     console.log('  ⚠️  Bridge cache miss for continuation; starting fresh');
     debugLog.warn('continuation_cache_miss', { request_id: requestId, conv_key: convKey, bridge_key: bridgeKey });
   }
