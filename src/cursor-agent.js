@@ -82,6 +82,8 @@ const _clientType = process.env.CURSOR_CLIENT_TYPE || 'ide';
 const _clientOs = process.env.CURSOR_CLIENT_OS || (process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows_nt' : 'linux');
 const _clientArch = process.env.CURSOR_CLIENT_ARCH || (process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch);
 const _clientDevice = process.env.CURSOR_CLIENT_DEVICE_TYPE || 'desktop';
+const _clientOsVersion = process.env.CURSOR_CLIENT_OS_VERSION || require('os').release();
+const _clientCommit = process.env.CURSOR_COMMIT || 'd5c0e77a0214208f36b56d42e8e787de88d02ea4';
 // Cache the timezone string at module load — Intl.DateTimeFormat() does
 // non-trivial work and the answer never changes mid-process.
 const _cursorTimezone = (() => {
@@ -110,6 +112,9 @@ function buildHeaders(token, sessionId) {
     'x-cursor-client-os': _clientOs,
     'x-cursor-client-arch': _clientArch,
     'x-cursor-client-device-type': _clientDevice,
+    // IDE-style fingerprint padding; harmless if backend ignores
+    'x-cursor-client-os-version': _clientOsVersion,
+    'x-cursor-commit': _clientCommit,
   };
 }
 

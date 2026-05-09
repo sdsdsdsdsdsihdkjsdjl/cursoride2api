@@ -4,7 +4,7 @@
 
 const config = {
   cursor: {
-    baseUrl: 'https://api2.cursor.sh',
+    baseUrl: process.env.CURSOR_API_BASE_URL || 'https://api2.cursor.sh',
     clientVersion: process.env.CURSOR_CLIENT_VERSION || '2.6.20',
     defaultModel: process.env.DEFAULT_MODEL || 'claude-4.5-sonnet',
     requestTimeout: parseInt(process.env.REQUEST_TIMEOUT || '120000'),

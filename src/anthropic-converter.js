@@ -563,6 +563,10 @@ function mapAnthropicModel(model, configMapping) {
   if (configMapping) {
     const mapped = configMapping[model];
     if (mapped) return mapped;
+    // Anthropic dated aliases (e.g. claude-opus-4-7-20260301): try the bare
+    // form so future date suffixes resolve without a config change.
+    const bare = model.replace(/-\d{8}$/, '');
+    if (bare !== model && configMapping[bare]) return configMapping[bare];
   }
 
   // 直通 (未知模型原样传递)
@@ -974,6 +978,64 @@ function buildPing() {
   });
 }
 
+/**
+ * Build /v1/models response that exposes BOTH Cursor-internal IDs and
+ * Anthropic-shaped IDs. claude-code, the Anthropic SDK, and most aiservice
+ * routers ask for models by their canonical Anthropic name (e.g.
+ * `claude-opus-4-7-20250507`); without aliases the proxy looks empty for
+ * those clients even though the underlying Cursor model is available.
+ *
+ * For each Anthropic key in `anthropicModelMapping`, we emit an entry only
+ * if the mapped Cursor ID is in the live model list — so a 4.7-Opus rollback
+ * at the Cursor side automatically removes the Anthropic alias instead of
+ * silently 404'ing on use.
+ *
+ * The Cursor entries are preserved unchanged so existing OpenAI-compatible
+ * callers keep working.
+ */
+function buildModelsResponseWithAnthropicAliases(cursorModels = [], anthropicModelMapping = {}) {
+  const created = Math.floor(Date.now() / 1000);
+  const liveCursorIds = new Set();
+  const cursorEntries = [];
+  for (const m of cursorModels) {
+    const id = m.modelId || m.model_id;
+    if (!id) continue;
+    liveCursorIds.add(id);
+    cursorEntries.push({
+      id,
+      object: 'model',
+      created,
+      owned_by: 'cursor',
+      permission: [],
+      root: id,
+      parent: null,
+    });
+  }
+
+  const anthropicEntries = [];
+  const seen = new Set();
+  for (const anthropicId of Object.keys(anthropicModelMapping)) {
+    if (seen.has(anthropicId)) continue;
+    const cursorId = anthropicModelMapping[anthropicId];
+    if (!liveCursorIds.has(cursorId)) continue;
+    seen.add(anthropicId);
+    anthropicEntries.push({
+      id: anthropicId,
+      object: 'model',
+      created,
+      owned_by: 'anthropic-via-cursor',
+      permission: [],
+      root: cursorId,
+      parent: null,
+    });
+  }
+
+  return {
+    object: 'list',
+    data: cursorEntries.concat(anthropicEntries),
+  };
+}
+
 module.exports = {
   anthropicMessagesToPrompt, mapAnthropicModel,
   applyModelOverrides, extractModelOverrides, stripNoThinkingSuffix,
@@ -983,5 +1045,6 @@ module.exports = {
   buildContentBlockStartToolUse, buildContentBlockDeltaInputJson,
   buildContentBlockStartThinking, buildContentBlockDeltaThinking,
   buildContentBlockStop, buildMessageDelta, buildMessageStop, buildPing,
+  buildModelsResponseWithAnthropicAliases,
   buildSseErrorEvent,
 };

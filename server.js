@@ -99,9 +99,132 @@ function evictStale() {
 }
 setInterval(evictStale, 60 * 1000).unref();
 
-// ── 加载 Tokens ──
-let tokens = [];
-let roundRobinIndex = 0;
+// ── Token pool ──
+//
+// Health-aware replacement for the old round-robin picker. State per token:
+//
+//   { accessToken, machineId, macMachineId,
+//     activeRequests, lastUsed, rateLimitUntil,
+//     totalRequests, totalErrors, totalRateLimits,
+//     released /* internal — set by pick(), cleared by release() */ }
+//
+// pick() prefers tokens with fewer in-flight requests, breaking ties by
+// least-recently-used. Tokens that recently 429'd are parked until their
+// rateLimitUntil expires (default 60 s, override via TOKEN_RATE_LIMIT_PARK_MS).
+// If every token is parked, we still hand out the one recovering soonest —
+// the upstream call will likely fail again, but blocking unconditionally would
+// hide the situation from the caller.
+//
+// release() is idempotent: each "ticket" returned by pick() carries a unique
+// `released` flag, so duplicate calls (e.g. both a try/finally and an
+// res.on('close') hook) don't double-decrement activeRequests.
+const TOKEN_RATE_LIMIT_PARK_MS = parseInt(process.env.TOKEN_RATE_LIMIT_PARK_MS || '60000');
+
+class TokenPool {
+  constructor(rawTokens = []) {
+    this._tokens = [];
+    this.replace(rawTokens);
+  }
+
+  replace(rawTokens) {
+    // Preserve counters across hot-reloads by matching on accessToken.
+    const prev = new Map(this._tokens.map(t => [t.accessToken, t]));
+    this._tokens = rawTokens
+      .filter(t => t && t.accessToken)
+      .map(t => {
+        const carry = prev.get(t.accessToken);
+        return {
+          accessToken: t.accessToken,
+          machineId: t.machineId || '',
+          macMachineId: t.macMachineId || '',
+          activeRequests: carry ? carry.activeRequests : 0,
+          lastUsed: carry ? carry.lastUsed : 0,
+          rateLimitUntil: carry ? carry.rateLimitUntil : 0,
+          totalRequests: carry ? carry.totalRequests : 0,
+          totalErrors: carry ? carry.totalErrors : 0,
+          totalRateLimits: carry ? carry.totalRateLimits : 0,
+        };
+      });
+  }
+
+  size() { return this._tokens.length; }
+
+  pick() {
+    if (this._tokens.length === 0) return null;
+    const now = Date.now();
+    const live = this._tokens.filter(t => t.rateLimitUntil <= now);
+    let chosen;
+    if (live.length > 0) {
+      live.sort((a, b) =>
+        (a.activeRequests - b.activeRequests) || (a.lastUsed - b.lastUsed));
+      chosen = live[0];
+    } else {
+      // Every token is parked — pick the one recovering soonest so we at
+      // least try, rather than failing closed.
+      chosen = this._tokens.slice()
+        .sort((a, b) => a.rateLimitUntil - b.rateLimitUntil)[0];
+    }
+    chosen.activeRequests++;
+    chosen.lastUsed = now;
+    chosen.totalRequests++;
+    // Each pick returns a fresh ticket object so release() can be idempotent
+    // per call site without sharing a mutable flag across concurrent requests
+    // that happen to draw the same underlying token.
+    return {
+      accessToken: chosen.accessToken,
+      machineId: chosen.machineId,
+      macMachineId: chosen.macMachineId,
+      _slot: chosen,
+      _released: false,
+    };
+  }
+
+  release(ticket, info = {}) {
+    if (!ticket || ticket._released || !ticket._slot) return;
+    ticket._released = true;
+    const slot = ticket._slot;
+    if (slot.activeRequests > 0) slot.activeRequests--;
+    if (info.error) slot.totalErrors++;
+    if (info.rateLimited) {
+      slot.totalRateLimits++;
+      slot.rateLimitUntil = Date.now() + TOKEN_RATE_LIMIT_PARK_MS;
+    }
+  }
+
+  stats() {
+    const now = Date.now();
+    return {
+      tokens: this._tokens.map(t => {
+        const parked = t.rateLimitUntil > now;
+        return {
+          accessToken_suffix: t.accessToken.slice(-6),
+          activeRequests: t.activeRequests,
+          totalRequests: t.totalRequests,
+          totalErrors: t.totalErrors,
+          totalRateLimits: t.totalRateLimits,
+          parked,
+          parkedUntilMs: parked ? t.rateLimitUntil : null,
+        };
+      }),
+    };
+  }
+}
+
+// Heuristic 429 detection. We accept several shapes because Connect/H2 errors
+// surface differently depending on where they originated (TLS layer, Cursor's
+// envelope, or the upstream Anthropic provider Cursor proxies to).
+function looksLikeRateLimit(err) {
+  if (!err) return false;
+  if (err.status === 429 || err.statusCode === 429 || err.code === 429) return true;
+  if (typeof err.code === 'string' && /resource_exhausted/i.test(err.code)) return true;
+  const msg = (typeof err === 'string') ? err : (err.message || '');
+  if (/\b429\b/.test(msg)) return true;
+  if (/RESOURCE_EXHAUSTED/i.test(msg)) return true;
+  if (/rate.?limit|too.many.requests/i.test(msg)) return true;
+  return false;
+}
+
+const tokenPool = new TokenPool([]);
 
 function loadTokens() {
   try {
@@ -111,13 +234,14 @@ function loadTokens() {
       process.exit(1);
     }
     const data = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
-    tokens = (data.tokens || []).filter(t => t.accessToken && t.accessToken !== 'your-cursor-access-token-here');
-    if (tokens.length === 0) {
+    const valid = (data.tokens || []).filter(t => t.accessToken && t.accessToken !== 'your-cursor-access-token-here');
+    if (valid.length === 0) {
       console.error('  ❌ No valid tokens in token.json');
       console.error('  📝 Add at least one token with a valid accessToken');
       process.exit(1);
     }
-    return tokens.length;
+    tokenPool.replace(valid);
+    return tokenPool.size();
   } catch (e) {
     console.error(`  ❌ Failed to load token.json: ${e.message}`);
     process.exit(1);
@@ -132,26 +256,12 @@ function watchTokenFile() {
         const data = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
         const newTokens = (data.tokens || []).filter(t => t.accessToken && t.accessToken !== 'your-cursor-access-token-here');
         if (newTokens.length > 0) {
-          tokens = newTokens;
-          roundRobinIndex = 0;
-          console.log(`  🔄 token.json reloaded: ${tokens.length} token(s)`);
+          tokenPool.replace(newTokens);
+          console.log(`  🔄 token.json reloaded: ${tokenPool.size()} token(s)`);
         }
       } catch {}
     });
   } catch {}
-}
-
-// 轮询选 token
-function pickToken() {
-  if (tokens.length === 0) return null;
-  roundRobinIndex = roundRobinIndex % tokens.length;
-  const token = tokens[roundRobinIndex];
-  roundRobinIndex++;
-  return {
-    accessToken: token.accessToken,
-    machineId: token.machineId || '',
-    macMachineId: token.macMachineId || '',
-  };
 }
 
 // ── Express 应用 ──
@@ -179,19 +289,26 @@ function checkApiKey(req, res, next) {
 const _modelsCache = { ts: 0, body: null };
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 app.get('/v1/models', checkApiKey, async (req, res) => {
+  const now = Date.now();
+  if (_modelsCache.body && (now - _modelsCache.ts) < MODELS_CACHE_TTL_MS) {
+    return res.json(_modelsCache.body);
+  }
+  const token = tokenPool.pick();
+  if (!token) return res.json({ object: 'list', data: [] });
   try {
-    const now = Date.now();
-    if (_modelsCache.body && (now - _modelsCache.ts) < MODELS_CACHE_TTL_MS) {
-      return res.json(_modelsCache.body);
-    }
-    const token = pickToken();
-    if (!token) return res.json({ object: 'list', data: [] });
     const result = await cursorClient.getModels(token);
-    const body = converter.buildModelsResponse(result.models || []);
+    const body = anthropicConverter.buildModelsResponseWithAnthropicAliases(
+      result.models || [], config.anthropicModelMapping
+    );
     _modelsCache.ts = now;
     _modelsCache.body = body;
+    tokenPool.release(token, { success: true });
     res.json(body);
-  } catch {
+  } catch (err) {
+    tokenPool.release(token, {
+      error: true,
+      rateLimited: looksLikeRateLimit(err),
+    });
     // On error, serve stale cache if we have one rather than empty list.
     if (_modelsCache.body) return res.json(_modelsCache.body);
     res.json({ object: 'list', data: [] });
@@ -206,10 +323,15 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
     return res.status(400).json(converter.buildErrorResponse('messages is required', 'invalid_request_error', 400));
   }
 
-  const token = pickToken();
+  const token = tokenPool.pick();
   if (!token) {
     return res.status(503).json(converter.buildErrorResponse('No available tokens', 'server_error', 503));
   }
+
+  // Belt-and-suspenders: if the response closes for any reason without a
+  // matching release, clean up the token slot. release() is idempotent so the
+  // success/error paths below are still safe to call directly.
+  res.on('close', () => tokenPool.release(token, { success: true }));
 
   const requestedModel = model || 'gpt-4';
   const cursorModel = converter.mapModel(requestedModel);
@@ -250,9 +372,15 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
         res.end();
       }
 
+      tokenPool.release(token, {
+        success: !result.error,
+        error: !!result.error,
+        rateLimited: looksLikeRateLimit(result.error),
+      });
       console.log(`  ✅ stream done | in=${result.inputTokens} out=${result.outputTokens}`);
     } catch (e) {
       console.error(`  ❌ stream error: ${e.message}`);
+      tokenPool.release(token, { error: true, rateLimited: looksLikeRateLimit(e) });
       if (!res.writableEnded) {
         res.write(converter.buildStreamChunk(`\n\n[Error: ${e.message}]`, requestedModel, null, ident));
         res.write(converter.buildStreamChunk(null, requestedModel, 'stop', ident));
@@ -268,13 +396,19 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
 
       if (result.error) {
         console.error(`  ❌ ${result.error}`);
+        tokenPool.release(token, {
+          error: true,
+          rateLimited: looksLikeRateLimit(result.error),
+        });
         return res.status(500).json(converter.buildErrorResponse(result.error));
       }
 
+      tokenPool.release(token, { success: true });
       console.log(`  ✅ done | in=${result.inputTokens} out=${result.outputTokens}`);
       res.json(converter.buildChatResponse(result.text, requestedModel, result.inputTokens, result.outputTokens));
     } catch (e) {
       console.error(`  ❌ ${e.message}`);
+      tokenPool.release(token, { error: true, rateLimited: looksLikeRateLimit(e) });
       res.status(500).json(converter.buildErrorResponse(e.message));
     }
   }
@@ -308,6 +442,12 @@ function buildTurnCallbacks(ctx) {
     // Timings object — populated by callbacks; logged on turn end so the
     // user can see where time went (local proxy work vs upstream Cursor).
     timings,
+    // Optional — the TokenPool ticket for this fresh turn. Continuations
+    // reuse the bridge's already-released ticket and pass null. Callbacks
+    // that signal a true terminal outcome (success/error) call
+    // tokenPool.release(token, ...); release() is idempotent so the
+    // res.on('close') backstop on the original handler is still safe.
+    token,
   } = ctx;
   function stamp(name) {
     if (timings && timings.t0 != null && timings[name] == null) {
@@ -654,6 +794,12 @@ function buildTurnCallbacks(ctx) {
 
     onError: (errMsg) => {
       console.error(`  ❌ ${errMsg}`);
+      if (token) {
+        tokenPool.release(token, {
+          error: true,
+          rateLimited: looksLikeRateLimit(errMsg),
+        });
+      }
       if (cachedEntry) {
         dropBridgeEntry(cachedEntry, 'error');
       } else {
@@ -906,6 +1052,7 @@ async function handleFreshTurn(req, res, token, params) {
     getBridge: () => bridge,
     requestId: params.requestId,
     timings,
+    token,
   });
 
   bridge = cursorAgent.startConversation(token, {
@@ -1100,14 +1247,20 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
   }
 
   // Path B: fresh turn — only NOW do we burn a token. Cache-hit continuations
-  // reuse the bridge's existing connection; calling pickToken() upfront would
-  // advance roundRobinIndex without using the token and skew load distribution
-  // for unrelated fresh requests.
-  const token = pickToken();
+  // reuse the bridge's existing connection; calling tokenPool.pick() upfront
+  // would inflate the chosen slot's activeRequests without using it and skew
+  // health-aware load distribution for unrelated fresh requests.
+  const token = tokenPool.pick();
   if (!token) {
     debugLog.error('no_tokens_available', { reason: 'No available tokens', method: req.method, path: req.path });
     return res.status(503).json(anthropicConverter.buildAnthropicErrorResponse('No available tokens', 'api_error'));
   }
+  // Release on response close. release() is idempotent, so the bridge's
+  // onError/onTurnEnded callbacks below can also call it with a more accurate
+  // {error, rateLimited} verdict — whichever fires first wins, the second is
+  // a no-op. This guarantees we never leak activeRequests even if a bridge
+  // callback is somehow missed (e.g. abrupt H2 client tear-down).
+  res.on('close', () => tokenPool.release(token, { success: true }));
   return handleFreshTurn(req, res, token, {
     messages, system, requestedModel, cursorModel, isStream,
     convKey, bridgeKey, conversationId, tools, requestId,
@@ -1180,8 +1333,10 @@ app.post('/v1/messages/count_tokens', checkApiKey, async (req, res) => {
 // ── 健康检查 ──
 app.get('/health', (req, res) => {
   res.json({
+    ok: true,
     status: 'ok',
-    tokens: tokens.length,
+    tokens: tokenPool.stats(),
+    tokenCount: tokenPool.size(),
     defaultModel: DEFAULT_MODEL,
     version: '2.0.0',
   });
