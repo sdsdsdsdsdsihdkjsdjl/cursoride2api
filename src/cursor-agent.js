@@ -142,6 +142,13 @@ let _poolCursor = 0;
 // Tag a client object with its pool slot so failOrRetry can find it without
 // rescanning the pool. Set by _openClient; read by reportSlotError.
 const _slotOf = new WeakMap();
+// Mark clients that have received GOAWAY but haven't yet emitted 'close'.
+// Node's http2 connection stays in a draining state during this window,
+// and `c.closed` is still false — but new streams on it will get
+// REFUSED_STREAM. We use this set to skip such clients in getSharedClient
+// so a load-balancer cycle doesn't cascade across a fresh round of
+// requests landing on draining connections.
+const _drainingClients = new WeakSet();
 
 function _openClient(slot) {
   if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] opening pool client #${slot} → ${_baseUrl}`);
@@ -157,7 +164,13 @@ function _openClient(slot) {
   };
   c.on('error', (e) => drop(`error: ${e.message}`));
   c.on('close', () => drop('closed'));
-  c.on('goaway', () => drop('goaway'));
+  c.on('goaway', () => {
+    // Mark draining BEFORE drop() nulls the slot — getSharedClient may be
+    // called between goaway and close, and we don't want it to pick this
+    // client even if the slot pointer hasn't been cleared yet (race).
+    _drainingClients.add(c);
+    drop('goaway');
+  });
   _pool[slot] = c;
   _poolErrorCount[slot] = 0; // fresh slot, reset error counter
   return c;
@@ -187,7 +200,14 @@ function getSharedClient() {
     const slot = _poolCursor % _poolSize;
     _poolCursor = (_poolCursor + 1) % _poolSize;
     const c = _pool[slot];
-    if (c && !c.destroyed && !c.closed) return c;
+    // A "live" client must be: present, not destroyed, not closed, AND
+    // not draining (received GOAWAY but not yet fully closed). The last
+    // check catches the window where Cursor's LB just rotated us — new
+    // streams on a draining client will get REFUSED_STREAM immediately.
+    if (c && !c.destroyed && !c.closed && !_drainingClients.has(c)) return c;
+    // Slot is empty/dead/draining — open fresh. If the old client was
+    // draining, null it now so a future request doesn't get stuck on it.
+    if (c) _pool[slot] = null;
     return _openClient(slot);
   }
   // Should be unreachable — _poolSize >= 1.
@@ -1150,7 +1170,12 @@ function startConversation(token, options = {}) {
   // point even on otherwise-retryable errors. Set in handleServerMessage.
   let hasEmittedContent = false;
   let retryAttempts = 0;
-  const MAX_REQUEST_RETRIES = 2;
+  // Match pool size so a load-balancer cycle that hits every slot in
+  // sequence still has a chance to land on a fresh connection on the last
+  // retry. Exponential backoff (see failOrRetry) gives Cursor's LB time
+  // to recover between attempts so we don't waste retries on a still-
+  // draining client.
+  const MAX_REQUEST_RETRIES = 3;
   let cachedInitialEncoded = null;
   // Hold the H2 client we attached to so failOrRetry / poisonSharedClient
   // can target the specific bad pool slot without rescanning the pool.
@@ -1435,9 +1460,14 @@ function startConversation(token, options = {}) {
         try { clearInterval(watchdog); } catch { /* ignore */ }
         watchdog = null;
       }
-      // Brief backoff (50ms × attempt) — gives the upstream a moment to
-      // free a slot and the new TLS connection time to handshake.
-      const backoffMs = 50 * retryAttempts;
+      // Exponential backoff: 100ms, 250ms, 750ms (capped at ~1s). When
+      // Cursor's load balancer cycles its pool, all our slots receive
+      // GOAWAY in a tight burst — without backoff the retries land on
+      // brand-new but still-draining connections and cascade. The wider
+      // gap on later attempts gives the LB time to stabilize.
+      const backoffMs = retryAttempts === 1 ? 100
+                       : retryAttempts === 2 ? 250
+                       : 750;
       setTimeout(() => {
         if (closed) return;
         try { attemptConnection(proto); } catch (e) {
