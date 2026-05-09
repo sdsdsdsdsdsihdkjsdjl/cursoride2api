@@ -389,11 +389,23 @@ curl http://localhost:4141/v1/chat/completions \
 
 ## References
 
+### Primary references (foundational)
+
 - [`ephraimduncan/opencode-cursor`](https://github.com/ephraimduncan/opencode-cursor) — the working TypeScript reference proxy. Read its `src/proxy.ts` if anything here is unclear.
 - [`burpheart/cursor-tap`](https://github.com/burpheart/cursor-tap) — packet-capture-based reverse engineering, source of the proto definitions in `cursor_proto/agent_v1.proto` (4345 lines).
 - [Connect protocol spec](https://connectrpc.com/docs/protocol) — frame format, end-stream trailers.
 - [`@bufbuild/protobuf` docs](https://github.com/bufbuild/protobuf-es) — runtime we use for proto encode/decode.
 - This repo's `Cursor IDE API 逆向工程文档.md` — older Chinese-language reverse engineering notes (predates the connect+proto migration but still useful for non-tool flows).
+
+### Secondary references (cross-checked; see "Cross-referencing with other Cursor RE projects" above for what we adopted/rejected)
+
+- [`JJDTrump/cursor-reverse-engineering`](https://github.com/JJDTrump/cursor-reverse-engineering) — Cursor IDE v3.2.11 deep RE (Chinese). Single-README write-up of gRPC services, headers, ModelDetails. Several claims are stale vs. the current `agent.v1.AgentService` we target; treat dated material with skepticism.
+- [`anyrobert/cursor-api-proxy`](https://github.com/anyrobert/cursor-api-proxy) — most polished CLI-wrapping proxy. Origin of the health-aware `TokenPool` design we ported. Different architecture (wraps the `cursor-agent` CLI binary).
+- [`JiuZ-Chn/Cursor-To-OpenAI`](https://github.com/JiuZ-Chn/Cursor-To-OpenAI) — closest peer (also backend-direct). Source of the dated-variant regex idea and the fuller header survey. Includes a PKCE login flow we have not yet ported.
+- [`unkn0wncode/extract-cursor-protos`](https://github.com/unkn0wncode/extract-cursor-protos) — extracts the full `aiserver.v1` + `agent.v1` proto registry from Cursor binaries. Useful catalog when tracking down a wire-format question; we keep a hand-curated subset to avoid the bulk.
+- [`yokingma/OpenCursor`](https://github.com/yokingma/OpenCursor) — small TS proxy; documents `WorkosCursorSessionToken` cookie sourcing. Mostly redundant with JiuZ-Chn.
+- [`leeguooooo/agent-cli-to-api`](https://github.com/leeguooooo/agent-cli-to-api) — multi-CLI gateway (cursor-agent / codex / claude / gemini). Useful for comparing how each CLI's protocol differs.
+- [`Azhi-ss/cursorcli2api`](https://github.com/Azhi-ss/cursorcli2api), [`tageecc/cursor-agent-api-proxy`](https://github.com/tageecc/cursor-agent-api-proxy) — smaller CLI-wrapping experiments.
 
 ---
 
@@ -887,6 +899,47 @@ We maintain two in-memory caches on the proxy:
 **Current behavior:** every fresh `/v1/messages` request starts with empty `conversationState`. Cursor rebuilds its blob store from `setBlobArgs` (system prompt, etc.) and the client re-supplies the message history in the prompt anyway. The `conversationStates` Map is preserved as scaffolding for a future architecture where we share an H2 client across requests, but it's not currently populated.
 
 Bridge cache expires after 30 minutes of inactivity. Bridges with pending tool calls are kept alive for the client's continuation POST.
+
+---
+
+## Cross-referencing with other Cursor RE projects
+
+Survey of three external reverse-engineering efforts produced a small set of optimizations that bring real value (most of what they document, we already do correctly — and in a few cases, more correctly than they do).
+
+Repos consulted:
+- [`JJDTrump/cursor-reverse-engineering`](https://github.com/JJDTrump/cursor-reverse-engineering) — single-README deep dive on Cursor IDE v3.2.11 (gRPC service list, headers, ModelDetails). Several claims stale vs. current `agent.v1.AgentService`; the documented "HMAC" checksum is plausibly wrong. Our XOR-feedback `generateChecksum()` (`src/cursor-client.js:11`) matches what every working open-source proxy uses.
+- [`anyrobert/cursor-api-proxy`](https://github.com/anyrobert/cursor-api-proxy) — most polished CLI-wrapper proxy. Different architecture (wraps the local `cursor-agent` binary; we hit the backend directly), so half their tricks (`cli-config.json` writes, `CURSOR_CONFIG_DIRS`) don't apply. Their `account-pool.ts` health-aware token rotation is the standout idea that does port.
+- [`JiuZ-Chn/Cursor-To-OpenAI`](https://github.com/JiuZ-Chn/Cursor-To-OpenAI) (164 ⭐) — closest peer (backend-direct). Slightly fuller header set; documents a PKCE login flow we don't currently support.
+- [`unkn0wncode/extract-cursor-protos`](https://github.com/unkn0wncode/extract-cursor-protos) — pulls the full `aiserver.v1` + `agent.v1` proto registry (~23k lines, ~64 services, ~792 RPCs) straight from Cursor's bundle. Useful for spotting services we don't surface (e.g. `AuthService.CheckSessionToken`); we keep our hand-curated subset to avoid dragging in the whole file.
+
+What we already do that they document (no change needed):
+- `x-cursor-checksum` algorithm (XOR-feedback ladder, base64'd 6-byte timestamp + machineId/macMachineId).
+- `mcp_` prefix workaround on tool names; KV blob ACK; synthesized `stop_reason=tool_use`.
+- Per-stream `x-session-id` UUID (the load-bearing one for concurrent sessions).
+- `x-ghost-mode`, client-type/os/arch fingerprint headers.
+- Real input/output token counts parsed from `tokenDelta` / `conversationCheckpointUpdate` (anyrobert's README admits theirs is `chars/4` heuristic — don't regress to that).
+- Telemetry silence (no Sentry, no `metrics.cursor.sh`). Sending those would actively expose abuse signals.
+
+Optimizations we adopted from this round:
+
+1. **Health-aware `TokenPool`** (ported from anyrobert's `account-pool.ts`). Replaces the old naive round-robin (server.js had a single `roundRobinIndex` global). Each token now carries `{activeRequests, lastUsed, rateLimitUntil, totalRequests, totalErrors, totalRateLimits}`; `pick()` filters out parked tokens, sorts the survivors by least-busy + LRU, and falls through to the fastest-recovering one if every token is parked. `release()` is idempotent (each pick returns a fresh ticket with a `_released` flag) so a `try/finally` plus an `res.on('close')` backstop double-cover the request lifecycle without double-decrementing. 429 detection is heuristic-based (status 429, `RESOURCE_EXHAUSTED`, regex match on the error string) and parks for 60 s by default (`TOKEN_RATE_LIMIT_PARK_MS`). The fresh-turn path in `/v1/messages` defers `pick()` until after the bridge-cache miss check so we don't burn a ticket on a continuation that ends up reusing the existing H2 stream. `/health` now exposes `tokenPool.stats()` with redacted token suffixes (last 6 chars only). Single-token deployments are unaffected — same one token gets picked every call, only with health-aware parking on 429s.
+
+2. **Anthropic-aliased `/v1/models`**. Previously we emitted only Cursor-internal IDs (`claude-opus-4-7-thinking-max` etc.); Claude Code wants Anthropic-shaped IDs in its model picker. New `buildModelsResponseWithAnthropicAliases()` in `src/anthropic-converter.js` walks `config.anthropicModelMapping`, and for each Anthropic key whose Cursor target is in the live model list it emits an extra entry with `owned_by: 'anthropic-via-cursor'` and `root: <cursor_id>`. Cursor IDs are still emitted unchanged (so existing OpenAI-style clients are not affected). Aliases for non-live Cursor targets are silently dropped.
+
+3. **Dated-variant fallback in `mapAnthropicModel`**. Anthropic ships ID variants with date suffixes (`claude-opus-4-7-20250507`); we hand-list the ones we know in `config.anthropicModelMapping`. Future-dated variants (e.g. `claude-opus-4-7-20990101`) would have fallen through to pass-through and 404'd at Cursor. Now `mapAnthropicModel` strips a trailing `-YYYYMMDD` and retries the lookup against the bare key, so a future date suffix on a known family resolves correctly without a config change. Unknown families still pass through.
+
+4. **IDE-fingerprint headers**: added `x-cursor-client-os-version` (defaults to `os.release()`) and `x-cursor-commit` (defaults to v3.2.11's published distro hash, `d5c0e77a02...`) to `buildHeaders()` in `src/cursor-agent.js`. Both env-overridable (`CURSOR_CLIENT_OS_VERSION`, `CURSOR_COMMIT`). Marginal but real: matches the IDE's wire shape more closely.
+
+5. **`CURSOR_API_BASE_URL` env override**. The IDE itself reads this; we now do too. Useful for staging endpoints, regional steering, or testing against a packet-capture proxy.
+
+What we explicitly chose **not** to copy:
+- Telemetry / Sentry / metrics submission — would actively expose us as a non-IDE client.
+- `cli-config.json` Max Mode side-channel — CLI-only; on our backend-direct path Max Mode is encoded in `ModelDetails.max_mode` already.
+- `CURSOR_CONFIG_DIRS` multi-account scheme — CLI-only; our `tokens[]` array already handles multi-account.
+- gzip request bodies — most of our requests are small; gzip + Connect framing adds bookkeeping for negligible bandwidth gain.
+- Stream-json double-emit dedup — CLI-specific; our backend doesn't double-emit.
+- ACP JSON-RPC stdio dance — not relevant.
+- PKCE login tool — useful but separate feature; deferred.
 
 ---
 

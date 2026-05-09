@@ -170,7 +170,11 @@ for chunk in resp:
 | `TOKEN_FILE` | `./token.json` | Token 文件路径 |
 | `DEFAULT_MODEL` | `claude-4.5-sonnet` | 默认 Cursor 模型 |
 | `CURSOR_CLIENT_VERSION` | `2.6.20` | Cursor 客户端版本号 |
+| `CURSOR_API_BASE_URL` | `https://api2.cursor.sh` | Cursor 后端地址（与官方 IDE 同名 env） |
+| `CURSOR_CLIENT_OS_VERSION` | `os.release()` | 上送的客户端 OS 版本（指纹用） |
+| `CURSOR_COMMIT` | _(默认 v3.2.11 hash)_ | 上送的客户端 commit hash（指纹用） |
 | `REQUEST_TIMEOUT` | `120000` | 请求超时 (ms) |
+| `TOKEN_RATE_LIMIT_PARK_MS` | `60000` | Token 命中 429 后冷却时长 (ms) |
 | `DEBUG_LOG` | _(空=关)_ | `1` 写错误日志到 `logs/`；`verbose` 也记录请求体 |
 | `DEBUG_LOG_DIR` | `./logs` | 日志目录覆盖 |
 | `TOOL_INCLUDE` | _(空)_ | Anthropic 工具白名单（按工具名） |
@@ -206,7 +210,17 @@ for chunk in resp:
 4. 自动回复 `execServerMessage` (headless 模式)
 5. 实时解析 `interactionUpdate` 流并转为 OpenAI SSE 格式
 
-详细逆向文档见 [Cursor IDE API 逆向工程文档](Cursor%20IDE%20API%20逆向工程文档.md)
+详细逆向文档见 [Cursor IDE API 逆向工程文档](Cursor%20IDE%20API%20逆向工程文档.md)；近期开发笔记见 [DEVLOG.md](DEVLOG.md)。
+
+## 🔗 相关项目 / Related Projects
+
+本项目交叉参考了下列 Cursor 逆向研究（详见 [DEVLOG.md](DEVLOG.md) 的 "Cross-referencing with other Cursor RE projects" 章节）：
+
+- [`JJDTrump/cursor-reverse-engineering`](https://github.com/JJDTrump/cursor-reverse-engineering) — Cursor IDE 深度逆向分析（gRPC services, headers, ModelDetails）。
+- [`anyrobert/cursor-api-proxy`](https://github.com/anyrobert/cursor-api-proxy) — `cursor-agent` CLI → OpenAI 兼容代理；本项目的 health-aware TokenPool 设计参考自其 `account-pool.ts`。
+- [`JiuZ-Chn/Cursor-To-OpenAI`](https://github.com/JiuZ-Chn/Cursor-To-OpenAI) — 后端直连代理（与本项目同路线），dated-variant 回退正则参考自该项目。
+- [`unkn0wncode/extract-cursor-protos`](https://github.com/unkn0wncode/extract-cursor-protos) — 直接从 Cursor bundle 抽取完整 protobuf registry，用于核对 wire format。
+- [`ephraimduncan/opencode-cursor`](https://github.com/ephraimduncan/opencode-cursor)、[`burpheart/cursor-tap`](https://github.com/burpheart/cursor-tap) — 早期参考实现与抓包分析（proto 定义来源）。
 
 ## 📄 License
 
