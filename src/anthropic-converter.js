@@ -49,32 +49,130 @@ function anthropicMessagesToPrompt(messages, system) {
     if (m && (m.role || 'user') === 'user') { lastUserIdx = i; break; }
   }
 
-  // Build a lookup: tool_use_id → { tool_name, input } from prior assistant
-  // tool_use blocks. Used to enrich tool_result echoes with the file content
-  // we authored, so the model doesn't have to scan back through history to
-  // remember what it wrote. Without this, the most common circling pattern
-  // is "model writes file → re-reads file 5 turns later because content is
-  // too far back in attention to recall cheaply." Toggle off via env if it
-  // bloats the prompt unacceptably (large files written multiple times).
+  // ───────────────────────────────────────────────────────────────────
+  // File-state echo: simulate Write/Edit/MultiEdit/Read effects forward
+  // through the message history, then attach each file's CURRENT content
+  // to the tool_result that was its most recent touch. The model gets
+  // exactly one cheap-to-attend recent location per file holding the
+  // believed current state. Without this, on long sessions the model
+  // re-reads files it just wrote/edited because its own tool_use args
+  // (the actual content) are buried far back in attention.
+  //
+  // Earlier touches of the same file get a brief diff/note instead of
+  // the full content, so we don't bloat the prompt with N copies of
+  // every file.
+  //
+  // Env knobs:
+  //   ECHO_WRITE_CONTENT=0          — disable entirely (default: on)
+  //   ECHO_WRITE_CONTENT_MAX_BYTES  — per-file cap (default: 8192)
+  // ───────────────────────────────────────────────────────────────────
   const echoWriteContent = (process.env.ECHO_WRITE_CONTENT || '1') !== '0';
   const echoMaxBytes = (() => {
     const raw = process.env.ECHO_WRITE_CONTENT_MAX_BYTES;
-    if (raw == null || raw === '') return 8192; // ~8KB per file
+    if (raw == null || raw === '') return 8192;
     const n = parseInt(raw, 10);
     return Number.isFinite(n) && n >= 0 ? n : 8192;
   })();
-  const toolUseInputById = new Map();
+
+  // toolUseId → { name, input, file_path?, contentAfter? }
+  const toolUseInfoById = new Map();
+  // file_path → tool_use_id of the LAST tool_result that touched it (so
+  // we know which tool_result gets the full-state echo)
+  const lastTouchByFile = new Map();
+  // tool_use_id → string content of file AFTER this op (post-state).
+  // Used for Write/Edit/MultiEdit. Read is special — content comes from
+  // the tool_result, not the input — so we resolve it during the user-
+  // message walk below.
+  const fileStateAfterTool = new Map();
+
   if (echoWriteContent) {
+    // Pre-pass 1: index every tool_use by id, and walk forward simulating
+    // file ops to compute the post-state content per tool. This requires
+    // both assistant tool_use blocks AND user tool_result blocks for Read
+    // (since Read's content is in the result, not the input).
+    const fileStateNow = new Map(); // file_path → believed current content
+
     for (const m of messages) {
-      if (!m || (m.role || 'user') !== 'assistant') continue;
-      if (!Array.isArray(m.content)) continue;
-      for (const b of m.content) {
-        if (b && b.type === 'tool_use' && b.id) {
-          toolUseInputById.set(b.id, { name: b.name || '', input: b.input || {} });
+      if (!m) continue;
+      const role = m.role || 'user';
+      if (role === 'assistant' && Array.isArray(m.content)) {
+        for (const b of m.content) {
+          if (!b || b.type !== 'tool_use' || !b.id) continue;
+          const name = b.name || '';
+          const input = b.input || {};
+          const filePath = input.file_path || input.path || '';
+          const info = { name, input, file_path: filePath };
+          toolUseInfoById.set(b.id, info);
+
+          if ((name === 'Write' || name === 'mcp_Write') && filePath) {
+            const c = typeof input.content === 'string' ? input.content : '';
+            fileStateNow.set(filePath, c);
+            fileStateAfterTool.set(b.id, c);
+            lastTouchByFile.set(filePath, b.id);
+          } else if ((name === 'Edit' || name === 'mcp_Edit') && filePath) {
+            const cur = fileStateNow.get(filePath);
+            const oldS = input.old_string;
+            const newS = input.new_string;
+            if (typeof cur === 'string' && typeof oldS === 'string' && typeof newS === 'string') {
+              let next;
+              if (input.replace_all) {
+                next = cur.split(oldS).join(newS);
+              } else {
+                const idx = cur.indexOf(oldS);
+                next = idx >= 0 ? cur.slice(0, idx) + newS + cur.slice(idx + oldS.length) : cur;
+              }
+              fileStateNow.set(filePath, next);
+              fileStateAfterTool.set(b.id, next);
+            } else if (typeof cur === 'string') {
+              // Couldn't apply (missing strings); preserve prior state
+              fileStateAfterTool.set(b.id, cur);
+            }
+            lastTouchByFile.set(filePath, b.id);
+          } else if ((name === 'MultiEdit' || name === 'mcp_MultiEdit') && filePath) {
+            let cur = fileStateNow.get(filePath);
+            if (typeof cur === 'string' && Array.isArray(input.edits)) {
+              for (const e of input.edits) {
+                if (!e || typeof e.old_string !== 'string' || typeof e.new_string !== 'string') continue;
+                if (e.replace_all) {
+                  cur = cur.split(e.old_string).join(e.new_string);
+                } else {
+                  const idx = cur.indexOf(e.old_string);
+                  if (idx >= 0) cur = cur.slice(0, idx) + e.new_string + cur.slice(idx + e.old_string.length);
+                }
+              }
+              fileStateNow.set(filePath, cur);
+              fileStateAfterTool.set(b.id, cur);
+            }
+            lastTouchByFile.set(filePath, b.id);
+          } else if ((name === 'Read' || name === 'mcp_Read') && filePath) {
+            // Defer to user-message pass (Read's content lives in the result)
+            // We still mark the last touch — the result will populate state.
+            lastTouchByFile.set(filePath, b.id);
+          }
+        }
+      } else if (role === 'user' && Array.isArray(m.content)) {
+        for (const b of m.content) {
+          if (!b || b.type !== 'tool_result' || !b.tool_use_id) continue;
+          const info = toolUseInfoById.get(b.tool_use_id);
+          if (!info) continue;
+          if ((info.name === 'Read' || info.name === 'mcp_Read') && info.file_path) {
+            // Snapshot content from the result, stripped of any line-number
+            // prefixes claude-code's Read tool injects ("  123→content").
+            let raw = '';
+            if (typeof b.content === 'string') raw = b.content;
+            else if (Array.isArray(b.content)) {
+              raw = b.content.filter(c => c?.type === 'text').map(c => c.text).join('\n');
+            }
+            const stripped = raw.replace(/^\s*\d+→/gm, '').replace(/^\s*\d+→/gm, '');
+            fileStateNow.set(info.file_path, stripped);
+            fileStateAfterTool.set(b.tool_use_id, stripped);
+          }
         }
       }
     }
   }
+  // Backwards-compat alias used by existing code paths below
+  const toolUseInputById = toolUseInfoById;
 
   // 处理 messages
   for (let i = 0; i < messages.length; i++) {
@@ -118,36 +216,58 @@ function anthropicMessagesToPrompt(messages, system) {
               .map(c => c.text)
               .join('\n');
           }
-          // Echo the file content the model wrote (Write/Edit) into the
-          // tool_result so the model has it in recent attention. Without
-          // this, "what's in the file I wrote?" forces the model to scan
-          // back to its own original tool_use args — expensive on long
-          // histories, leading to the redundant-Read circling pattern.
+          // ──────────── FILE-STATE ECHO ─────────────────────────────
+          // For tool_results referring to file-touching tools (Write,
+          // Edit, MultiEdit, Read), attach a recent-attention copy of
+          // the file's current believed state at the LATEST touch in
+          // the conversation. Earlier touches get a brief diff/note.
+          // The aim: model finds each file's current state in ONE
+          // recent location, no need to re-read.
+          // ──────────────────────────────────────────────────────────
           let echoSuffix = '';
           if (echoWriteContent && b.tool_use_id) {
-            const orig = toolUseInputById.get(b.tool_use_id);
-            if (orig && (orig.name === 'Write' || orig.name === 'mcp_Write')) {
-              const fp = orig.input?.file_path || '';
-              const c = orig.input?.content;
-              if (typeof c === 'string' && c.length > 0) {
+            const info = toolUseInfoById.get(b.tool_use_id);
+            if (info && info.file_path) {
+              const isLatestForThisFile = lastTouchByFile.get(info.file_path) === b.tool_use_id;
+              const fp = info.file_path;
+              const isWrite = info.name === 'Write' || info.name === 'mcp_Write';
+              const isEdit = info.name === 'Edit' || info.name === 'mcp_Edit';
+              const isMultiEdit = info.name === 'MultiEdit' || info.name === 'mcp_MultiEdit';
+              const isRead = info.name === 'Read' || info.name === 'mcp_Read';
+
+              if (isLatestForThisFile && (isWrite || isEdit || isMultiEdit)) {
+                // Echo full current state at the latest write-side touch.
+                // Read tool_results already contain content — no echo needed.
+                const cur = fileStateAfterTool.get(b.tool_use_id);
+                if (typeof cur === 'string' && cur.length > 0) {
+                  const truncated = cur.length > echoMaxBytes
+                    ? cur.slice(0, echoMaxBytes) + `\n... [truncated; full file is ${cur.length} bytes]`
+                    : cur;
+                  echoSuffix =
+                    `\n\n[Current believed content of ${fp} (after this op) — use this directly, do NOT re-read the file:\n` +
+                    '```\n' + truncated + '\n```]';
+                }
+              } else if (!isLatestForThisFile && (isWrite || isEdit || isMultiEdit)) {
+                // Earlier touch on a file that gets overwritten later.
+                // Skip the bulky echo — the latest touch will carry the
+                // authoritative state. Just leave a breadcrumb so the
+                // model knows there's a more recent version downstream.
+                echoSuffix = `\n\n[Note: ${fp} was modified again later; refer to the most recent tool_result for that file for current state.]`;
+              } else if (isWrite && info.input?.content) {
+                // Fallback for Write whose state we couldn't compute.
+                const c = info.input.content;
                 const truncated = c.length > echoMaxBytes
                   ? c.slice(0, echoMaxBytes) + `\n... [truncated; full file is ${c.length} bytes]`
                   : c;
                 echoSuffix =
-                  `\n\n[You wrote this content to ${fp} — refer to it directly rather than re-reading the file:\n` +
+                  `\n\n[You wrote this content to ${fp}:\n` +
                   '```\n' + truncated + '\n```]';
-              }
-            } else if (orig && (orig.name === 'Edit' || orig.name === 'mcp_Edit')) {
-              // For Edit, echo the change intent (old → new) so the model
-              // knows the edited region without re-reading.
-              const fp = orig.input?.file_path || '';
-              const oldS = orig.input?.old_string;
-              const newS = orig.input?.new_string;
-              if (typeof oldS === 'string' && typeof newS === 'string') {
-                const trim = (s) => (s.length > 1024 ? s.slice(0, 1024) + '…' : s);
+              } else if (isEdit && typeof info.input?.old_string === 'string' && typeof info.input?.new_string === 'string') {
+                // Fallback for Edit when state-tracking failed.
+                const trim = (s) => (s.length > 512 ? s.slice(0, 512) + '…' : s);
                 echoSuffix =
                   `\n\n[You edited ${fp}: replaced\n` +
-                  '```\n' + trim(oldS) + '\n```\n→\n```\n' + trim(newS) + '\n```]';
+                  '```\n' + trim(info.input.old_string) + '\n```\n→\n```\n' + trim(info.input.new_string) + '\n```]';
               }
             }
           }
