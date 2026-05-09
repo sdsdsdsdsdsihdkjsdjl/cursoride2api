@@ -1406,7 +1406,14 @@ function startConversation(token, options = {}) {
       if (idle > STALL_TIMEOUT_MS) {
         try { clearInterval(watchdog); } catch { /* ignore */ }
         watchdog = null;
-        fail(`Upstream stalled — no progress for ${Math.round(idle / 1000)}s`);
+        const msg = `Upstream stalled — no progress for ${Math.round(idle / 1000)}s`;
+        // Route stalls through failOrRetry so an early stall (before any
+        // content was emitted to the client) gets the same retry-on-
+        // fresh-slot treatment as REFUSED_STREAM. Once content has been
+        // emitted, failOrRetry's hasEmittedContent guard turns this into
+        // a plain fail anyway — same outcome, but no missed retry on
+        // the empty-stream case.
+        failOrRetry(proto, `NGHTTP2_INTERNAL_ERROR (${msg})`, 'ERR_HTTP2_STALL');
       }
     }, Math.min(15000, Math.floor(STALL_TIMEOUT_MS / 4)));
   }
