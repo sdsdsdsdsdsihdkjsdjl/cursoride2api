@@ -906,16 +906,25 @@ function buildContentBlockStop(index) {
 /**
  * message_delta 事件
  */
-function buildMessageDelta(stopReason, outputTokens) {
+function buildMessageDelta(stopReason, outputTokens, inputTokens) {
+  // Per Anthropic SSE spec, message_delta.usage is the FINAL cumulative
+  // usage for the response (not an incremental delta). claude-code's
+  // /context tracker reads input_tokens from here for streaming
+  // responses — without it, the counter is stuck at message_start's
+  // initial input_tokens=0 (we don't know the count at start time).
+  // omitting input_tokens entirely is also valid per spec, but emitting
+  // 0 zeroes out the tracker; only include it when we actually know it.
+  const usage = { output_tokens: outputTokens || 0 };
+  if (typeof inputTokens === 'number' && inputTokens > 0) {
+    usage.input_tokens = inputTokens;
+  }
   return formatSSE('message_delta', {
     type: 'message_delta',
     delta: {
       stop_reason: stopReason || 'end_turn',
       stop_sequence: null,
     },
-    usage: {
-      output_tokens: outputTokens || 0,
-    },
+    usage,
   });
 }
 

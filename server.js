@@ -361,7 +361,14 @@ function buildTurnCallbacks(ctx) {
 
     if (isStream) {
       if (!res.writableEnded) {
-        res.write(anthropicConverter.buildMessageDelta('tool_use', 0));
+        // Read latest known token counts from the bridge — checkpoint
+        // updates may have populated input_tokens before the early
+        // finalize fires. Better to emit the real number when we have
+        // it than to leave claude-code's /context counter at 0.
+        const stats = (bridge && typeof bridge.getStats === 'function') ? bridge.getStats() : null;
+        const inTok = stats ? stats.inputTokens : 0;
+        const outTok = stats ? stats.outputTokens : 0;
+        res.write(anthropicConverter.buildMessageDelta('tool_use', outTok || 0, inTok || 0));
         res.write(anthropicConverter.buildMessageStop());
         res.end();
       }
@@ -611,7 +618,7 @@ function buildTurnCallbacks(ctx) {
 
       if (isStream) {
         if (!res.writableEnded) {
-          res.write(anthropicConverter.buildMessageDelta(stopReason, outputTokens || 0));
+          res.write(anthropicConverter.buildMessageDelta(stopReason, outputTokens || 0, inputTokens || 0));
           res.write(anthropicConverter.buildMessageStop());
           res.end();
         }

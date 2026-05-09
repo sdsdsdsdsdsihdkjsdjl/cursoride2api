@@ -1527,6 +1527,12 @@ function startConversation(token, options = {}) {
     sendToolResult,
     setCallbacks,
     close,
+    // Latest known token counts. server.js's finalizeToolUseTurn fires
+    // before onTurnEnded, but conversationCheckpointUpdate frames may have
+    // already landed and populated these — exposing them lets the caller
+    // emit accurate input_tokens in the streaming message_delta even on
+    // the early-finalize path used for tool_use turns.
+    getStats: () => ({ inputTokens, outputTokens }),
   };
 }
 
