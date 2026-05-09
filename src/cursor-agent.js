@@ -815,9 +815,13 @@ function startConversation(token, options = {}) {
   let watchdog = null;
   const STALL_TIMEOUT_MS = (() => {
     const raw = process.env.CURSOR_STALL_TIMEOUT_MS;
-    if (raw == null || raw === '') return 90000; // 90s default — covers thinking-mode latency
+    // 60s default — observed thinking-mode max-effort turns kept frame
+    // gaps well under that, so 60s preserves headroom while shaving
+    // ~30s off every stall-detect cycle. Bump via env if real Cursor
+    // backends introduce longer natural pauses.
+    if (raw == null || raw === '') return 60000;
     const n = parseInt(raw, 10);
-    return Number.isFinite(n) && n > 0 ? n : 90000;
+    return Number.isFinite(n) && n > 0 ? n : 60000;
   })();
   function dumpStreamSummary(reason, code) {
     if (streamSummaryEmitted) return;
