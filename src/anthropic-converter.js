@@ -49,6 +49,33 @@ function anthropicMessagesToPrompt(messages, system) {
     if (m && (m.role || 'user') === 'user') { lastUserIdx = i; break; }
   }
 
+  // Build a lookup: tool_use_id → { tool_name, input } from prior assistant
+  // tool_use blocks. Used to enrich tool_result echoes with the file content
+  // we authored, so the model doesn't have to scan back through history to
+  // remember what it wrote. Without this, the most common circling pattern
+  // is "model writes file → re-reads file 5 turns later because content is
+  // too far back in attention to recall cheaply." Toggle off via env if it
+  // bloats the prompt unacceptably (large files written multiple times).
+  const echoWriteContent = (process.env.ECHO_WRITE_CONTENT || '1') !== '0';
+  const echoMaxBytes = (() => {
+    const raw = process.env.ECHO_WRITE_CONTENT_MAX_BYTES;
+    if (raw == null || raw === '') return 8192; // ~8KB per file
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 0 ? n : 8192;
+  })();
+  const toolUseInputById = new Map();
+  if (echoWriteContent) {
+    for (const m of messages) {
+      if (!m || (m.role || 'user') !== 'assistant') continue;
+      if (!Array.isArray(m.content)) continue;
+      for (const b of m.content) {
+        if (b && b.type === 'tool_use' && b.id) {
+          toolUseInputById.set(b.id, { name: b.name || '', input: b.input || {} });
+        }
+      }
+    }
+  }
+
   // 处理 messages
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -91,7 +118,40 @@ function anthropicMessagesToPrompt(messages, system) {
               .map(c => c.text)
               .join('\n');
           }
-          segments.push(`[Tool result for ${b.tool_use_id || ''}]:\n${resultText}`);
+          // Echo the file content the model wrote (Write/Edit) into the
+          // tool_result so the model has it in recent attention. Without
+          // this, "what's in the file I wrote?" forces the model to scan
+          // back to its own original tool_use args — expensive on long
+          // histories, leading to the redundant-Read circling pattern.
+          let echoSuffix = '';
+          if (echoWriteContent && b.tool_use_id) {
+            const orig = toolUseInputById.get(b.tool_use_id);
+            if (orig && (orig.name === 'Write' || orig.name === 'mcp_Write')) {
+              const fp = orig.input?.file_path || '';
+              const c = orig.input?.content;
+              if (typeof c === 'string' && c.length > 0) {
+                const truncated = c.length > echoMaxBytes
+                  ? c.slice(0, echoMaxBytes) + `\n... [truncated; full file is ${c.length} bytes]`
+                  : c;
+                echoSuffix =
+                  `\n\n[You wrote this content to ${fp} — refer to it directly rather than re-reading the file:\n` +
+                  '```\n' + truncated + '\n```]';
+              }
+            } else if (orig && (orig.name === 'Edit' || orig.name === 'mcp_Edit')) {
+              // For Edit, echo the change intent (old → new) so the model
+              // knows the edited region without re-reading.
+              const fp = orig.input?.file_path || '';
+              const oldS = orig.input?.old_string;
+              const newS = orig.input?.new_string;
+              if (typeof oldS === 'string' && typeof newS === 'string') {
+                const trim = (s) => (s.length > 1024 ? s.slice(0, 1024) + '…' : s);
+                echoSuffix =
+                  `\n\n[You edited ${fp}: replaced\n` +
+                  '```\n' + trim(oldS) + '\n```\n→\n```\n' + trim(newS) + '\n```]';
+              }
+            }
+          }
+          segments.push(`[Tool result for ${b.tool_use_id || ''}]:\n${resultText}${echoSuffix}`);
         } else if (b.type === 'image') {
           segments.push('[image]');
           if (role === 'user') userHasOriginalContent = true;
