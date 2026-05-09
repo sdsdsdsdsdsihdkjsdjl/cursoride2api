@@ -786,6 +786,19 @@ function startConversation(token, options = {}) {
   let streamBytesOut = 0;            // bytes written via sendBinaryFrame
   let streamMcpCallCount = 0;        // count of mcpArgs received from Cursor
   let streamSummaryEmitted = false;  // dedupe — we may pass through multiple error paths
+  // Last time we saw a *meaningful* frame from Cursor — text/thinking/tool/
+  // step/checkpoint, NOT heartbeats. The watchdog uses this to detect a
+  // stalled stream where Cursor keeps the H2 channel alive (heartbeats reset
+  // req.setTimeout) but isn't actually advancing the turn. Without this we
+  // saw 17-minute hangs after the model went silent post-thinking.
+  let lastUsefulFrameAt = 0;
+  let watchdog = null;
+  const STALL_TIMEOUT_MS = (() => {
+    const raw = process.env.CURSOR_STALL_TIMEOUT_MS;
+    if (raw == null || raw === '') return 90000; // 90s default — covers thinking-mode latency
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : 90000;
+  })();
   function dumpStreamSummary(reason, code) {
     if (streamSummaryEmitted) return;
     streamSummaryEmitted = true;
@@ -819,6 +832,7 @@ function startConversation(token, options = {}) {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
+    if (watchdog) { try { clearInterval(watchdog); } catch { /* ignore */ } watchdog = null; }
     try { if (req) req.end(); } catch { /* ignore */ }
     setTimeout(() => {
       try { if (req) req.close(); } catch { /* ignore */ }
@@ -859,6 +873,12 @@ function startConversation(token, options = {}) {
   //   - any other value                                 → JSON-stringified text
   function sendToolResult(id, execId, content) {
     if (closed) return;
+    // A new turn is starting — re-arm the stall watchdog. It was paused
+    // when turnEndedFired flipped on at the previous turn's end; clearing
+    // the flag and refreshing the timestamp gives the new turn a full
+    // STALL_TIMEOUT_MS to make progress before we trip.
+    turnEndedFired = false;
+    lastUsefulFrameAt = Date.now();
     const { create, toBinary, agent } = _requireProto();
 
     // Build the content[] array of MCP items
@@ -935,6 +955,7 @@ function startConversation(token, options = {}) {
     const msgCase = msg.message?.case;
 
     if (msgCase === 'execServerMessage') {
+      lastUsefulFrameAt = Date.now();
       const exec = msg.message.value;
       const mcpToolDefs = state.mcpToolDefs;
       handleExecMessage(exec, mcpToolDefs, sendBinaryFrame, (info) => {
@@ -947,6 +968,7 @@ function startConversation(token, options = {}) {
       return;
     }
     if (msgCase === 'kvServerMessage') {
+      lastUsefulFrameAt = Date.now();
       handleKvMessage(msg.message.value, blobStore, sendBinaryFrame);
       return;
     }
@@ -955,7 +977,12 @@ function startConversation(token, options = {}) {
       const iuCase = iu.message?.case;
       const iuVal = iu.message?.value;
 
+      // Heartbeats deliberately do NOT reset lastUsefulFrameAt — they are
+      // exactly what the watchdog has to ignore. Everything else is
+      // forward progress, including stepStarted/Completed which are tiny
+      // but indicate the model is actively working.
       if (iuCase === 'heartbeat') return;
+      lastUsefulFrameAt = Date.now();
       if (iuCase === 'textDelta') {
         const t = iuVal?.text || '';
         if (t) { hasEmittedContent = true; currentCallbacks.onTextDelta(t); }
@@ -1002,6 +1029,7 @@ function startConversation(token, options = {}) {
       return;
     }
     if (msgCase === 'conversationCheckpointUpdate') {
+      lastUsefulFrameAt = Date.now();
       const stateStruct = msg.message.value;
       if (stateStruct?.tokenDetails) {
         // totalTokens (used) tracks input+output combined; we keep
@@ -1020,10 +1048,16 @@ function startConversation(token, options = {}) {
       return;
     }
     if (msgCase === 'interactionQuery') {
+      lastUsefulFrameAt = Date.now();
       handleInteractionQuery(msg.message.value, sendBinaryFrame);
       return;
     }
-    if (msgCase === 'execServerControlMessage') return;
+    if (msgCase === 'execServerControlMessage') {
+      // Server-side control message — counts as forward progress so the
+      // watchdog doesn't trip on a stream that's actively orchestrating.
+      lastUsefulFrameAt = Date.now();
+      return;
+    }
 
     if (process.env.CURSOR_AGENT_DEBUG) {
       console.log(`[cursor-agent][debug] unhandled server case=${msgCase}`);
@@ -1285,6 +1319,7 @@ function startConversation(token, options = {}) {
       // and mark closed so we don't double-handle.
       if (turnEndedFired) {
         clearInterval(heartbeat);
+        if (watchdog) { try { clearInterval(watchdog); } catch { /* ignore */ } watchdog = null; }
         closed = true;
         return;
       }
@@ -1297,6 +1332,25 @@ function startConversation(token, options = {}) {
     req.on('error', (e) => failOrRetry(proto, e.message || 'Stream error', e.code));
     req.on('timeout', () => fail('Request timeout'));
 
+    // ── Connection-level death propagation ──
+    // The pool catches goaway/close at the slot level (drops the slot for
+    // future requests), but our in-flight stream sometimes never fires
+    // 'error' or 'end' when its underlying TCP connection drains. Without
+    // this, a GOAWAY-induced silent stall can run for tens of minutes
+    // until the wallclock watchdog (below) trips. Attach short-lived
+    // listeners that route through failOrRetry — REFUSED_STREAM-shaped so
+    // the existing retry path triggers if no content has been emitted yet.
+    const onClientGoaway = () => {
+      if (closed || turnEndedFired) return;
+      failOrRetry(proto, 'NGHTTP2_REFUSED_STREAM (client goaway)', 'ERR_HTTP2_GOAWAY');
+    };
+    const onClientClose = () => {
+      if (closed || turnEndedFired) return;
+      failOrRetry(proto, 'NGHTTP2_REFUSED_STREAM (client closed)', 'ERR_HTTP2_CLOSED');
+    };
+    client.once('goaway', onClientGoaway);
+    client.once('close', onClientClose);
+
     // Heartbeat
     heartbeat = setInterval(() => {
       if (closed) return;
@@ -1306,6 +1360,30 @@ function startConversation(token, options = {}) {
       });
       sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, hb));
     }, config.cursor.heartbeatInterval);
+
+    // ── Stall watchdog ──
+    // The req.setTimeout above resets on EVERY chunk including 9-byte
+    // server heartbeats, so an effectively-dead stream stays "alive"
+    // forever from setTimeout's POV. We need a separate timer keyed on
+    // *meaningful* progress (text/thinking/exec/step/checkpoint —
+    // updated in handleServerMessage) so we can detect the case where
+    // Cursor's backend is heartbeating but no longer advancing.
+    lastUsefulFrameAt = Date.now();
+    if (watchdog) { try { clearInterval(watchdog); } catch { /* ignore */ } }
+    watchdog = setInterval(() => {
+      if (closed) return;
+      // Bridges are reused across continuations: after turnEnded fires, the
+      // stream sits idle until the next sendToolResult. We don't want the
+      // watchdog to trip in that window — it only watches in-flight turns.
+      // sendToolResult resets lastUsefulFrameAt as the new turn's start.
+      if (turnEndedFired) return;
+      const idle = Date.now() - lastUsefulFrameAt;
+      if (idle > STALL_TIMEOUT_MS) {
+        try { clearInterval(watchdog); } catch { /* ignore */ }
+        watchdog = null;
+        fail(`Upstream stalled — no progress for ${Math.round(idle / 1000)}s`);
+      }
+    }, Math.min(15000, Math.floor(STALL_TIMEOUT_MS / 4)));
   }
 
   // Retry-aware error handler. Auto-retries when ALL of:
@@ -1352,6 +1430,10 @@ function startConversation(token, options = {}) {
       if (heartbeat) {
         try { clearInterval(heartbeat); } catch { /* ignore */ }
         heartbeat = null;
+      }
+      if (watchdog) {
+        try { clearInterval(watchdog); } catch { /* ignore */ }
+        watchdog = null;
       }
       // Brief backoff (50ms × attempt) — gives the upstream a moment to
       // free a slot and the new TLS connection time to handshake.
