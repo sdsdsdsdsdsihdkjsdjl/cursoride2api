@@ -528,6 +528,16 @@ function buildTurnCallbacks(ctx) {
           const registered = new Set((mcpTools || []).map(t => t.name).concat((mcpTools || []).map(t => t.toolName)));
           for (const hit of hits) {
             const canonical = anthropicTools.canonicalizeHallucinatedToolName(hit.name, registered);
+            // Normalize known field-name typos (e.g. Write's `contents` →
+            // `content`, Edit's `old`/`new` → `old_string`/`new_string`).
+            // The structural rescuer can't fix bad data on its own; this
+            // saves the most common cases from the "tool ran but failed"
+            // outcome.
+            const normalizedArgs = anthropicTools.normalizeHallucinatedToolArgs(canonical, hit.args || {});
+            const argsJson = (() => {
+              try { return JSON.stringify(normalizedArgs); }
+              catch { return '{}'; }
+            })();
             const synthExecId = '';
             const synthToolCallId = `toolu_synth_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
             const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, synthExecId, synthToolCallId, sessionId);
@@ -537,7 +547,7 @@ function buildTurnCallbacks(ctx) {
               execId: synthExecId,
               toolCallId: synthToolCallId,
               toolName: canonical,
-              args: hit.args || {},
+              args: normalizedArgs,
               anthropicToolUseId,
               blockIndex,
               synthetic: true,
@@ -547,11 +557,18 @@ function buildTurnCallbacks(ctx) {
             // the same response) but lets the tool actually run.
             if (isStream && !res.writableEnded) {
               res.write(anthropicConverter.buildContentBlockStartToolUse(blockIndex, anthropicToolUseId, canonical));
-              try { res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, JSON.stringify(hit.args || {}))); }
-              catch { res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, '{}')); }
+              res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, argsJson));
               res.write(anthropicConverter.buildContentBlockStop(blockIndex));
             }
-            console.log(`  🩹 hallucinated-tool-call rescued: ${hit.name}${canonical !== hit.name ? ' → ' + canonical : ''}`);
+            const normalizedKeys = Object.keys(normalizedArgs);
+            const originalKeys = Object.keys(hit.args || {});
+            const argsRenamed = normalizedKeys.length === originalKeys.length &&
+              normalizedKeys.some(k => !originalKeys.includes(k));
+            console.log(
+              `  🩹 hallucinated-tool-call rescued: ${hit.name}` +
+              (canonical !== hit.name ? ` → ${canonical}` : '') +
+              (argsRenamed ? ` (args normalized: ${originalKeys.join(',')} → ${normalizedKeys.join(',')})` : '')
+            );
           }
         }
       }

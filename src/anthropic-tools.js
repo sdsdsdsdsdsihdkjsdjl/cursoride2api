@@ -530,6 +530,73 @@ function canonicalizeHallucinatedToolName(name, registeredNames) {
   return name;
 }
 
+// Field-name normalizers for known tools where the model reliably
+// hallucinates a typo'd argument key. Applied AFTER the rescuer parses
+// `[Tool call: NAME({...args})]` text and AFTER name canonicalization.
+//
+// Each normalizer mutates and returns the args object. It should be
+// idempotent (running twice has the same effect as once) and only
+// add fields when the canonical key is missing — never overwrite a
+// correct value the model produced.
+//
+// Add new tools as new typo patterns surface. Don't try to be
+// exhaustive; just cover what we observe in the wild.
+const TOOL_ARG_NORMALIZERS = {
+  Write(args) {
+    if (!args || typeof args !== 'object') return args;
+    // Hallucinated `contents` (plural) instead of `content` (singular)
+    if (args.contents != null && args.content == null) {
+      args.content = args.contents;
+      delete args.contents;
+    }
+    // Some hallucinations use `body`/`text`/`data` for the file payload
+    for (const alt of ['body', 'text', 'data', 'file_content']) {
+      if (args[alt] != null && args.content == null) {
+        args.content = args[alt];
+        delete args[alt];
+        break;
+      }
+    }
+    // path → file_path
+    if (args.path != null && args.file_path == null) {
+      args.file_path = args.path;
+      delete args.path;
+    }
+    return args;
+  },
+  Edit(args) {
+    if (!args || typeof args !== 'object') return args;
+    if (args.old != null && args.old_string == null) { args.old_string = args.old; delete args.old; }
+    if (args.new != null && args.new_string == null) { args.new_string = args.new; delete args.new; }
+    if (args.path != null && args.file_path == null) { args.file_path = args.path; delete args.path; }
+    return args;
+  },
+  MultiEdit(args) {
+    if (!args || typeof args !== 'object') return args;
+    if (args.path != null && args.file_path == null) { args.file_path = args.path; delete args.path; }
+    if (Array.isArray(args.edits)) {
+      for (const e of args.edits) {
+        if (!e || typeof e !== 'object') continue;
+        if (e.old != null && e.old_string == null) { e.old_string = e.old; delete e.old; }
+        if (e.new != null && e.new_string == null) { e.new_string = e.new; delete e.new; }
+      }
+    }
+    return args;
+  },
+  Read(args) {
+    if (!args || typeof args !== 'object') return args;
+    if (args.path != null && args.file_path == null) { args.file_path = args.path; delete args.path; }
+    return args;
+  },
+};
+
+function normalizeHallucinatedToolArgs(toolName, args) {
+  const fn = TOOL_ARG_NORMALIZERS[toolName];
+  if (!fn) return args;
+  try { return fn(args) || args; }
+  catch { return args; }
+}
+
 module.exports = {
   anthropicToolsToMcpTools,
   encodeToolUseId, decodeToolUseId,
@@ -539,4 +606,5 @@ module.exports = {
   deterministicConversationId,
   hasToolResults,
   parseHallucinatedToolCalls, canonicalizeHallucinatedToolName,
+  normalizeHallucinatedToolArgs,
 };
