@@ -5,6 +5,105 @@
 const { v4: uuidv4 } = require('uuid');
 
 /**
+ * Parse a Bash command string for common file-write idioms and return
+ * the writes detected. Used by the file-state simulator so the model
+ * gets a recent-attention echo of files written via Bash, just like it
+ * does for the structured Write/Edit tools.
+ *
+ * Handles:
+ *   - Heredoc with redirect:    cat > FILE <<TAG ... TAG
+ *                                cat >> FILE <<'TAG' ... TAG     (append)
+ *                                tee FILE <<TAG ... TAG
+ *                                tee -a FILE <<TAG ... TAG       (append)
+ *   - Echo with redirect:       echo "..." > FILE
+ *                                echo "..." >> FILE              (append)
+ *                                printf "..." > FILE
+ *
+ * Doesn't try to handle every shell idiom — sed -i, awk redirects, command
+ * substitution, etc. Catches the dominant patterns we observe in the wild;
+ * unknown ones just don't get echoed and the model falls back to
+ * re-reading.
+ *
+ * Returns array of { file_path, content, append }.
+ */
+function _extractBashFileWrites(command) {
+  if (typeof command !== 'string' || !command.includes('\n') && !/[<>]/.test(command)) return [];
+  const writes = [];
+  const lines = command.split('\n');
+
+  // Heredoc detection — line that opens with `cat`/`tee` and ends with <<TAG
+  // (TAG can be quoted with ' or " to disable expansion). We accept either
+  // ordering: `cat > FILE <<TAG` or `tee -a FILE <<TAG` or `> FILE cat <<TAG`.
+  const heredocOpen =
+    /^\s*(cat|tee)\b(?:\s+(-a))?\s+(?:>>?\s*)?(\S+)?\s*(?:>>?\s*(\S+))?\s*<<\s*['"]?(\w+)['"]?\s*$/;
+
+  // Echo/printf one-line redirect.
+  const echoRedirect =
+    /^\s*(echo|printf)(?:\s+-[neE]+)?\s+("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s+(>>?)\s+(\S+)\s*$/;
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Try heredoc first (multi-line)
+    const hm = line.match(heredocOpen);
+    if (hm) {
+      const cmd = hm[1];
+      const teeAppend = hm[2] === '-a';
+      // The redirect target may be in capture 3 or 4 depending on the
+      // ordering; the first non-empty wins, with `tee FILE` (no >) also
+      // valid.
+      const filePath = hm[3] || hm[4] || '';
+      const tag = hm[5];
+      // Detect append redirect (>>) — was the redirect operator >>? We
+      // need to re-scan the original line to know.
+      const append = teeAppend || /\s>>\s/.test(line);
+      if (filePath && tag) {
+        // Read content lines until a line equal to the closing tag.
+        const contentLines = [];
+        let j = i + 1;
+        while (j < lines.length && lines[j].trim() !== tag) {
+          contentLines.push(lines[j]);
+          j++;
+        }
+        if (j < lines.length) {
+          // Found closing tag — record the write
+          writes.push({ file_path: filePath, content: contentLines.join('\n'), append });
+          i = j + 1;
+          continue;
+        }
+        // No closing tag found — malformed; bail on this match
+      }
+    }
+
+    // Try echo/printf redirect (single-line)
+    const em = line.match(echoRedirect);
+    if (em) {
+      const tool = em[1];
+      const quoted = em[2];
+      const op = em[3]; // > or >>
+      const filePath = em[4];
+      const append = op === '>>';
+      // Strip outer quote char and unescape \" / \' / \\
+      let payload;
+      if (quoted.startsWith('"')) {
+        payload = quoted.slice(1, -1).replace(/\\(["\\nrtbf])/g, (m, c) => ({ n: '\n', r: '\r', t: '\t', b: '\b', f: '\f' })[c] || c);
+      } else {
+        payload = quoted.slice(1, -1).replace(/\\(['\\])/g, (m, c) => c);
+      }
+      // echo (without -n) appends a newline; printf does not by default.
+      if (tool === 'echo') payload = payload + '\n';
+      writes.push({ file_path: filePath, content: payload, append });
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+  return writes;
+}
+
+/**
  * Anthropic messages → Cursor 单一 prompt
  * 将 Anthropic 格式的 messages + system 拼接为 Cursor 需要的单一文本.
  *
@@ -80,10 +179,14 @@ function anthropicMessagesToPrompt(messages, system) {
   // we know which tool_result gets the full-state echo)
   const lastTouchByFile = new Map();
   // tool_use_id → string content of file AFTER this op (post-state).
-  // Used for Write/Edit/MultiEdit. Read is special — content comes from
-  // the tool_result, not the input — so we resolve it during the user-
-  // message walk below.
+  // Used for Write/Edit/MultiEdit/Read (single file per call).
   const fileStateAfterTool = new Map();
+  // tool_use_id → Map<file_path, content>. Used for Bash, which may
+  // write multiple files in one call (multiple heredocs / redirects).
+  // Keys are file_paths; values are believed contents AFTER the Bash
+  // operation completes. Echo logic treats each file independently
+  // when deciding "is this the latest touch?" and what to emit.
+  const bashFileStates = new Map();
 
   if (echoWriteContent) {
     // Pre-pass 1: index every tool_use by id, and walk forward simulating
@@ -148,6 +251,30 @@ function anthropicMessagesToPrompt(messages, system) {
             // Defer to user-message pass (Read's content lives in the result)
             // We still mark the last touch — the result will populate state.
             lastTouchByFile.set(filePath, b.id);
+          } else if (name === 'Bash' || name === 'mcp_Bash') {
+            // Bash file-write idioms — heredoc + redirect, echo > FILE,
+            // tee > FILE, etc. Parse the command body and update file
+            // state for any writes detected. A single Bash call can
+            // write multiple files (multiple heredocs in one script),
+            // so we maintain a per-file map keyed by the Bash tool_use_id.
+            const cmd = typeof input.command === 'string' ? input.command : '';
+            const writes = _extractBashFileWrites(cmd);
+            if (writes.length > 0) {
+              const perFile = new Map();
+              for (const w of writes) {
+                let next;
+                if (w.append) {
+                  const prior = fileStateNow.get(w.file_path) || '';
+                  next = prior ? prior + (prior.endsWith('\n') ? '' : '\n') + w.content : w.content;
+                } else {
+                  next = w.content;
+                }
+                fileStateNow.set(w.file_path, next);
+                perFile.set(w.file_path, next);
+                lastTouchByFile.set(w.file_path, b.id);
+              }
+              bashFileStates.set(b.id, perFile);
+            }
           }
         }
       } else if (role === 'user' && Array.isArray(m.content)) {
@@ -268,6 +395,32 @@ function anthropicMessagesToPrompt(messages, system) {
                 echoSuffix =
                   `\n\n[You edited ${fp}: replaced\n` +
                   '```\n' + trim(info.input.old_string) + '\n```\n→\n```\n' + trim(info.input.new_string) + '\n```]';
+              }
+            }
+            // Bash with file writes — emit one echo block per file written.
+            // For each, show full content if THIS Bash is the latest touch
+            // for that file, else just a breadcrumb.
+            if (info && (info.name === 'Bash' || info.name === 'mcp_Bash')) {
+              const perFile = bashFileStates.get(b.tool_use_id);
+              if (perFile && perFile.size > 0) {
+                const echoBlocks = [];
+                for (const [fp, cur] of perFile) {
+                  const isLatest = lastTouchByFile.get(fp) === b.tool_use_id;
+                  if (isLatest && typeof cur === 'string' && cur.length > 0) {
+                    const truncated = cur.length > echoMaxBytes
+                      ? cur.slice(0, echoMaxBytes) + `\n... [truncated; full file is ${cur.length} bytes]`
+                      : cur;
+                    echoBlocks.push(
+                      `[Current believed content of ${fp} (after this Bash op wrote it) — use this directly, do NOT re-read the file:\n` +
+                      '```\n' + truncated + '\n```]'
+                    );
+                  } else if (!isLatest) {
+                    echoBlocks.push(`[Note: ${fp} was modified again later; refer to the most recent tool_result for that file for current state.]`);
+                  }
+                }
+                if (echoBlocks.length > 0) {
+                  echoSuffix = (echoSuffix || '') + '\n\n' + echoBlocks.join('\n\n');
+                }
               }
             }
           }
