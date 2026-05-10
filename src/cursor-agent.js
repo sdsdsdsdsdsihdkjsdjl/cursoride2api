@@ -866,6 +866,14 @@ function startConversation(token, options = {}) {
   // get adaptive thresholds. Reset on each retry attempt — only the
   // successful attempt's distribution should feed the threshold model.
   let maxIdleMs = 0;
+  // Per-turn counters for runtime statistics. Reset at the start of each
+  // new turn (initial bridge run + each sendToolResult continuation).
+  // Reported via onTurnEnded / bridge.getStats() so server.js can feed
+  // them to the runtime-stats aggregator.
+  let _turnRetries = 0;
+  let _turnTransportErrors = 0;
+  let _turnStalls = 0;
+  let _turnCascadeDetected = false;
   let watchdog = null;
 
   // Stall thresholds are per-model and adaptive — see src/stall-thresholds.js.
@@ -976,6 +984,12 @@ function startConversation(token, options = {}) {
     turnEndedFired = false;
     lastUsefulFrameAt = Date.now();
     maxIdleMs = 0;
+    // Fresh turn — runtime-stats counters reset so this turn's outcome is
+    // attributed only to its own retries / stalls / cascades.
+    _turnRetries = 0;
+    _turnTransportErrors = 0;
+    _turnStalls = 0;
+    _turnCascadeDetected = false;
     const { create, toBinary, agent } = _requireProto();
 
     // Build the content[] array of MCP items
@@ -1123,6 +1137,10 @@ function startConversation(token, options = {}) {
             inputTokens, outputTokens, conversationState: capturedState,
             maxIdleMs,
             stallThresholdSource: _stallSource,
+            turnRetries: _turnRetries,
+            turnTransportErrors: _turnTransportErrors,
+            turnStalls: _turnStalls,
+            turnCascadeDetected: _turnCascadeDetected,
           });
         } catch (e) {
           console.log(`[cursor-agent] onTurnEnded threw: ${e.message}`);
@@ -1507,6 +1525,7 @@ function startConversation(token, options = {}) {
         // an elevated threshold (multiplicative bump, decays over time).
         // Successful turns reset the elevation back to baseline.
         try { stallThresholds.recordStall(modelId); } catch { /* ignore */ }
+        _turnStalls++;
         const msg = `Upstream stalled — no progress for ${Math.round(idle / 1000)}s`;
         // Route stalls through failOrRetry so an early stall (before any
         // content was emitted to the client) gets the same retry-on-
@@ -1547,6 +1566,7 @@ function startConversation(token, options = {}) {
     dumpStreamSummary(msg, code || 'stream-error');
     if (safeToRetry) {
       retryAttempts++;
+      _turnRetries++;
       console.log(`[cursor-agent] retrying after ${msg} (${retryAttempts}/${MAX_REQUEST_RETRIES}) hasReceivedData=${hasReceivedData}`);
       poisonSharedClient(msg, client);
       // Reset the dedupe flag so the NEXT error on the new stream gets its
@@ -1581,6 +1601,8 @@ function startConversation(token, options = {}) {
       // tight. Double the delay in that case (capped at 8 s).
       const isTransportError = /REFUSED_STREAM|GOAWAY|INTERNAL_ERROR/i.test(msg);
       const inCascade = isTransportError && lastErrorWasTransport;
+      if (isTransportError) _turnTransportErrors++;
+      if (inCascade) _turnCascadeDetected = true;
       const baseBackoffs = [100, 250, 750, 2000, 5000];
       const baseMs = baseBackoffs[Math.min(retryAttempts - 1, baseBackoffs.length - 1)];
       const backoffMs = Math.min(8000, baseMs * (inCascade ? 2 : 1));
@@ -1641,7 +1663,14 @@ function startConversation(token, options = {}) {
     // already landed and populated these — exposing them lets the caller
     // emit accurate input_tokens in the streaming message_delta even on
     // the early-finalize path used for tool_use turns.
-    getStats: () => ({ inputTokens, outputTokens }),
+    getStats: () => ({
+      inputTokens, outputTokens,
+      maxIdleMs,
+      turnRetries: _turnRetries,
+      turnTransportErrors: _turnTransportErrors,
+      turnStalls: _turnStalls,
+      turnCascadeDetected: _turnCascadeDetected,
+    }),
   };
 }
 

@@ -17,6 +17,7 @@ const anthropicTools = require('./src/anthropic-tools');
 const preprocess = require('./src/preprocess');
 const debugLog = require('./src/debug-log');
 const stallThresholds = require('./src/stall-thresholds');
+const runtimeStats = require('./src/runtime-stats');
 debugLog.init();
 
 // Configurable "small model" used for warmup pings, compaction summarization,
@@ -640,7 +641,11 @@ function buildTurnCallbacks(ctx) {
       }
     },
 
-    onTurnEnded: ({ inputTokens, outputTokens, conversationState: newState, maxIdleMs, stallThresholdSource }) => {
+    onTurnEnded: ({
+      inputTokens, outputTokens, conversationState: newState,
+      maxIdleMs, stallThresholdSource,
+      turnRetries, turnTransportErrors, turnStalls, turnCascadeDetected,
+    }) => {
       closeOpenBlock();
 
       // NOTE: we deliberately do NOT cache `newState` to conversationStates
@@ -789,6 +794,21 @@ function buildTurnCallbacks(ctx) {
         (timings ? ` | ${formatTimings(timings)}` : '') +
         maxIdleStr
       );
+      // Feed runtime-stats. Duration = total turn wall time (from t0 to
+      // turnEnded). firstFrame = time to first useful frame.
+      try {
+        runtimeStats.recordTurnEnd({
+          model: cursorModel,
+          outcome: 'success',
+          durationMs: timings ? timings.turnEnded : null,
+          firstFrameMs: timings ? timings.firstFrame : null,
+          maxIdleMs: typeof maxIdleMs === 'number' ? maxIdleMs : null,
+          retries: turnRetries || 0,
+          transportErrors: turnTransportErrors || 0,
+          stalls: turnStalls || 0,
+          cascadeDetected: !!turnCascadeDetected,
+        });
+      } catch (e) { /* never let stats crash a turn */ }
       debugLog.logTurnEnded(
         { request_id: requestId, conv_key: convKey, model_cursor: cursorModel },
         { inputTokens, outputTokens },
@@ -799,6 +819,22 @@ function buildTurnCallbacks(ctx) {
 
     onError: (errMsg) => {
       console.error(`  ❌ ${errMsg}`);
+      // Record the failed turn — pull the in-flight counters off the bridge.
+      try {
+        const bridge = getBridge && getBridge();
+        const bs = bridge && typeof bridge.getStats === 'function' ? bridge.getStats() : {};
+        runtimeStats.recordTurnEnd({
+          model: cursorModel,
+          outcome: 'fail',
+          durationMs: timings && timings.t0 ? Date.now() - timings.t0 : null,
+          firstFrameMs: timings ? timings.firstFrame : null,
+          maxIdleMs: typeof bs.maxIdleMs === 'number' ? bs.maxIdleMs : null,
+          retries: bs.turnRetries || 0,
+          transportErrors: bs.turnTransportErrors || 0,
+          stalls: bs.turnStalls || 0,
+          cascadeDetected: !!bs.turnCascadeDetected,
+        });
+      } catch (e) { /* never let stats crash error path */ }
       if (token) {
         tokenPool.release(token, {
           error: true,
@@ -1344,8 +1380,24 @@ app.get('/health', (req, res) => {
     tokenCount: tokenPool.size(),
     defaultModel: DEFAULT_MODEL,
     stallThresholds: stallThresholds.getStats(),
+    runtime: runtimeStats.getStats({ window: 'last1h' }).totals,
     version: '2.0.0',
   });
+});
+
+// ── Runtime stats endpoint ──
+//
+// Per-model aggregates with t-digest distributions. Supports time windows
+// (?window=lifetime|last1h|last24h|<ms>) and model filtering (?model=...).
+// Persists across restarts via logs/runtime-stats.json (override path with
+// RUNTIME_STATS_FILE).
+app.get('/stats', checkApiKey, (req, res) => {
+  const windowParam = req.query.window;
+  const window = windowParam == null
+    ? 'lifetime'
+    : /^\d+$/.test(windowParam) ? parseInt(windowParam, 10) : windowParam;
+  const model = req.query.model || undefined;
+  res.json(runtimeStats.getStats({ window, model }));
 });
 
 // ── 启动 ──
@@ -1355,6 +1407,30 @@ watchTokenFile();
 // Pre-warm the shared H2 client + proto schemas so the first /v1/messages
 // request doesn't pay the TLS handshake / proto load latency.
 cursorAgent.prewarmSharedClient();
+
+// Start runtime-stats persistence (snapshot to logs/runtime-stats.json
+// every minute and on graceful shutdown).
+runtimeStats.startPersistence();
+
+// Periodic stats summary line. Off by default; set RUNTIME_STATS_LOG_INTERVAL_MS
+// to a positive number of ms to enable. Useful on long-running proxies for
+// at-a-glance health without polling /stats.
+const _statsLogIntervalMs = parseInt(process.env.RUNTIME_STATS_LOG_INTERVAL_MS || '0', 10);
+if (_statsLogIntervalMs > 0) {
+  setInterval(() => {
+    const s = runtimeStats.getStats({ window: 'last1h' });
+    if (!s.totals.total) return;
+    const t = s.totals;
+    const succPct = ((t.successRate || 0) * 100).toFixed(1);
+    const firstPct = ((t.firstTryRate || 0) * 100).toFixed(1);
+    // Pick the busiest model in the last hour for a model-specific slice.
+    const top = Object.entries(s.models).sort((a, b) => b[1].total - a[1].total)[0];
+    const topStr = top ? ` | top ${top[0]}: ${top[1].total} (p95dur=${top[1].durationMs.p95}ms p95first=${top[1].firstFrameMs.p95}ms)` : '';
+    console.log(
+      `  📈 runtime/last1h | turns=${t.total} succ=${succPct}% firstTry=${firstPct}% retries=${t.totalRetries} stalls=${t.totalStalls} cascades=${t.totalCascades}${topStr}`
+    );
+  }, _statsLogIntervalMs).unref();
+}
 
 app.listen(PORT, HOST, () => {
   console.log('');
