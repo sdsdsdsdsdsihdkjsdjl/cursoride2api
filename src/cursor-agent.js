@@ -143,7 +143,21 @@ const _poolSize = (() => {
 })();
 const _pool = new Array(_poolSize).fill(null);
 const _poolErrorCount = new Array(_poolSize).fill(0); // recent stream-error count per slot
+const _poolLastUsedAt = new Array(_poolSize).fill(0); // ms timestamp of last getSharedClient hit
 let _poolCursor = 0;
+
+// Pool clients that have sat unused for this long get proactively recycled.
+// Cursor's LB silently rotates connections under us — connections look "open"
+// from Node's POV but the LB has already decided they're toast, so the first
+// write returns REFUSED_STREAM (we don't see the GOAWAY event because the LB
+// never sent us one cleanly). Recycling on idle prevents the cascade you see
+// when the user opens a new claude-code session after a quiet period.
+const POOL_MAX_IDLE_MS = (() => {
+  const raw = process.env.CURSOR_POOL_MAX_IDLE_MS;
+  if (raw == null || raw === '') return 5 * 60_000;  // 5 minutes default
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 5 * 60_000;
+})();
 
 // Tag a client object with its pool slot so failOrRetry can find it without
 // rescanning the pool. Set by _openClient; read by reportSlotError.
@@ -178,9 +192,35 @@ function _openClient(slot) {
     drop('goaway');
   });
   _pool[slot] = c;
-  _poolErrorCount[slot] = 0; // fresh slot, reset error counter
+  _poolErrorCount[slot] = 0;          // fresh slot, reset error counter
+  _poolLastUsedAt[slot] = Date.now(); // arm the idle-recycler timestamp
   return c;
 }
+
+// Background pool recycler. Runs every minute; closes any slot that hasn't
+// served a getSharedClient() hit in POOL_MAX_IDLE_MS. The c.close() call
+// triggers a GOAWAY → our existing handler nulls the slot and adds to
+// _drainingClients. Active streams on the connection complete naturally.
+const _poolRecycler = setInterval(() => {
+  const now = Date.now();
+  for (let i = 0; i < _poolSize; i++) {
+    const c = _pool[i];
+    if (!c || c.destroyed || c.closed) continue;
+    if (_drainingClients.has(c)) continue;
+    if (now - _poolLastUsedAt[i] > POOL_MAX_IDLE_MS) {
+      if (process.env.CURSOR_AGENT_DEBUG) {
+        const idleSec = Math.round((now - _poolLastUsedAt[i]) / 1000);
+        console.log(`[cursor-agent][debug] pool slot #${i} idle ${idleSec}s; recycling`);
+      }
+      try { c.close(); } catch { /* ignore */ }
+      // Optimistically null the slot and mark draining so a fast-arriving
+      // request opens a fresh client instead of racing the close event.
+      _pool[i] = null;
+      _drainingClients.add(c);
+    }
+  }
+}, 60_000);
+_poolRecycler.unref();
 
 // Stream-level error happened on this client. Bump its slot's error count;
 // if a slot crosses the threshold (3 errors in this session-lifetime),
@@ -210,11 +250,14 @@ function getSharedClient() {
     // not draining (received GOAWAY but not yet fully closed). The last
     // check catches the window where Cursor's LB just rotated us — new
     // streams on a draining client will get REFUSED_STREAM immediately.
-    if (c && !c.destroyed && !c.closed && !_drainingClients.has(c)) return c;
+    if (c && !c.destroyed && !c.closed && !_drainingClients.has(c)) {
+      _poolLastUsedAt[slot] = Date.now();
+      return c;
+    }
     // Slot is empty/dead/draining — open fresh. If the old client was
     // draining, null it now so a future request doesn't get stuck on it.
     if (c) _pool[slot] = null;
-    return _openClient(slot);
+    return _openClient(slot); // _openClient sets _poolLastUsedAt itself
   }
   // Should be unreachable — _poolSize >= 1.
   return _openClient(0);
@@ -1212,12 +1255,17 @@ function startConversation(token, options = {}) {
   // point even on otherwise-retryable errors. Set in handleServerMessage.
   let hasEmittedContent = false;
   let retryAttempts = 0;
-  // Match pool size so a load-balancer cycle that hits every slot in
-  // sequence still has a chance to land on a fresh connection on the last
-  // retry. Exponential backoff (see failOrRetry) gives Cursor's LB time
-  // to recover between attempts so we don't waste retries on a still-
-  // draining client.
-  const MAX_REQUEST_RETRIES = 3;
+  // Tracks whether the previous error was a transport-level cascade signal
+  // (REFUSED_STREAM / GOAWAY / INTERNAL_ERROR before content). Two of these
+  // in a row mean Cursor's LB is in bad state, not just one bad slot —
+  // failOrRetry doubles the next backoff in that case to actually let the
+  // LB stabilize before we hammer it again.
+  let lastErrorWasTransport = false;
+  // 5 attempts gives us coverage past Cursor's typical 1-2 second LB hiccup
+  // without exhausting on the first cascade. Was 3, but we observed cascades
+  // that recovered just past our last retry — bumped to 5 so the longer
+  // backoff schedule (last delay up to ~5 s) lands on a recovered LB.
+  const MAX_REQUEST_RETRIES = 5;
   let cachedInitialEncoded = null;
   // Hold the H2 client we attached to so failOrRetry / poisonSharedClient
   // can target the specific bad pool slot without rescanning the pool.
@@ -1520,14 +1568,26 @@ function startConversation(token, options = {}) {
         try { clearInterval(watchdog); } catch { /* ignore */ }
         watchdog = null;
       }
-      // Exponential backoff: 100ms, 250ms, 750ms (capped at ~1s). When
-      // Cursor's load balancer cycles its pool, all our slots receive
-      // GOAWAY in a tight burst — without backoff the retries land on
-      // brand-new but still-draining connections and cascade. The wider
-      // gap on later attempts gives the LB time to stabilize.
-      const backoffMs = retryAttempts === 1 ? 100
-                       : retryAttempts === 2 ? 250
-                       : 750;
+      // Exponential backoff schedule: 100, 250, 750, 2000, 5000 ms.
+      //
+      // When Cursor's LB cycles its pool, all our slots receive GOAWAY in a
+      // tight burst — without backoff the retries land on brand-new but
+      // still-draining connections and cascade. The wider gap on later
+      // attempts gives the LB time to stabilize.
+      //
+      // Cascade detection: if THIS error and the PREVIOUS error were both
+      // transport-level (REFUSED_STREAM / GOAWAY / INTERNAL_ERROR before
+      // content), we're in an LB cascade and our normal backoff is too
+      // tight. Double the delay in that case (capped at 8 s).
+      const isTransportError = /REFUSED_STREAM|GOAWAY|INTERNAL_ERROR/i.test(msg);
+      const inCascade = isTransportError && lastErrorWasTransport;
+      const baseBackoffs = [100, 250, 750, 2000, 5000];
+      const baseMs = baseBackoffs[Math.min(retryAttempts - 1, baseBackoffs.length - 1)];
+      const backoffMs = Math.min(8000, baseMs * (inCascade ? 2 : 1));
+      lastErrorWasTransport = isTransportError;
+      if (inCascade && process.env.CURSOR_AGENT_DEBUG) {
+        console.log(`[cursor-agent][debug] cascade detected — backoff ${baseMs}ms × 2 = ${backoffMs}ms`);
+      }
       setTimeout(() => {
         if (closed) return;
         try { attemptConnection(proto); } catch (e) {
