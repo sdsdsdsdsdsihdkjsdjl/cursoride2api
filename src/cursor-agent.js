@@ -1455,6 +1455,10 @@ function startConversation(token, options = {}) {
       if (idle > threshold) {
         try { clearInterval(watchdog); } catch { /* ignore */ }
         watchdog = null;
+        // Tell the threshold module so the next attempt for this model gets
+        // an elevated threshold (multiplicative bump, decays over time).
+        // Successful turns reset the elevation back to baseline.
+        try { stallThresholds.recordStall(modelId); } catch { /* ignore */ }
         const msg = `Upstream stalled — no progress for ${Math.round(idle / 1000)}s`;
         // Route stalls through failOrRetry so an early stall (before any
         // content was emitted to the client) gets the same retry-on-
