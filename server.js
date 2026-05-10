@@ -441,6 +441,9 @@ function buildTurnCallbacks(ctx) {
     // existing entry in place (preserving its bridgeKey alias set) instead
     // of creating a new one.
     cachedEntry,
+    // Whether this turn is a continuation (claude-code POSTed tool_result
+    // blocks). Fed to runtime-stats so we can break down latency by mode.
+    isContinuation = false,
     // Timings object — populated by callbacks; logged on turn end so the
     // user can see where time went (local proxy work vs upstream Cursor).
     timings,
@@ -795,18 +798,26 @@ function buildTurnCallbacks(ctx) {
         maxIdleStr
       );
       // Feed runtime-stats. Duration = total turn wall time (from t0 to
-      // turnEnded). firstFrame = time to first useful frame.
+      // turnEnded). firstFrame/firstText/firstTool come from the per-turn
+      // timing object. Tool count comes from the turnState's pending list.
       try {
         runtimeStats.recordTurnEnd({
           model: cursorModel,
           outcome: 'success',
-          durationMs: timings ? timings.turnEnded : null,
+          isStream: !!isStream,
+          isContinuation: !!isContinuation,
+          durationMs:   timings ? timings.turnEnded : null,
           firstFrameMs: timings ? timings.firstFrame : null,
+          firstTextMs:  timings ? timings.firstText : null,
+          firstToolMs:  timings ? timings.firstTool : null,
           maxIdleMs: typeof maxIdleMs === 'number' ? maxIdleMs : null,
           retries: turnRetries || 0,
           transportErrors: turnTransportErrors || 0,
           stalls: turnStalls || 0,
           cascadeDetected: !!turnCascadeDetected,
+          toolCount: turnState.pendingToolCalls.length,
+          inputTokens: typeof inputTokens === 'number' ? inputTokens : null,
+          outputTokens: typeof outputTokens === 'number' ? outputTokens : null,
         });
       } catch (e) { /* never let stats crash a turn */ }
       debugLog.logTurnEnded(
@@ -826,13 +837,20 @@ function buildTurnCallbacks(ctx) {
         runtimeStats.recordTurnEnd({
           model: cursorModel,
           outcome: 'fail',
+          isStream: !!isStream,
+          isContinuation: !!isContinuation,
           durationMs: timings && timings.t0 ? Date.now() - timings.t0 : null,
           firstFrameMs: timings ? timings.firstFrame : null,
+          firstTextMs:  timings ? timings.firstText : null,
+          firstToolMs:  timings ? timings.firstTool : null,
           maxIdleMs: typeof bs.maxIdleMs === 'number' ? bs.maxIdleMs : null,
           retries: bs.turnRetries || 0,
           transportErrors: bs.turnTransportErrors || 0,
           stalls: bs.turnStalls || 0,
           cascadeDetected: !!bs.turnCascadeDetected,
+          toolCount: turnState.pendingToolCalls.length,
+          inputTokens: typeof bs.inputTokens === 'number' ? bs.inputTokens : null,
+          outputTokens: typeof bs.outputTokens === 'number' ? bs.outputTokens : null,
         });
       } catch (e) { /* never let stats crash error path */ }
       if (token) {
@@ -982,6 +1000,7 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
     // Pass the existing entry so finalize/onTurnEnded mutate it in place
     // (preserving the bridgeKeys alias set) instead of creating a new one.
     cachedEntry: cached,
+    isContinuation: true,  // continuation handler
     timings,
   });
 
@@ -1092,6 +1111,7 @@ async function handleFreshTurn(req, res, token, params) {
     requestedModel, cursorModel, mcpTools,
     getBridge: () => bridge,
     requestId: params.requestId,
+    isContinuation: false,  // fresh-turn handler
     timings,
     token,
   });
@@ -1373,6 +1393,7 @@ app.post('/v1/messages/count_tokens', checkApiKey, async (req, res) => {
 
 // ── 健康检查 ──
 app.get('/health', (req, res) => {
+  const conn = runtimeStats.getConnectionStats({ recent: 0 });
   res.json({
     ok: true,
     status: 'ok',
@@ -1381,6 +1402,12 @@ app.get('/health', (req, res) => {
     defaultModel: DEFAULT_MODEL,
     stallThresholds: stallThresholds.getStats(),
     runtime: runtimeStats.getStats({ window: 'last1h' }).totals,
+    connections: {
+      currentlyOpen: conn.currentlyOpen,
+      totalOpens: conn.totalOpens,
+      totalCloses: conn.totalCloses,
+      closeReasonCounts: conn.closeReasonCounts,
+    },
     version: '2.0.0',
   });
 });
@@ -1388,7 +1415,8 @@ app.get('/health', (req, res) => {
 // ── Runtime stats endpoint ──
 //
 // Per-model aggregates with t-digest distributions. Supports time windows
-// (?window=lifetime|last1h|last24h|<ms>) and model filtering (?model=...).
+// (?window=lifetime|last1h|last24h|<ms>), model filtering (?model=...), and
+// grouping (?groupBy=model|modelMode|mode).
 // Persists across restarts via logs/runtime-stats.json (override path with
 // RUNTIME_STATS_FILE).
 app.get('/stats', checkApiKey, (req, res) => {
@@ -1397,7 +1425,18 @@ app.get('/stats', checkApiKey, (req, res) => {
     ? 'lifetime'
     : /^\d+$/.test(windowParam) ? parseInt(windowParam, 10) : windowParam;
   const model = req.query.model || undefined;
-  res.json(runtimeStats.getStats({ window, model }));
+  const groupBy = req.query.groupBy || 'model';
+  res.json(runtimeStats.getStats({ window, model, groupBy }));
+});
+
+// ── Connection lifecycle stats ──
+//
+// Per-pool-client lifetimes, streams-served distribution, close-reason
+// breakdown, per-slot churn. Useful for diagnosing connection rot from
+// Cursor's LB rotating connections, GOAWAY frequency, etc.
+app.get('/stats/connections', checkApiKey, (req, res) => {
+  const recentN = req.query.recent != null ? parseInt(req.query.recent, 10) : 50;
+  res.json(runtimeStats.getConnectionStats({ recent: Number.isFinite(recentN) ? recentN : 50 }));
 });
 
 // ── 启动 ──

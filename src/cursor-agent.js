@@ -19,6 +19,7 @@ const { v4: uuidv4 } = require('uuid');
 const config = require('./config');
 const { generateChecksum } = require('./cursor-client');
 const stallThresholds = require('./stall-thresholds');
+const runtimeStats = require('./runtime-stats');
 
 // Connect-protocol "end stream" frame flag
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -169,6 +170,27 @@ const _slotOf = new WeakMap();
 // so a load-balancer cycle doesn't cascade across a fresh round of
 // requests landing on draining connections.
 const _drainingClients = new WeakSet();
+// Per-client metadata for runtime-stats connection tracking. We record
+// connection open/close events with lifetimes and stream counts so the
+// stats endpoint can show how often Cursor's LB rotates connections, how
+// many streams a typical client serves before churn, and which close
+// reasons dominate (goaway / error / idle-recycle / poison).
+const _clientMeta = new WeakMap();
+function _markFirstClose(c, defaultReason) {
+  const meta = _clientMeta.get(c);
+  if (!meta || meta.closed) return;
+  meta.closed = true;
+  const reason = meta.closeReasonHint || defaultReason || 'unknown';
+  try {
+    runtimeStats.recordConnectionClose({
+      slot: meta.slot,
+      ageMs: Date.now() - meta.openedAt,
+      streamsServed: meta.streamsServed,
+      streamErrors: meta.streamErrors,
+      closeReason: reason,
+    });
+  } catch { /* ignore */ }
+}
 
 function _openClient(slot) {
   if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] opening pool client #${slot} → ${_baseUrl}`);
@@ -178,17 +200,27 @@ function _openClient(slot) {
   c.setMaxListeners(0);
   c.unref();
   _slotOf.set(c, slot);
+  _clientMeta.set(c, {
+    slot,
+    openedAt: Date.now(),
+    streamsServed: 0,
+    streamErrors: 0,
+    closed: false,
+    closeReasonHint: null,
+  });
+  try { runtimeStats.recordConnectionOpen({ slot }); } catch { /* ignore */ }
   const drop = (why) => {
     if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] pool client #${slot} ${why}`);
     if (_pool[slot] === c) _pool[slot] = null;
   };
-  c.on('error', (e) => drop(`error: ${e.message}`));
-  c.on('close', () => drop('closed'));
+  c.on('error', (e) => { _markFirstClose(c, 'error'); drop(`error: ${e.message}`); });
+  c.on('close', () => { _markFirstClose(c, 'closed'); drop('closed'); });
   c.on('goaway', () => {
     // Mark draining BEFORE drop() nulls the slot — getSharedClient may be
     // called between goaway and close, and we don't want it to pick this
     // client even if the slot pointer hasn't been cleared yet (race).
     _drainingClients.add(c);
+    _markFirstClose(c, 'goaway');
     drop('goaway');
   });
   _pool[slot] = c;
@@ -212,6 +244,10 @@ const _poolRecycler = setInterval(() => {
         const idleSec = Math.round((now - _poolLastUsedAt[i]) / 1000);
         console.log(`[cursor-agent][debug] pool slot #${i} idle ${idleSec}s; recycling`);
       }
+      // Tag the close reason so the eventual c.on('close') records the
+      // recycle origin instead of a generic 'closed'.
+      const meta = _clientMeta.get(c);
+      if (meta) meta.closeReasonHint = 'idle-recycle';
       try { c.close(); } catch { /* ignore */ }
       // Optimistically null the slot and mark draining so a fast-arriving
       // request opens a fresh client instead of racing the close event.
@@ -230,10 +266,15 @@ function reportSlotError(client, reason) {
   if (!client) return;
   const slot = _slotOf.get(client);
   if (slot == null) return;
+  // Bump per-client streamErrors regardless of pool replacement state —
+  // the close event on this client will use it.
+  const meta = _clientMeta.get(client);
+  if (meta) meta.streamErrors++;
   if (_pool[slot] !== client) return; // already replaced
   _poolErrorCount[slot]++;
   if (_poolErrorCount[slot] >= _SLOT_ERROR_THRESHOLD) {
     if (process.env.CURSOR_AGENT_DEBUG) console.log(`[cursor-agent][debug] pool slot #${slot} hit ${_poolErrorCount[slot]} errors (${reason}); evicting`);
+    if (meta) meta.closeReasonHint = 'poison';
     _pool[slot] = null;
     _poolErrorCount[slot] = 0;
   }
@@ -252,6 +293,8 @@ function getSharedClient() {
     // streams on a draining client will get REFUSED_STREAM immediately.
     if (c && !c.destroyed && !c.closed && !_drainingClients.has(c)) {
       _poolLastUsedAt[slot] = Date.now();
+      const meta = _clientMeta.get(c);
+      if (meta) meta.streamsServed++;
       return c;
     }
     // Slot is empty/dead/draining — open fresh. If the old client was

@@ -27,7 +27,18 @@ const STATS_FILE = process.env.RUNTIME_STATS_FILE
   || path.join(__dirname, '..', 'logs', 'runtime-stats.json');
 const PERSIST_INTERVAL_MS = parseInt(process.env.RUNTIME_STATS_PERSIST_MS || '60000', 10);
 const RECENT_RING = parseInt(process.env.RUNTIME_STATS_RECENT || '1000', 10);
-const SCHEMA_VERSION = 1;
+const CONN_EVENT_RING = parseInt(process.env.RUNTIME_STATS_CONN_RING || '500', 10);
+// v2: turn records carry mode (stream|nonstream + fresh|cont) and finer
+// latencies (firstTextMs/firstToolMs/toolCount); a parallel byModelMode
+// aggregate lets you query "all stream continuations of opus-thinking-max".
+// v1 stat files won't load — they'll start fresh and rebuild.
+const SCHEMA_VERSION = 2;
+
+// modeKey: stable cardinality (4 values) regardless of model count, so the
+// per-(model, mode) cross-product stays bounded.
+function modeKeyOf({ isStream, isContinuation }) {
+  return `${isStream ? 'stream' : 'nonstream'}|${isContinuation ? 'cont' : 'fresh'}`;
+}
 
 function _newDigest() { return new TDigest(); }
 function _digestToJSON(d) { return d.toArray(); }
@@ -53,9 +64,14 @@ function _newModelStats() {
     totalStalls: 0,
     totalTransportErrors: 0,
     totalCascades: 0,
-    durationDigest: _newDigest(),
-    firstFrameDigest: _newDigest(),
-    maxIdleDigest: _newDigest(),
+    totalToolCalls: 0,
+    durationDigest:    _newDigest(),
+    firstFrameDigest:  _newDigest(),
+    firstTextDigest:   _newDigest(),
+    firstToolDigest:   _newDigest(),
+    maxIdleDigest:     _newDigest(),
+    inputTokensDigest: _newDigest(),
+    outputTokensDigest: _newDigest(),
     firstSeenAt: Date.now(),
   };
 }
@@ -68,9 +84,14 @@ function _modelStatsToJSON(s) {
     totalStalls: s.totalStalls,
     totalTransportErrors: s.totalTransportErrors,
     totalCascades: s.totalCascades,
-    durationDigest: _digestToJSON(s.durationDigest),
-    firstFrameDigest: _digestToJSON(s.firstFrameDigest),
-    maxIdleDigest: _digestToJSON(s.maxIdleDigest),
+    totalToolCalls: s.totalToolCalls,
+    durationDigest:    _digestToJSON(s.durationDigest),
+    firstFrameDigest:  _digestToJSON(s.firstFrameDigest),
+    firstTextDigest:   _digestToJSON(s.firstTextDigest),
+    firstToolDigest:   _digestToJSON(s.firstToolDigest),
+    maxIdleDigest:     _digestToJSON(s.maxIdleDigest),
+    inputTokensDigest: _digestToJSON(s.inputTokensDigest),
+    outputTokensDigest: _digestToJSON(s.outputTokensDigest),
     firstSeenAt: s.firstSeenAt,
   };
 }
@@ -83,17 +104,33 @@ function _modelStatsFromJSON(j) {
     totalStalls: j.totalStalls || 0,
     totalTransportErrors: j.totalTransportErrors || 0,
     totalCascades: j.totalCascades || 0,
-    durationDigest: _digestFromJSON(j.durationDigest),
-    firstFrameDigest: _digestFromJSON(j.firstFrameDigest),
-    maxIdleDigest: _digestFromJSON(j.maxIdleDigest),
+    totalToolCalls: j.totalToolCalls || 0,
+    durationDigest:    _digestFromJSON(j.durationDigest),
+    firstFrameDigest:  _digestFromJSON(j.firstFrameDigest),
+    firstTextDigest:   _digestFromJSON(j.firstTextDigest),
+    firstToolDigest:   _digestFromJSON(j.firstToolDigest),
+    maxIdleDigest:     _digestFromJSON(j.maxIdleDigest),
+    inputTokensDigest: _digestFromJSON(j.inputTokensDigest),
+    outputTokensDigest: _digestFromJSON(j.outputTokensDigest),
     firstSeenAt: j.firstSeenAt || Date.now(),
   };
 }
 
 class RuntimeStats {
   constructor() {
-    this.byModel = new Map();
-    this.recent = [];           // ring buffer of last RECENT_RING records
+    this.byModel = new Map();         // model → ModelStats (rollup across modes)
+    this.byModelMode = new Map();     // `${model}|${modeKey}` → ModelStats
+    this.recent = [];                 // ring buffer of last RECENT_RING turn records
+    // Connection lifecycle aggregates — separate from turn stats.
+    this.connections = {
+      lifetimeDigest:    _newDigest(), // ageMs at close
+      streamsServedDigest: _newDigest(), // streams served per closed connection
+      closeReasonCounts: {},  // 'goaway' | 'error' | 'idle-recycle' | 'shutdown' | ...
+      totalOpens: 0,
+      totalCloses: 0,
+      perSlot: {},  // slot index → { opens, closes, currentClientOpenedAt }
+    };
+    this.connectionEvents = [];       // ring of recent connection events
     this._dirty = false;
     this._lastSavedAt = 0;
     this._persistTimer = null;
@@ -105,49 +142,78 @@ class RuntimeStats {
     if (!s) { s = _newModelStats(); this.byModel.set(model, s); }
     return s;
   }
+  _slotMode(model, modeKey) {
+    const k = `${model}|${modeKey}`;
+    let s = this.byModelMode.get(k);
+    if (!s) { s = _newModelStats(); this.byModelMode.set(k, s); }
+    return s;
+  }
+  _connSlotKey(slot) {
+    if (slot == null) return 'unknown';
+    if (!this.connections.perSlot[slot]) {
+      this.connections.perSlot[slot] = { opens: 0, closes: 0, currentClientOpenedAt: null };
+    }
+    return slot;
+  }
 
   // record: {
   //   model, outcome ('success' | 'fail'),
-  //   durationMs?, firstFrameMs?, maxIdleMs?,
+  //   isStream (bool), isContinuation (bool),
+  //   durationMs?, firstFrameMs?, firstTextMs?, firstToolMs?, maxIdleMs?,
   //   retries, transportErrors, stalls, cascadeDetected,
+  //   toolCount?, inputTokens?, outputTokens?,
   // }
   recordTurnEnd(record) {
     if (!record || typeof record.model !== 'string' || !record.model) return;
-    const s = this._slot(record.model);
-    s.total++;
-    if (record.outcome === 'success') s.success++;
-    else s.fail++;
-    if (record.retries > 0) {
-      s.retried++;
-      if (record.outcome === 'success') s.recovered++;
-    }
-    s.totalRetries += record.retries || 0;
-    s.totalStalls += record.stalls || 0;
-    s.totalTransportErrors += record.transportErrors || 0;
-    s.totalCascades += record.cascadeDetected ? 1 : 0;
+    const modeKey = modeKeyOf({
+      isStream: !!record.isStream,
+      isContinuation: !!record.isContinuation,
+    });
 
-    if (typeof record.durationMs === 'number' && record.durationMs >= 0) {
-      s.durationDigest.push(record.durationMs);
-    }
-    if (typeof record.firstFrameMs === 'number' && record.firstFrameMs >= 0) {
-      s.firstFrameDigest.push(record.firstFrameMs);
-    }
-    if (typeof record.maxIdleMs === 'number' && record.maxIdleMs >= 0) {
-      s.maxIdleDigest.push(record.maxIdleMs);
+    // Update both per-model rollup and per-(model, mode) breakdown.
+    for (const s of [this._slot(record.model), this._slotMode(record.model, modeKey)]) {
+      s.total++;
+      if (record.outcome === 'success') s.success++;
+      else s.fail++;
+      if (record.retries > 0) {
+        s.retried++;
+        if (record.outcome === 'success') s.recovered++;
+      }
+      s.totalRetries += record.retries || 0;
+      s.totalStalls += record.stalls || 0;
+      s.totalTransportErrors += record.transportErrors || 0;
+      s.totalCascades += record.cascadeDetected ? 1 : 0;
+      s.totalToolCalls += record.toolCount || 0;
+
+      if (typeof record.durationMs === 'number' && record.durationMs >= 0)   s.durationDigest.push(record.durationMs);
+      if (typeof record.firstFrameMs === 'number' && record.firstFrameMs >= 0) s.firstFrameDigest.push(record.firstFrameMs);
+      if (typeof record.firstTextMs === 'number' && record.firstTextMs >= 0)  s.firstTextDigest.push(record.firstTextMs);
+      if (typeof record.firstToolMs === 'number' && record.firstToolMs >= 0)  s.firstToolDigest.push(record.firstToolMs);
+      if (typeof record.maxIdleMs === 'number' && record.maxIdleMs >= 0)      s.maxIdleDigest.push(record.maxIdleMs);
+      if (typeof record.inputTokens === 'number' && record.inputTokens >= 0)  s.inputTokensDigest.push(record.inputTokens);
+      if (typeof record.outputTokens === 'number' && record.outputTokens >= 0) s.outputTokensDigest.push(record.outputTokens);
     }
 
     // Ring buffer for time-windowed views.
     const compactRecord = {
       ts: Date.now(),
       model: record.model,
+      modeKey,
+      isStream: !!record.isStream,
+      isContinuation: !!record.isContinuation,
       outcome: record.outcome,
       durationMs: record.durationMs ?? null,
       firstFrameMs: record.firstFrameMs ?? null,
+      firstTextMs: record.firstTextMs ?? null,
+      firstToolMs: record.firstToolMs ?? null,
       maxIdleMs: record.maxIdleMs ?? null,
       retries: record.retries || 0,
       transportErrors: record.transportErrors || 0,
       stalls: record.stalls || 0,
       cascadeDetected: !!record.cascadeDetected,
+      toolCount: record.toolCount || 0,
+      inputTokens: record.inputTokens || 0,
+      outputTokens: record.outputTokens || 0,
     };
     this.recent.push(compactRecord);
     if (this.recent.length > RECENT_RING) {
@@ -156,23 +222,70 @@ class RuntimeStats {
     this._dirty = true;
   }
 
-  // window = 'lifetime' | 'last1h' | 'last24h' | a number of ms
-  // model = optional filter
-  getStats({ window = 'lifetime', model } = {}) {
+  // Connection-level events (one record per pool client open/close).
+  // event: 'open' on _openClient; 'close' on c.on('close'/'error'/'goaway')
+  // (deduped — only the FIRST close-equivalent for a client emits a record).
+  // closeReason: 'error' | 'goaway' | 'closed' | 'idle-recycle' | 'poison' | 'shutdown'
+  recordConnectionOpen({ slot }) {
+    const sl = this._connSlotKey(slot);
+    this.connections.perSlot[sl].opens++;
+    this.connections.perSlot[sl].currentClientOpenedAt = Date.now();
+    this.connections.totalOpens++;
+    this._pushConnEvent({ ts: Date.now(), slot, event: 'open' });
+    this._dirty = true;
+  }
+  recordConnectionClose({ slot, ageMs, streamsServed, streamErrors, closeReason }) {
+    const sl = this._connSlotKey(slot);
+    this.connections.perSlot[sl].closes++;
+    this.connections.perSlot[sl].currentClientOpenedAt = null;
+    this.connections.totalCloses++;
+    if (typeof ageMs === 'number' && ageMs >= 0) {
+      this.connections.lifetimeDigest.push(ageMs);
+    }
+    if (typeof streamsServed === 'number' && streamsServed >= 0) {
+      this.connections.streamsServedDigest.push(streamsServed);
+    }
+    const reason = closeReason || 'unknown';
+    this.connections.closeReasonCounts[reason] = (this.connections.closeReasonCounts[reason] || 0) + 1;
+    this._pushConnEvent({
+      ts: Date.now(), slot, event: 'close',
+      ageMs: ageMs ?? null,
+      streamsServed: streamsServed ?? null,
+      streamErrors: streamErrors ?? null,
+      closeReason: reason,
+    });
+    this._dirty = true;
+  }
+  _pushConnEvent(ev) {
+    this.connectionEvents.push(ev);
+    if (this.connectionEvents.length > CONN_EVENT_RING) {
+      this.connectionEvents.splice(0, this.connectionEvents.length - CONN_EVENT_RING);
+    }
+  }
+
+  // window  — 'lifetime' | 'last1h' | 'last24h' | <ms>
+  // model   — optional filter
+  // groupBy — 'model' (default) | 'modelMode' (cross-product) | 'mode'
+  getStats({ window = 'lifetime', model, groupBy = 'model' } = {}) {
     const filterModel = model || null;
-    if (window === 'lifetime') {
-      // Use the lifetime per-model digests
-      const out = { window, models: {} };
-      let g = null;
-      for (const [m, s] of this.byModel.entries()) {
-        if (filterModel && m !== filterModel) continue;
-        out.models[m] = this._summarize(s);
+    const isLifetime = window === 'lifetime';
+
+    if (isLifetime) {
+      const sourceMap = (groupBy === 'modelMode') ? this.byModelMode : this.byModel;
+      const out = { window, groupBy, groups: {} };
+      for (const [k, s] of sourceMap.entries()) {
+        if (filterModel) {
+          const modelPart = (groupBy === 'modelMode') ? k.split('|')[0] : k;
+          if (modelPart !== filterModel) continue;
+        }
+        out.groups[k] = this._summarize(s);
       }
-      out.totals = this._totals(out.models);
+      if (groupBy === 'mode') return this._regroupByMode(out);
+      out.totals = this._totals(out.groups);
       return out;
     }
 
-    // Time-windowed: replay the ring. Build per-model digests on the fly.
+    // Time-windowed: replay the ring. Build digests on the fly.
     const sinceMs = (typeof window === 'number')
       ? window
       : window === 'last1h' ? 60 * 60_000
@@ -180,11 +293,17 @@ class RuntimeStats {
       : 60 * 60_000;
     const cutoff = Date.now() - sinceMs;
     const tmp = new Map();
+    const keyFn = (r) =>
+      (groupBy === 'modelMode') ? `${r.model}|${r.modeKey}`
+      : (groupBy === 'mode') ? r.modeKey
+      : r.model;
+
     for (const r of this.recent) {
       if (r.ts < cutoff) continue;
       if (filterModel && r.model !== filterModel) continue;
-      let s = tmp.get(r.model);
-      if (!s) { s = _newModelStats(); s.firstSeenAt = r.ts; tmp.set(r.model, s); }
+      const k = keyFn(r);
+      let s = tmp.get(k);
+      if (!s) { s = _newModelStats(); s.firstSeenAt = r.ts; tmp.set(k, s); }
       s.total++;
       if (r.outcome === 'success') s.success++;
       else s.fail++;
@@ -196,19 +315,100 @@ class RuntimeStats {
       s.totalStalls += r.stalls;
       s.totalTransportErrors += r.transportErrors;
       s.totalCascades += r.cascadeDetected ? 1 : 0;
-      if (typeof r.durationMs === 'number') s.durationDigest.push(r.durationMs);
+      s.totalToolCalls += r.toolCount || 0;
+      if (typeof r.durationMs === 'number')   s.durationDigest.push(r.durationMs);
       if (typeof r.firstFrameMs === 'number') s.firstFrameDigest.push(r.firstFrameMs);
-      if (typeof r.maxIdleMs === 'number') s.maxIdleDigest.push(r.maxIdleMs);
+      if (typeof r.firstTextMs === 'number')  s.firstTextDigest.push(r.firstTextMs);
+      if (typeof r.firstToolMs === 'number')  s.firstToolDigest.push(r.firstToolMs);
+      if (typeof r.maxIdleMs === 'number')    s.maxIdleDigest.push(r.maxIdleMs);
+      if (typeof r.inputTokens === 'number')  s.inputTokensDigest.push(r.inputTokens);
+      if (typeof r.outputTokens === 'number') s.outputTokensDigest.push(r.outputTokens);
     }
-    const out = { window, models: {} };
-    for (const [m, s] of tmp.entries()) out.models[m] = this._summarize(s);
-    out.totals = this._totals(out.models);
+    const out = { window, groupBy, groups: {} };
+    for (const [k, s] of tmp.entries()) out.groups[k] = this._summarize(s);
+    out.totals = this._totals(out.groups);
+    return out;
+  }
+
+  // For lifetime + groupBy='mode': aggregate byModelMode by stripping the
+  // model prefix. Counters sum trivially; t-digests merge by replaying
+  // centroids into a fresh digest.
+  _regroupByMode(out) {
+    const byMode = new Map();
+    for (const [k, s] of this.byModelMode.entries()) {
+      const modeKey = k.split('|').slice(1).join('|') || 'unknown';
+      let agg = byMode.get(modeKey);
+      if (!agg) { agg = _newModelStats(); byMode.set(modeKey, agg); }
+      agg.total += s.total;
+      agg.success += s.success;
+      agg.fail += s.fail;
+      agg.retried += s.retried;
+      agg.recovered += s.recovered;
+      agg.totalRetries += s.totalRetries;
+      agg.totalStalls += s.totalStalls;
+      agg.totalTransportErrors += s.totalTransportErrors;
+      agg.totalCascades += s.totalCascades;
+      agg.totalToolCalls += s.totalToolCalls;
+      // Merge digests by replaying centroids.
+      for (const dKey of ['durationDigest', 'firstFrameDigest', 'firstTextDigest',
+                          'firstToolDigest', 'maxIdleDigest',
+                          'inputTokensDigest', 'outputTokensDigest']) {
+        const arr = s[dKey].toArray();
+        if (arr.length) agg[dKey].push_centroid(arr);
+      }
+    }
+    const groups = {};
+    for (const [k, s] of byMode.entries()) groups[k] = this._summarize(s);
+    return { window: out.window, groupBy: 'mode', groups, totals: this._totals(groups) };
+  }
+
+  // Connection-level stats. Includes per-slot churn and lifetime distributions.
+  getConnectionStats({ recent = 50 } = {}) {
+    return {
+      totalOpens: this.connections.totalOpens,
+      totalCloses: this.connections.totalCloses,
+      currentlyOpen: Math.max(0, this.connections.totalOpens - this.connections.totalCloses),
+      closeReasonCounts: { ...this.connections.closeReasonCounts },
+      lifetimeMs: {
+        p50: _safePercentile(this.connections.lifetimeDigest, 0.5),
+        p95: _safePercentile(this.connections.lifetimeDigest, 0.95),
+        p99: _safePercentile(this.connections.lifetimeDigest, 0.99),
+        n: this.connections.lifetimeDigest.size(),
+      },
+      streamsPerConnection: {
+        p50: _safePercentile(this.connections.streamsServedDigest, 0.5),
+        p95: _safePercentile(this.connections.streamsServedDigest, 0.95),
+        p99: _safePercentile(this.connections.streamsServedDigest, 0.99),
+        n: this.connections.streamsServedDigest.size(),
+      },
+      perSlot: this._perSlotSnapshot(),
+      recentEvents: this.connectionEvents.slice(-recent),
+    };
+  }
+
+  _perSlotSnapshot() {
+    const now = Date.now();
+    const out = {};
+    for (const [slot, s] of Object.entries(this.connections.perSlot)) {
+      out[slot] = {
+        opens: s.opens,
+        closes: s.closes,
+        churn: s.opens - s.closes,
+        currentAgeMs: s.currentClientOpenedAt ? (now - s.currentClientOpenedAt) : null,
+      };
+    }
     return out;
   }
 
   _summarize(s) {
     const succRate = s.total > 0 ? s.success / s.total : null;
     const firstTryRate = s.total > 0 ? (s.success - s.recovered) / s.total : null;
+    const pctile = (d) => ({
+      p50: _safePercentile(d, 0.50),
+      p95: _safePercentile(d, 0.95),
+      p99: _safePercentile(d, 0.99),
+      n: d.size(),
+    });
     return {
       total: s.total,
       success: s.success,
@@ -219,35 +419,26 @@ class RuntimeStats {
       totalStalls: s.totalStalls,
       totalTransportErrors: s.totalTransportErrors,
       totalCascades: s.totalCascades,
-      successRate: succRate != null ? Number(succRate.toFixed(4)) : null,
+      totalToolCalls: s.totalToolCalls,
+      successRate:  succRate     != null ? Number(succRate.toFixed(4))     : null,
       firstTryRate: firstTryRate != null ? Number(firstTryRate.toFixed(4)) : null,
-      durationMs: {
-        p50: _safePercentile(s.durationDigest, 0.50),
-        p95: _safePercentile(s.durationDigest, 0.95),
-        p99: _safePercentile(s.durationDigest, 0.99),
-        n: s.durationDigest.size(),
-      },
-      firstFrameMs: {
-        p50: _safePercentile(s.firstFrameDigest, 0.50),
-        p95: _safePercentile(s.firstFrameDigest, 0.95),
-        p99: _safePercentile(s.firstFrameDigest, 0.99),
-        n: s.firstFrameDigest.size(),
-      },
-      maxIdleMs: {
-        p50: _safePercentile(s.maxIdleDigest, 0.50),
-        p95: _safePercentile(s.maxIdleDigest, 0.95),
-        p99: _safePercentile(s.maxIdleDigest, 0.99),
-        n: s.maxIdleDigest.size(),
-      },
+      durationMs:    pctile(s.durationDigest),
+      firstFrameMs:  pctile(s.firstFrameDigest),
+      firstTextMs:   pctile(s.firstTextDigest),
+      firstToolMs:   pctile(s.firstToolDigest),
+      maxIdleMs:     pctile(s.maxIdleDigest),
+      inputTokens:   pctile(s.inputTokensDigest),
+      outputTokens:  pctile(s.outputTokensDigest),
     };
   }
 
-  _totals(models) {
+  _totals(groups) {
     const fields = ['total', 'success', 'fail', 'retried', 'recovered',
-      'totalRetries', 'totalStalls', 'totalTransportErrors', 'totalCascades'];
+      'totalRetries', 'totalStalls', 'totalTransportErrors', 'totalCascades',
+      'totalToolCalls'];
     const t = {};
     for (const f of fields) t[f] = 0;
-    for (const m of Object.values(models)) for (const f of fields) t[f] += m[f] || 0;
+    for (const m of Object.values(groups)) for (const f of fields) t[f] += m[f] || 0;
     t.successRate = t.total > 0 ? Number((t.success / t.total).toFixed(4)) : null;
     t.firstTryRate = t.total > 0
       ? Number(((t.success - t.recovered) / t.total).toFixed(4)) : null;
@@ -260,16 +451,34 @@ class RuntimeStats {
       if (!fs.existsSync(STATS_FILE)) return;
       const raw = fs.readFileSync(STATS_FILE, 'utf8');
       const j = JSON.parse(raw);
-      if (j.schema !== SCHEMA_VERSION) return; // future-proof; ignore old format
+      if (j.schema !== SCHEMA_VERSION) return; // schema mismatch — start fresh
       this.byModel = new Map();
       for (const [m, ms] of Object.entries(j.byModel || {})) {
         this.byModel.set(m, _modelStatsFromJSON(ms));
       }
+      this.byModelMode = new Map();
+      for (const [k, ms] of Object.entries(j.byModelMode || {})) {
+        this.byModelMode.set(k, _modelStatsFromJSON(ms));
+      }
       if (Array.isArray(j.recent)) {
         this.recent = j.recent.slice(-RECENT_RING);
       }
+      if (j.connections) {
+        this.connections.totalOpens = j.connections.totalOpens || 0;
+        this.connections.totalCloses = j.connections.totalCloses || 0;
+        this.connections.closeReasonCounts = j.connections.closeReasonCounts || {};
+        this.connections.lifetimeDigest = _digestFromJSON(j.connections.lifetimeDigest);
+        this.connections.streamsServedDigest = _digestFromJSON(j.connections.streamsServedDigest);
+        this.connections.perSlot = j.connections.perSlot || {};
+        // Drop currentClientOpenedAt — those clients don't survive restarts.
+        for (const k of Object.keys(this.connections.perSlot)) {
+          this.connections.perSlot[k].currentClientOpenedAt = null;
+        }
+      }
+      if (Array.isArray(j.connectionEvents)) {
+        this.connectionEvents = j.connectionEvents.slice(-CONN_EVENT_RING);
+      }
     } catch (e) {
-      // Corrupt file or read error; start fresh.
       console.error(`[runtime-stats] load failed: ${e.message}`);
     }
   }
@@ -284,13 +493,21 @@ class RuntimeStats {
       schema: SCHEMA_VERSION,
       savedAt: Date.now(),
       byModel: {},
+      byModelMode: {},
       recent: this.recent,
+      connections: {
+        totalOpens: this.connections.totalOpens,
+        totalCloses: this.connections.totalCloses,
+        closeReasonCounts: this.connections.closeReasonCounts,
+        lifetimeDigest: _digestToJSON(this.connections.lifetimeDigest),
+        streamsServedDigest: _digestToJSON(this.connections.streamsServedDigest),
+        perSlot: this.connections.perSlot,
+      },
+      connectionEvents: this.connectionEvents,
     };
-    for (const [m, s] of this.byModel.entries()) {
-      obj.byModel[m] = _modelStatsToJSON(s);
-    }
+    for (const [m, s] of this.byModel.entries())     obj.byModel[m] = _modelStatsToJSON(s);
+    for (const [k, s] of this.byModelMode.entries()) obj.byModelMode[k] = _modelStatsToJSON(s);
     try {
-      // Atomic-ish: write tmp + rename.
       const tmp = STATS_FILE + '.tmp';
       fs.writeFileSync(tmp, JSON.stringify(obj));
       fs.renameSync(tmp, STATS_FILE);
@@ -315,7 +532,17 @@ class RuntimeStats {
   // Test hook
   _resetForTests() {
     this.byModel.clear();
+    this.byModelMode.clear();
     this.recent = [];
+    this.connectionEvents = [];
+    this.connections = {
+      lifetimeDigest: _newDigest(),
+      streamsServedDigest: _newDigest(),
+      closeReasonCounts: {},
+      totalOpens: 0,
+      totalCloses: 0,
+      perSlot: {},
+    };
     this._dirty = false;
   }
 }
@@ -323,14 +550,19 @@ class RuntimeStats {
 const _instance = new RuntimeStats();
 
 module.exports = {
-  recordTurnEnd: (r) => _instance.recordTurnEnd(r),
-  getStats: (opts) => _instance.getStats(opts),
-  startPersistence: () => _instance.startPersistence(),
-  saveNow: () => _instance._saveToDisk(),
-  _resetForTests: () => _instance._resetForTests(),
+  recordTurnEnd:           (r) => _instance.recordTurnEnd(r),
+  recordConnectionOpen:    (r) => _instance.recordConnectionOpen(r),
+  recordConnectionClose:   (r) => _instance.recordConnectionClose(r),
+  getStats:                (opts) => _instance.getStats(opts),
+  getConnectionStats:      (opts) => _instance.getConnectionStats(opts),
+  startPersistence:        () => _instance.startPersistence(),
+  saveNow:                 () => _instance._saveToDisk(),
+  _resetForTests:          () => _instance._resetForTests(),
   // For periodic-log helper to access cheaply:
   _instance,
+  modeKeyOf,
   // Constants exported for tests
   RECENT_RING,
+  CONN_EVENT_RING,
   SCHEMA_VERSION,
 };
