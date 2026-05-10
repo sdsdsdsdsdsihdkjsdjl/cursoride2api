@@ -475,12 +475,109 @@ function buildTurnCallbacks(ctx) {
     }
   }
 
+  // Scan the buffered text + thinking content for `[Tool call: NAME({...})]`
+  // patterns the model emitted as TEXT instead of as structured tool_use,
+  // and synthesize tool_use blocks for the ones not already represented in
+  // pendingToolCalls. Safe to call multiple times per turn — uses
+  // turnState.rescuedHitCount as a watermark so identical hits aren't
+  // re-rescued and dedups against real tool calls already in the list.
+  //
+  // Must be called BEFORE writing the final message_delta / message_stop in
+  // a tool_use finalize, so the synthesized content_block_* deltas can ride
+  // out on the still-open response.
+  //
+  // Returns the number of newly rescued calls (informational).
+  function tryRescueHallucinatedToolCalls() {
+    if (turnState.toolUseFinished) {
+      // After finalize, res is closed — we couldn't emit blocks anyway.
+      return 0;
+    }
+    const textBuf = turnState.emittedTextForDetection || '';
+    const thinkBuf = turnState.emittedThinkingForDetection || '';
+    if (!textBuf && !thinkBuf) return 0;
+    // Concatenating with a newline separator is fine for the parser — it
+    // scans for the `[Tool call: ` literal which doesn't cross the boundary.
+    const combined = textBuf + (thinkBuf ? '\n' + thinkBuf : '');
+    const allHits = anthropicTools.parseHallucinatedToolCalls(combined);
+    if (allHits.length <= turnState.rescuedHitCount) return 0;
+    const newHits = allHits.slice(turnState.rescuedHitCount);
+
+    const registered = new Set(
+      (mcpTools || []).flatMap(t => [t && t.name, t && t.toolName]).filter(Boolean)
+    );
+
+    // Dedup keys for already-pending calls (real or previously rescued).
+    const pendingKeys = new Set(turnState.pendingToolCalls.map(tc => {
+      try { return tc.toolName + '|' + JSON.stringify(tc.args || {}); }
+      catch { return tc.toolName + '|?'; }
+    }));
+
+    let added = 0;
+    for (const hit of newHits) {
+      const canonical = anthropicTools.canonicalizeHallucinatedToolName(hit.name, registered);
+      const normalizedArgs = anthropicTools.normalizeHallucinatedToolArgs(canonical, hit.args || {});
+      const dupKey = (() => {
+        try { return canonical + '|' + JSON.stringify(normalizedArgs); }
+        catch { return canonical + '|?'; }
+      })();
+      if (pendingKeys.has(dupKey)) {
+        // The model emitted both a real tool_use AND a `[Tool call: ...]`
+        // textual narration of the same call — don't double-execute.
+        continue;
+      }
+      pendingKeys.add(dupKey);
+
+      const argsJson = (() => {
+        try { return JSON.stringify(normalizedArgs); }
+        catch { return '{}'; }
+      })();
+      const synthExecId = '';
+      const synthToolCallId = `toolu_synth_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
+      const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, synthExecId, synthToolCallId, sessionId);
+      const blockIndex = turnState.nextBlockIndex++;
+      turnState.pendingToolCalls.push({
+        execMsgId: 0,
+        execId: synthExecId,
+        toolCallId: synthToolCallId,
+        toolName: canonical,
+        args: normalizedArgs,
+        anthropicToolUseId,
+        blockIndex,
+        synthetic: true,
+      });
+      if (isStream && !res.writableEnded) {
+        res.write(anthropicConverter.buildContentBlockStartToolUse(blockIndex, anthropicToolUseId, canonical));
+        res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, argsJson));
+        res.write(anthropicConverter.buildContentBlockStop(blockIndex));
+      }
+      const normalizedKeys = Object.keys(normalizedArgs);
+      const originalKeys = Object.keys(hit.args || {});
+      const argsRenamed = normalizedKeys.length === originalKeys.length &&
+        normalizedKeys.some(k => !originalKeys.includes(k));
+      console.log(
+        `  🩹 hallucinated-tool-call rescued: ${hit.name}` +
+        (canonical !== hit.name ? ` → ${canonical}` : '') +
+        (argsRenamed ? ` (args normalized: ${originalKeys.join(',')} → ${normalizedKeys.join(',')})` : '')
+      );
+      added++;
+    }
+    turnState.rescuedHitCount = allHits.length;
+    return added;
+  }
+
   function finalizeToolUseTurn() {
     if (turnState.toolUseFinished) return;
     if (turnState.toolUseFinishTimer) {
       clearTimeout(turnState.toolUseFinishTimer);
       turnState.toolUseFinishTimer = null;
     }
+    // Mixed-mode rescue: if the model emitted real tool_use AND
+    // `[Tool call: ...]` text in the same turn (a known failure mode of
+    // Cursor's thinking-max with long contexts), this is our last chance
+    // to synthesize the hallucinated calls before the response closes.
+    // Must run BEFORE setting toolUseFinished + writing message_delta so
+    // the synthesized content_block_* deltas can still go out on the wire.
+    try { tryRescueHallucinatedToolCalls(); } catch { /* never let rescue crash finalize */ }
     turnState.toolUseFinished = true;
     closeOpenBlock();
 
@@ -589,6 +686,10 @@ function buildTurnCallbacks(ctx) {
       if (!isStream) {
         turnState.accumulatedThinking += text;
       }
+      // Always append to the hallucination-detection buffer so the rescue
+      // catches `[Tool call: ...]` patterns the model emitted inside a
+      // thinking block (rare but observed).
+      turnState.emittedThinkingForDetection += text;
       if (isStream && !res.writableEnded) {
         res.write(anthropicConverter.buildContentBlockDeltaThinking(turnState.nextBlockIndex - 1, text));
       }
@@ -669,65 +770,13 @@ function buildTurnCallbacks(ctx) {
         return;
       }
 
-      // Hallucinated-tool-call rescue: if the turn ended without any
-      // structured tool_use AND the model emitted text matching
-      // `[Tool call: NAME({...})]`, synthesize tool_use blocks so the tool
-      // actually runs. Without this, claude-code shows the bracketed string
-      // as text and the conversation stalls. See parseHallucinatedToolCalls
-      // for the parser; this is a workaround for Cursor's model occasionally
-      // falling out of structured-tool-use mode (especially with low effort
-      // or long contexts where tool-name aliases like AskQuestion vs
-      // mcp_AskUserQuestion get muddled).
-      if (turnState.pendingToolCalls.length === 0 && turnState.emittedTextForDetection) {
-        const hits = anthropicTools.parseHallucinatedToolCalls(turnState.emittedTextForDetection);
-        if (hits.length > 0) {
-          const registered = new Set((mcpTools || []).map(t => t.name).concat((mcpTools || []).map(t => t.toolName)));
-          for (const hit of hits) {
-            const canonical = anthropicTools.canonicalizeHallucinatedToolName(hit.name, registered);
-            // Normalize known field-name typos (e.g. Write's `contents` →
-            // `content`, Edit's `old`/`new` → `old_string`/`new_string`).
-            // The structural rescuer can't fix bad data on its own; this
-            // saves the most common cases from the "tool ran but failed"
-            // outcome.
-            const normalizedArgs = anthropicTools.normalizeHallucinatedToolArgs(canonical, hit.args || {});
-            const argsJson = (() => {
-              try { return JSON.stringify(normalizedArgs); }
-              catch { return '{}'; }
-            })();
-            const synthExecId = '';
-            const synthToolCallId = `toolu_synth_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
-            const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, synthExecId, synthToolCallId, sessionId);
-            const blockIndex = turnState.nextBlockIndex++;
-            turnState.pendingToolCalls.push({
-              execMsgId: 0,
-              execId: synthExecId,
-              toolCallId: synthToolCallId,
-              toolName: canonical,
-              args: normalizedArgs,
-              anthropicToolUseId,
-              blockIndex,
-              synthetic: true,
-            });
-            // Emit the tool_use as new content blocks AFTER the text the
-            // client already saw. Slightly cluttered (text + tool_use in
-            // the same response) but lets the tool actually run.
-            if (isStream && !res.writableEnded) {
-              res.write(anthropicConverter.buildContentBlockStartToolUse(blockIndex, anthropicToolUseId, canonical));
-              res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, argsJson));
-              res.write(anthropicConverter.buildContentBlockStop(blockIndex));
-            }
-            const normalizedKeys = Object.keys(normalizedArgs);
-            const originalKeys = Object.keys(hit.args || {});
-            const argsRenamed = normalizedKeys.length === originalKeys.length &&
-              normalizedKeys.some(k => !originalKeys.includes(k));
-            console.log(
-              `  🩹 hallucinated-tool-call rescued: ${hit.name}` +
-              (canonical !== hit.name ? ` → ${canonical}` : '') +
-              (argsRenamed ? ` (args normalized: ${originalKeys.join(',')} → ${normalizedKeys.join(',')})` : '')
-            );
-          }
-        }
-      }
+      // Hallucinated-tool-call rescue: scans text + thinking content for
+      // `[Tool call: NAME({...})]` patterns the model emitted instead of
+      // structured tool_use, synthesizes tool_use blocks for any not
+      // already represented. Idempotent — safe even if finalizeToolUseTurn
+      // already ran the same scan. (In practice that path early-returns
+      // above via toolUseFinished, but the helper guards anyway.)
+      try { tryRescueHallucinatedToolCalls(); } catch { /* never let rescue crash end_turn */ }
 
       const hasTools = turnState.pendingToolCalls.length > 0;
       const stopReason = hasTools ? 'tool_use' : 'end_turn';
@@ -945,6 +994,14 @@ function makeTurnState() {
     // tool calls (`[Tool call: NAME({...})]`) the model emitted as text
     // instead of as structured tool_use. See parseHallucinatedToolCalls.
     emittedTextForDetection: '',
+    // Same idea for thinking content. The model occasionally narrates tool
+    // calls inside the thinking block instead of the response, and those
+    // would otherwise escape the rescuer.
+    emittedThinkingForDetection: '',
+    // Tracks how many tool_use blocks we've already rescued out of the text
+    // buffers. Lets the helper run multiple times per turn (e.g. at finalize
+    // time AND at onTurnEnded) without re-rescuing the same hit.
+    rescuedHitCount: 0,
     nextBlockIndex: 0,
     pendingToolCalls: [],   // { execMsgId, execId, toolCallId, toolName, args, anthropicToolUseId, blockIndex }
     accumulatedText: '',
