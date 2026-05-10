@@ -917,6 +917,14 @@ function startConversation(token, options = {}) {
   let _turnTransportErrors = 0;
   let _turnStalls = 0;
   let _turnCascadeDetected = false;
+  // Live in-flight diagnostics — exposed via bridge.getStats() so a
+  // /stats/inflight endpoint can answer "is this turn thinking or stuck?"
+  // in real time. textDelta/thinkingDelta counts rising = model is
+  // actively producing; flat counts + idle bytesIn = upstream is silent
+  // (heartbeats only). Reset at every new-turn boundary.
+  let _turnTextDeltaCount = 0;
+  let _turnThinkingDeltaCount = 0;
+  let _bytesInAtLastUsefulFrame = 0;
   let watchdog = null;
 
   // Stall thresholds are per-model and adaptive — see src/stall-thresholds.js.
@@ -935,8 +943,9 @@ function startConversation(token, options = {}) {
     _stallSource = t.source;
   }
   // Helper: mark a useful frame. Updates the maxIdleMs running max BEFORE
-  // resetting the clock. Called from every spot where lastUsefulFrameAt was
-  // previously set to Date.now() inline.
+  // resetting the clock. Snapshots streamBytesIn so the live-diagnostics
+  // endpoint can compute "bytes received since last useful frame" — if
+  // that's stable while idle climbs, only heartbeats are flowing.
   function markUsefulFrame() {
     const now = Date.now();
     if (lastUsefulFrameAt > 0) {
@@ -944,6 +953,7 @@ function startConversation(token, options = {}) {
       if (idle > maxIdleMs) maxIdleMs = idle;
     }
     lastUsefulFrameAt = now;
+    _bytesInAtLastUsefulFrame = streamBytesIn;
   }
   function dumpStreamSummary(reason, code) {
     if (streamSummaryEmitted) return;
@@ -1033,6 +1043,9 @@ function startConversation(token, options = {}) {
     _turnTransportErrors = 0;
     _turnStalls = 0;
     _turnCascadeDetected = false;
+    _turnTextDeltaCount = 0;
+    _turnThinkingDeltaCount = 0;
+    _bytesInAtLastUsefulFrame = streamBytesIn;
     const { create, toBinary, agent } = _requireProto();
 
     // Build the content[] array of MCP items
@@ -1139,13 +1152,21 @@ function startConversation(token, options = {}) {
       markUsefulFrame();
       if (iuCase === 'textDelta') {
         const t = iuVal?.text || '';
-        if (t) { hasEmittedContent = true; currentCallbacks.onTextDelta(t); }
+        if (t) {
+          hasEmittedContent = true;
+          _turnTextDeltaCount++;
+          currentCallbacks.onTextDelta(t);
+        }
         return;
       }
       if (iuCase === 'thinkingDelta') {
         const t = iuVal?.text || '';
         // Thinking is also user-visible content (claude-code renders it).
-        if (t) { hasEmittedContent = true; currentCallbacks.onThinkingDelta(t); }
+        if (t) {
+          hasEmittedContent = true;
+          _turnThinkingDeltaCount++;
+          currentCallbacks.onThinkingDelta(t);
+        }
         return;
       }
       if (iuCase === 'thinkingCompleted') return;
@@ -1706,14 +1727,41 @@ function startConversation(token, options = {}) {
     // already landed and populated these — exposing them lets the caller
     // emit accurate input_tokens in the streaming message_delta even on
     // the early-finalize path used for tool_use turns.
-    getStats: () => ({
-      inputTokens, outputTokens,
-      maxIdleMs,
-      turnRetries: _turnRetries,
-      turnTransportErrors: _turnTransportErrors,
-      turnStalls: _turnStalls,
-      turnCascadeDetected: _turnCascadeDetected,
-    }),
+    getStats: () => {
+      const now = Date.now();
+      const idleMs = lastUsefulFrameAt > 0 ? now - lastUsefulFrameAt : 0;
+      const thresholdMs = hasEmittedContent ? _stallPostMs : _stallPreMs;
+      return {
+        // Token counts
+        inputTokens, outputTokens,
+        // Per-turn aggregate signals (final values after turnEnded)
+        maxIdleMs,
+        turnRetries: _turnRetries,
+        turnTransportErrors: _turnTransportErrors,
+        turnStalls: _turnStalls,
+        turnCascadeDetected: _turnCascadeDetected,
+        // Live diagnostics (meaningful while the bridge is in-flight)
+        modelId,
+        closed,
+        turnEndedFired,
+        hasEmittedContent,
+        streamOpenedAt,
+        openedMsAgo: streamOpenedAt > 0 ? now - streamOpenedAt : null,
+        lastUsefulFrameAt,
+        idleMsSinceLastUsefulFrame: lastUsefulFrameAt > 0 ? idleMs : null,
+        currentThresholdMs: thresholdMs,
+        currentThresholdKind: hasEmittedContent ? 'post-content' : 'pre-content',
+        willTripStallInMs: lastUsefulFrameAt > 0 ? Math.max(0, thresholdMs - idleMs) : null,
+        stallThresholdSource: _stallSource,
+        retryAttempts,
+        bytesInTotal: streamBytesIn,
+        bytesInSinceLastUsefulFrame: streamBytesIn - _bytesInAtLastUsefulFrame,
+        bytesOutTotal: streamBytesOut,
+        textDeltaCount: _turnTextDeltaCount,
+        thinkingDeltaCount: _turnThinkingDeltaCount,
+        mcpCallCount: streamMcpCallCount,
+      };
+    },
   };
 }
 

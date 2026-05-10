@@ -1439,6 +1439,78 @@ app.get('/stats/connections', checkApiKey, (req, res) => {
   res.json(runtimeStats.getConnectionStats({ recent: Number.isFinite(recentN) ? recentN : 50 }));
 });
 
+// ── Live in-flight bridge state ──
+//
+// Answers the question "right now, is this turn thinking or stuck?" without
+// having to grep proxy logs. For each active bridge whose turn isn't
+// already ended, returns: model, idle time since last useful frame, current
+// stall threshold, when the watchdog will trip, plus delta counts and byte
+// flow so you can tell heartbeats-only (stuck) apart from active progress.
+//
+// Heuristic for the JSON consumer: if `thinkingDeltaCount` or `textDeltaCount`
+// is rising between polls, the model is producing. If those counts are flat
+// and `bytesInSinceLastUsefulFrame` is also flat, only heartbeats are flowing
+// — the upstream is silent and `willTripStallInMs` is the budget left.
+app.get('/stats/inflight', checkApiKey, (req, res) => {
+  const seen = new Set();   // dedupe entries that have multiple bridgeKey aliases
+  const bridges = [];
+  for (const [bridgeKey, entry] of activeBridges) {
+    if (!entry || seen.has(entry)) continue;
+    seen.add(entry);
+    let s = null;
+    try { s = entry.bridge && typeof entry.bridge.getStats === 'function' ? entry.bridge.getStats() : null; }
+    catch { /* ignore */ }
+    if (!s) continue;
+    // "In-flight" = not closed AND turn isn't ended (or the bridge is mid-
+    // continuation idle window — useful to surface either way).
+    const inFlight = !s.closed && !s.turnEndedFired;
+    bridges.push({
+      bridgeKey,
+      sessionId: entry.sessionId ? entry.sessionId.slice(0, 8) : null,
+      requestId: entry.requestId || null,
+      model: s.modelId || entry.cursorModel,
+      requestedModel: entry.requestedModel,
+      inFlight,
+      closed: s.closed,
+      turnEndedFired: s.turnEndedFired,
+      hasEmittedContent: s.hasEmittedContent,
+      openedMsAgo: s.openedMsAgo,
+      idleMsSinceLastUsefulFrame: s.idleMsSinceLastUsefulFrame,
+      currentThresholdMs: s.currentThresholdMs,
+      currentThresholdKind: s.currentThresholdKind,
+      willTripStallInMs: s.willTripStallInMs,
+      stallThresholdSource: s.stallThresholdSource,
+      retryAttempts: s.retryAttempts,
+      bytesInTotal: s.bytesInTotal,
+      bytesInSinceLastUsefulFrame: s.bytesInSinceLastUsefulFrame,
+      bytesOutTotal: s.bytesOutTotal,
+      textDeltaCount: s.textDeltaCount,
+      thinkingDeltaCount: s.thinkingDeltaCount,
+      mcpCallCount: s.mcpCallCount,
+      inputTokens: s.inputTokens,
+      outputTokens: s.outputTokens,
+      maxIdleMs: s.maxIdleMs,
+      turnRetries: s.turnRetries,
+      turnStalls: s.turnStalls,
+      turnTransportErrors: s.turnTransportErrors,
+      turnCascadeDetected: s.turnCascadeDetected,
+      lastAccessMsAgo: entry.lastAccessMs ? (Date.now() - entry.lastAccessMs) : null,
+    });
+  }
+  // Sort: in-flight first, then by largest idleMs so the most concerning
+  // bridge surfaces at the top of the list.
+  bridges.sort((a, b) => {
+    if (a.inFlight !== b.inFlight) return a.inFlight ? -1 : 1;
+    return (b.idleMsSinceLastUsefulFrame || 0) - (a.idleMsSinceLastUsefulFrame || 0);
+  });
+  res.json({
+    now: Date.now(),
+    totalBridges: bridges.length,
+    inFlightCount: bridges.filter(b => b.inFlight).length,
+    bridges,
+  });
+});
+
 // ── 启动 ──
 const count = loadTokens();
 watchTokenFile();
