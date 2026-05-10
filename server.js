@@ -18,6 +18,7 @@ const preprocess = require('./src/preprocess');
 const debugLog = require('./src/debug-log');
 const stallThresholds = require('./src/stall-thresholds');
 const runtimeStats = require('./src/runtime-stats');
+const { StreamingHallucinationFilter } = require('./src/streaming-hallucination-filter');
 debugLog.init();
 
 // Configurable "small model" used for warmup pings, compaction summarization,
@@ -462,6 +463,19 @@ function buildTurnCallbacks(ctx) {
 
   function closeOpenBlock() {
     if (turnState.textBlockOpen) {
+      // Flush any text the hallucination filter is still holding (typically
+      // an incomplete `[Tool call:` prefix the model started but never
+      // finished). Leak it as plain text rather than silently swallowing —
+      // better visible noise than swallowed user content.
+      const trailing = turnState.hallucinationFilter
+        ? turnState.hallucinationFilter.flush()
+        : '';
+      if (trailing) {
+        if (!isStream) turnState.accumulatedText += trailing;
+        if (isStream && !res.writableEnded) {
+          res.write(anthropicConverter.buildContentBlockDelta(turnState.nextBlockIndex - 1, trailing));
+        }
+      }
       if (isStream && !res.writableEnded) {
         res.write(anthropicConverter.buildContentBlockStop(turnState.nextBlockIndex - 1));
       }
@@ -650,6 +664,19 @@ function buildTurnCallbacks(ctx) {
     onTextDelta: (text) => {
       stamp('firstFrame');
       stamp('firstText');
+      // ALWAYS append to the detection buffer first — the structural rescue
+      // path reads from this buffer at finalize/onTurnEnded to find
+      // `[Tool call: ...]` patterns and synthesize tool_use blocks. The
+      // filter below only suppresses the bracketed text from the wire; the
+      // rescue still needs the original text to find what to rescue.
+      turnState.emittedTextForDetection += text;
+      // Filter out hallucinated `[Tool call: ...]` patterns from outbound
+      // text. Returns only the safe-to-forward portion (whole pattern
+      // ranges suppressed; partial pattern starts may be held back for
+      // the next delta).
+      const forwarded = turnState.hallucinationFilter.feed(text);
+      if (!forwarded) return;  // entirely suppressed / held back
+
       if (turnState.thinkingBlockOpen) closeOpenBlock();
       if (!turnState.textBlockOpen) {
         const idx = turnState.nextBlockIndex++;
@@ -662,13 +689,10 @@ function buildTurnCallbacks(ctx) {
       // delta is already on the wire; appending to a JS string per chunk
       // is O(n²) for long generations because strings are immutable.
       if (!isStream) {
-        turnState.accumulatedText += text;
+        turnState.accumulatedText += forwarded;
       }
-      // Always append to the hallucination-detection buffer (cheap; bounded
-      // by total text size of one turn). Used at end_turn time only.
-      turnState.emittedTextForDetection += text;
       if (isStream && !res.writableEnded) {
-        res.write(anthropicConverter.buildContentBlockDelta(turnState.nextBlockIndex - 1, text));
+        res.write(anthropicConverter.buildContentBlockDelta(turnState.nextBlockIndex - 1, forwarded));
       }
     },
 
@@ -1002,6 +1026,11 @@ function makeTurnState() {
     // buffers. Lets the helper run multiple times per turn (e.g. at finalize
     // time AND at onTurnEnded) without re-rescuing the same hit.
     rescuedHitCount: 0,
+    // Streams text-delta content through here before writing to the wire,
+    // so `[Tool call: ...]` patterns the model emits as text never reach
+    // claude-code (the rescue path still synthesizes structured tool_use
+    // for them — this just hides the leftover bracketed text from the UI).
+    hallucinationFilter: new StreamingHallucinationFilter(),
     nextBlockIndex: 0,
     pendingToolCalls: [],   // { execMsgId, execId, toolCallId, toolName, args, anthropicToolUseId, blockIndex }
     accumulatedText: '',
