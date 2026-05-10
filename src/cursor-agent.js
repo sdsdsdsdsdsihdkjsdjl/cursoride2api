@@ -18,6 +18,7 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const config = require('./config');
 const { generateChecksum } = require('./cursor-client');
+const stallThresholds = require('./stall-thresholds');
 
 // Connect-protocol "end stream" frame flag
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -817,17 +818,39 @@ function startConversation(token, options = {}) {
   // req.setTimeout) but isn't actually advancing the turn. Without this we
   // saw 17-minute hangs after the model went silent post-thinking.
   let lastUsefulFrameAt = 0;
+  // Largest gap between useful frames observed during the current attempt.
+  // Recorded into the per-model rolling window on success so future turns
+  // get adaptive thresholds. Reset on each retry attempt — only the
+  // successful attempt's distribution should feed the threshold model.
+  let maxIdleMs = 0;
   let watchdog = null;
-  const STALL_TIMEOUT_MS = (() => {
-    const raw = process.env.CURSOR_STALL_TIMEOUT_MS;
-    // 60s default — observed thinking-mode max-effort turns kept frame
-    // gaps well under that, so 60s preserves headroom while shaving
-    // ~30s off every stall-detect cycle. Bump via env if real Cursor
-    // backends introduce longer natural pauses.
-    if (raw == null || raw === '') return 60000;
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) && n > 0 ? n : 60000;
-  })();
+
+  // Stall thresholds are per-model and adaptive — see src/stall-thresholds.js.
+  // Each Cursor model variant has its own pre-content and post-content
+  // threshold derived from a feature-based baseline (thinking? opus? max
+  // effort?), upgraded to a p99-based threshold once we have enough
+  // successful-turn samples for that model. Computed once per attempt
+  // (cached in _stallPreMs / _stallPostMs) so the watchdog tick is cheap.
+  let _stallPreMs = 0;
+  let _stallPostMs = 0;
+  let _stallSource = 'baseline';
+  function _recomputeStallThresholds() {
+    const t = stallThresholds.getThreshold(modelId);
+    _stallPreMs = t.pre;
+    _stallPostMs = t.post;
+    _stallSource = t.source;
+  }
+  // Helper: mark a useful frame. Updates the maxIdleMs running max BEFORE
+  // resetting the clock. Called from every spot where lastUsefulFrameAt was
+  // previously set to Date.now() inline.
+  function markUsefulFrame() {
+    const now = Date.now();
+    if (lastUsefulFrameAt > 0) {
+      const idle = now - lastUsefulFrameAt;
+      if (idle > maxIdleMs) maxIdleMs = idle;
+    }
+    lastUsefulFrameAt = now;
+  }
   function dumpStreamSummary(reason, code) {
     if (streamSummaryEmitted) return;
     streamSummaryEmitted = true;
@@ -905,9 +928,11 @@ function startConversation(token, options = {}) {
     // A new turn is starting — re-arm the stall watchdog. It was paused
     // when turnEndedFired flipped on at the previous turn's end; clearing
     // the flag and refreshing the timestamp gives the new turn a full
-    // STALL_TIMEOUT_MS to make progress before we trip.
+    // pre-content threshold to make progress before we trip. Also reset
+    // maxIdleMs — only the new turn's gaps should feed the per-model stats.
     turnEndedFired = false;
     lastUsefulFrameAt = Date.now();
+    maxIdleMs = 0;
     const { create, toBinary, agent } = _requireProto();
 
     // Build the content[] array of MCP items
@@ -984,7 +1009,7 @@ function startConversation(token, options = {}) {
     const msgCase = msg.message?.case;
 
     if (msgCase === 'execServerMessage') {
-      lastUsefulFrameAt = Date.now();
+      markUsefulFrame();
       const exec = msg.message.value;
       const mcpToolDefs = state.mcpToolDefs;
       handleExecMessage(exec, mcpToolDefs, sendBinaryFrame, (info) => {
@@ -997,7 +1022,7 @@ function startConversation(token, options = {}) {
       return;
     }
     if (msgCase === 'kvServerMessage') {
-      lastUsefulFrameAt = Date.now();
+      markUsefulFrame();
       handleKvMessage(msg.message.value, blobStore, sendBinaryFrame);
       return;
     }
@@ -1006,12 +1031,12 @@ function startConversation(token, options = {}) {
       const iuCase = iu.message?.case;
       const iuVal = iu.message?.value;
 
-      // Heartbeats deliberately do NOT reset lastUsefulFrameAt — they are
+      // Heartbeats deliberately do NOT mark a useful frame — they are
       // exactly what the watchdog has to ignore. Everything else is
       // forward progress, including stepStarted/Completed which are tiny
       // but indicate the model is actively working.
       if (iuCase === 'heartbeat') return;
-      lastUsefulFrameAt = Date.now();
+      markUsefulFrame();
       if (iuCase === 'textDelta') {
         const t = iuVal?.text || '';
         if (t) { hasEmittedContent = true; currentCallbacks.onTextDelta(t); }
@@ -1046,8 +1071,16 @@ function startConversation(token, options = {}) {
           `state=${capturedState ? capturedState.length + 'B' : 'null'}`
         );
         turnEndedFired = true;
+        // Record the turn's max idle gap into the per-model rolling window so
+        // future turns of this model get a data-driven threshold. Successful
+        // turns only — failed turns are not recorded (would skew p99 down).
+        try { stallThresholds.recordTurn(modelId, maxIdleMs); } catch { /* ignore */ }
         try {
-          currentCallbacks.onTurnEnded({ inputTokens, outputTokens, conversationState: capturedState });
+          currentCallbacks.onTurnEnded({
+            inputTokens, outputTokens, conversationState: capturedState,
+            maxIdleMs,
+            stallThresholdSource: _stallSource,
+          });
         } catch (e) {
           console.log(`[cursor-agent] onTurnEnded threw: ${e.message}`);
         }
@@ -1058,7 +1091,7 @@ function startConversation(token, options = {}) {
       return;
     }
     if (msgCase === 'conversationCheckpointUpdate') {
-      lastUsefulFrameAt = Date.now();
+      markUsefulFrame();
       const stateStruct = msg.message.value;
       if (stateStruct?.tokenDetails) {
         // totalTokens (used) tracks input+output combined; we keep
@@ -1077,14 +1110,14 @@ function startConversation(token, options = {}) {
       return;
     }
     if (msgCase === 'interactionQuery') {
-      lastUsefulFrameAt = Date.now();
+      markUsefulFrame();
       handleInteractionQuery(msg.message.value, sendBinaryFrame);
       return;
     }
     if (msgCase === 'execServerControlMessage') {
       // Server-side control message — counts as forward progress so the
       // watchdog doesn't trip on a stream that's actively orchestrating.
-      lastUsefulFrameAt = Date.now();
+      markUsefulFrame();
       return;
     }
 
@@ -1402,7 +1435,13 @@ function startConversation(token, options = {}) {
     // *meaningful* progress (text/thinking/exec/step/checkpoint —
     // updated in handleServerMessage) so we can detect the case where
     // Cursor's backend is heartbeating but no longer advancing.
+    //
+    // Thresholds are per-model and may be adaptive (see stall-thresholds.js).
+    // Recompute at the start of each attempt so any new samples recorded
+    // since this run started take effect.
     lastUsefulFrameAt = Date.now();
+    maxIdleMs = 0;
+    _recomputeStallThresholds();
     if (watchdog) { try { clearInterval(watchdog); } catch { /* ignore */ } }
     watchdog = setInterval(() => {
       if (closed) return;
@@ -1412,7 +1451,8 @@ function startConversation(token, options = {}) {
       // sendToolResult resets lastUsefulFrameAt as the new turn's start.
       if (turnEndedFired) return;
       const idle = Date.now() - lastUsefulFrameAt;
-      if (idle > STALL_TIMEOUT_MS) {
+      const threshold = hasEmittedContent ? _stallPostMs : _stallPreMs;
+      if (idle > threshold) {
         try { clearInterval(watchdog); } catch { /* ignore */ }
         watchdog = null;
         const msg = `Upstream stalled — no progress for ${Math.round(idle / 1000)}s`;
@@ -1424,7 +1464,7 @@ function startConversation(token, options = {}) {
         // the empty-stream case.
         failOrRetry(proto, `NGHTTP2_INTERNAL_ERROR (${msg})`, 'ERR_HTTP2_STALL');
       }
-    }, Math.min(15000, Math.floor(STALL_TIMEOUT_MS / 4)));
+    }, Math.min(15000, Math.max(5000, Math.floor(_stallPreMs / 4))));
   }
 
   // Retry-aware error handler. Auto-retries when ALL of:

@@ -16,6 +16,7 @@ const cursorAgent = require('./src/cursor-agent');
 const anthropicTools = require('./src/anthropic-tools');
 const preprocess = require('./src/preprocess');
 const debugLog = require('./src/debug-log');
+const stallThresholds = require('./src/stall-thresholds');
 debugLog.init();
 
 // Configurable "small model" used for warmup pings, compaction summarization,
@@ -639,7 +640,7 @@ function buildTurnCallbacks(ctx) {
       }
     },
 
-    onTurnEnded: ({ inputTokens, outputTokens, conversationState: newState }) => {
+    onTurnEnded: ({ inputTokens, outputTokens, conversationState: newState, maxIdleMs, stallThresholdSource }) => {
       closeOpenBlock();
 
       // NOTE: we deliberately do NOT cache `newState` to conversationStates
@@ -779,10 +780,14 @@ function buildTurnCallbacks(ctx) {
 
       stamp('turnEnded');
       stamp('respEnded');
+      const maxIdleStr = (typeof maxIdleMs === 'number')
+        ? ` | maxIdle=${Math.round(maxIdleMs)}ms src=${stallThresholdSource || 'baseline'}`
+        : '';
       console.log(
         `  ✅ turn ended | in=${inputTokens} out=${outputTokens} | ` +
         `stopReason=${stopReason} | toolCalls=${turnState.pendingToolCalls.length}` +
-        (timings ? ` | ${formatTimings(timings)}` : '')
+        (timings ? ` | ${formatTimings(timings)}` : '') +
+        maxIdleStr
       );
       debugLog.logTurnEnded(
         { request_id: requestId, conv_key: convKey, model_cursor: cursorModel },
@@ -1338,6 +1343,7 @@ app.get('/health', (req, res) => {
     tokens: tokenPool.stats(),
     tokenCount: tokenPool.size(),
     defaultModel: DEFAULT_MODEL,
+    stallThresholds: stallThresholds.getStats(),
     version: '2.0.0',
   });
 });
