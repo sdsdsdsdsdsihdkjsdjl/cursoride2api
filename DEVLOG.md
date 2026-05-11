@@ -1103,9 +1103,15 @@ Startup banner shows the current setting: `💭 Thinking blocks: OFF (portable)`
 
 ---
 
-## ChatService migration (experimental, account-gated)
+## ChatService migration — attempted, blocked, reverted
 
-**Goal**: enable cross-turn thinking continuity by switching the proxy's wire transport from `agent.v1.AgentService/Run` to `aiserver.v1.ChatService/StreamUnifiedChatWithTools` — the RPC Cursor IDE itself uses internally for its chat panel. The agent transport strips Anthropic's signed thinking blocks (no signature field exists in its `ThinkingDeltaUpdate` message); the chat transport's `ConversationMessage.Thinking` has explicit `text`, `signature`, `redacted_thinking`, and `is_last_thinking_chunk` fields, preserving signatures end-to-end.
+**Record of an investigation, not a feature shipped.** The code that backed
+this section was added in commit `868aa95` and removed shortly after when
+the blocker below was confirmed. Findings preserved here so the next
+person investigating thinking continuity through this proxy doesn't repeat
+the discovery loop.
+
+**Goal:** enable cross-turn thinking continuity by switching the proxy's wire transport from `agent.v1.AgentService/Run` to `aiserver.v1.ChatService/StreamUnifiedChatWithTools` — the RPC Cursor IDE itself uses internally for its chat panel. The agent transport strips Anthropic's signed thinking blocks (no signature field exists in its `ThinkingDeltaUpdate` message); the chat transport's `ConversationMessage.Thinking` has explicit `text`, `signature`, `redacted_thinking`, and `is_last_thinking_chunk` fields, preserving signatures end-to-end.
 
 **What we built:**
 
@@ -1189,38 +1195,28 @@ plus signed-thinking continuity is part of their paid "Background Agents"
 feature, billed per team. Tokens minted from a free or unaffiliated account
 get a 403-style refusal.
 
-**Status of the work:**
+**Why the code was reverted:**
 
-- `chat_pb.mjs`, `cursor-chat.js`, and the wiring are in tree behind the
-  `CURSOR_USE_CHAT_SERVICE=1` env flag. Default off. Default behavior
-  (AgentService path) unchanged.
-- If a future deployment uses a token that has the entitlement (a paid
-  team account where the user has admin or chat access), flipping the env
-  flag should Just Work for tool-less text+thinking turns.
-- The error message is surfaced verbatim through `[cursor-chat] trailer: ...`
-  logging so an upgrade path is observable.
+The engineering was structurally complete and would Just Work for an
+entitled token, but it added ~5500 lines (mostly the generated proto) to
+a repo with no working users. Leaving it dormant is bloat. Cleaner to
+remove and reconstruct from this record if/when an entitled token shows
+up. The commits to consult:
+
+- `868aa95` — the full migration: proto module, client, wiring, signature
+  delta converter, env flag.
+- `5ec721f` — the corresponding docs.
+
+Re-add by `git cherry-pick 868aa95 5ec721f` from a branch off that point
+if the entitlement is later granted.
 
 **What's still future work even if the entitlement is granted:**
 
-- **Tool support on the chat path.** `ClientSideToolV2*` types are in
-  `chat_pb.mjs` but the request-side population (mapping Anthropic's
-  `tools[]` to Cursor's per-tool envelopes) wasn't implemented. Tool turns
-  currently fall back to AgentService automatically (`mcpTools.length > 0`
-  → AgentService).
-- **Response-side tool extraction.** When the model on the chat path emits
-  a tool call, we'd need to decode it from the `ConversationMessage`
-  response and synthesize an Anthropic `tool_use` block.
-- **Tool-result feedback.** The wrapper has a slot
-  (`client_side_tool_v2_result` at field 2) but the per-call wire shape
-  needs reverse-engineering from real Cursor IDE traffic with tools
-  enabled.
+- **Tool support on the chat path.** `ClientSideToolV2*` types were in the proto but the request-side population (mapping Anthropic's `tools[]` to Cursor's per-tool envelopes) wasn't implemented. The reverted client fell back to AgentService for tool turns.
+- **Response-side tool extraction.** Decoding tool calls from `ConversationMessage` and synthesizing Anthropic `tool_use` blocks.
+- **Tool-result feedback.** The wrapper has a slot (`client_side_tool_v2_result`, field 2) but the per-call wire shape needs reverse-engineering from real Cursor IDE traffic with tools enabled.
 
-**Bottom line.** The engineering migration is structurally complete; the
-blocker is an external entitlement Cursor controls. For accounts that lack
-it, the AgentService path remains the only viable transport — and is the
-default. The codepath is checked in for the day the entitlement becomes
-available, with a clear opt-in flag and a verbose error trailer to make the
-gating immediately observable.
+**Lesson for future attempts.** Before building a parallel transport, **probe the auth surface with a 10-line throwaway script** — POST an empty Connect-framed body to the target RPC and read the error trailer. A 30-second probe against `aiserver.v1.ChatService` would have surfaced `ERROR_UNAUTHORIZED` immediately and saved the multi-hour proto+client build. The fact that a peer project (JiuZ-Chn) successfully uses the RPC is not generalizable evidence that *your* token will — they have (or had) an entitled account.
 
 ---
 

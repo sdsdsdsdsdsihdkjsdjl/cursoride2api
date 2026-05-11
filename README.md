@@ -190,8 +190,6 @@ for chunk in resp:
 | `CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT` | _(自动)_ | 全局覆盖 post-content stall 阈值；同上 |
 | `CURSOR_FORCE_THINKING` | _(空)_ | `on`/`off`/`adaptive` — 全局覆盖客户端的 `thinking.type` |
 | `CURSOR_EMIT_THINKING_BLOCKS` | _(空=off)_ | `1` 时输出 `thinking` 内容块（缺签名，会破坏切换到真实 Anthropic API 的会话续传）。默认关闭以保证可移植性 |
-| `CURSOR_USE_CHAT_SERVICE` | _(空=off)_ | 实验性：`1` 时通过 `aiserver.v1.ChatService.StreamUnifiedChatWithTools` 而非 `agent.v1.AgentService.Run` 路由请求，以保留 Anthropic 思考块签名（实现思考连续性）。**需要 Cursor 团队层级的 "cloud agents" 权限**；未授权账户会收到 `ERROR_UNAUTHORIZED` 错误。当前只支持无工具的请求；带工具的请求自动回退到 AgentService。详见 [DEVLOG.md](DEVLOG.md) 的 "ChatService migration" 章节。 |
-| `CURSOR_CHAT_RPC_PATH` | `/aiserver.v1.ChatService/StreamUnifiedChatWithTools` | 实验性：ChatService 模式下覆盖 RPC 路径（可指向 `StreamUnifiedChat` 等变体）。 |
 | `RUNTIME_STATS_FILE` | `./logs/runtime-stats.json` | 运行时统计持久化文件路径 |
 | `RUNTIME_STATS_PERSIST_MS` | `60000` | 统计快照写盘间隔 (ms) |
 | `RUNTIME_STATS_RECENT` | `1000` | 滚动窗口大小（用于时间分桶视图） |
