@@ -19,6 +19,23 @@ const debugLog = require('./src/debug-log');
 const stallThresholds = require('./src/stall-thresholds');
 const runtimeStats = require('./src/runtime-stats');
 const { StreamingHallucinationFilter } = require('./src/streaming-hallucination-filter');
+
+// Thinking-block emission. Off by default: sessions created via this proxy
+// must remain portable to direct-Anthropic clients (real Claude API). Real
+// Anthropic rejects assistant messages whose thinking blocks lack a valid
+// server-issued cryptographic signature — and we can't forge that signature
+// because we don't have Anthropic's signing key, and Cursor's upstream
+// provider doesn't pass the original signatures back to us.
+//
+// Trade-off when off: claude-code's `✻ Cogitated for Xs (ctrl+o to expand)`
+// collapsed display disappears. The model's actual response is unaffected,
+// only the visible-reasoning UI. The hallucination rescue still scans the
+// internal thinking buffer for `[Tool call: ...]` patterns, so structural
+// protection isn't lost.
+//
+// Opt back in with CURSOR_EMIT_THINKING_BLOCKS=1 if you don't intend to
+// resume the session against direct Anthropic.
+const _emitThinkingBlocks = process.env.CURSOR_EMIT_THINKING_BLOCKS === '1';
 debugLog.init();
 
 // Configurable "small model" used for warmup pings, compaction summarization,
@@ -697,6 +714,17 @@ function buildTurnCallbacks(ctx) {
     },
 
     onThinkingDelta: (text) => {
+      // ALWAYS append to the detection buffer so the hallucination rescue
+      // path can find `[Tool call: ...]` patterns the model may have
+      // emitted inside the thinking block. This buffer is internal-only.
+      turnState.emittedThinkingForDetection += text;
+
+      // Drop thinking content from the API response by default. Anthropic's
+      // thinking blocks require a server-issued signature we cannot
+      // produce; emitting them poisons sessions against direct-Anthropic
+      // resume (see `_emitThinkingBlocks` comment at the top of this file).
+      if (!_emitThinkingBlocks) return;
+
       if (turnState.textBlockOpen) closeOpenBlock();
       if (!turnState.thinkingBlockOpen) {
         const idx = turnState.nextBlockIndex++;
@@ -710,10 +738,6 @@ function buildTurnCallbacks(ctx) {
       if (!isStream) {
         turnState.accumulatedThinking += text;
       }
-      // Always append to the hallucination-detection buffer so the rescue
-      // catches `[Tool call: ...]` patterns the model emitted inside a
-      // thinking block (rare but observed).
-      turnState.emittedThinkingForDetection += text;
       if (isStream && !res.writableEnded) {
         res.write(anthropicConverter.buildContentBlockDeltaThinking(turnState.nextBlockIndex - 1, text));
       }
@@ -1646,6 +1670,7 @@ app.listen(PORT, HOST, () => {
   if (debugLog.isEnabled()) {
     console.log(`  ║  📝 Debug: ${(debugLog.isVerbose() ? 'verbose' : 'on').padEnd(31)}║`);
   }
+  console.log(`  ║  💭 Thinking blocks: ${(_emitThinkingBlocks ? 'ON (non-portable)' : 'OFF (portable)').padEnd(21)}║`);
   console.log('  ╚═══════════════════════════════════════════╝');
   console.log('');
 });
