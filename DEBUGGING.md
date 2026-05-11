@@ -79,6 +79,35 @@ watch -n 2 'curl -s http://localhost:4141/health | jq .tokens'
 
 Combine with the log monitor: log gives you turn events, `/health` gives you cumulative counters and parking state.
 
+### Watch live in-flight bridges — is this turn thinking, or stuck?
+
+`/stats/inflight` exposes the live state of every active bridge — the question "right now, is upstream silent or making progress?" gets a one-curl answer.
+
+```bash
+watch -n 2 'curl -s http://localhost:4141/stats/inflight | jq ".bridges[0]"'
+```
+
+Decision rule reading the fields:
+
+- `thinkingDeltaCount` or `textDeltaCount` rising between polls → model is producing, wait
+- both flat **and** `bytesInSinceLastUsefulFrame` ≈ 0 → only heartbeats are flowing, upstream is silent
+- `willTripStallInMs` shows how long until the watchdog will declare a stall and emit the SSE error / retry
+
+### Pull per-model latency distributions to retune thresholds
+
+```bash
+# All models, lifetime aggregates
+curl -s http://localhost:4141/stats | jq '.groups'
+
+# Mode breakdown for the last hour
+curl -s 'http://localhost:4141/stats?window=last1h&groupBy=modelMode' | jq '.groups'
+
+# Connection lifecycle: who's churning, why
+curl -s http://localhost:4141/stats/connections | jq '{closeReasonCounts, lifetimeMs, streamsPerConnection, perSlot}'
+```
+
+The point of these endpoints is that `src/stall-thresholds.js` baselines were derived from intuition; with a week of real `firstFrameMs.p99` and `maxIdleMs.p99` data per model, you can rebuild the formula from evidence.
+
 ### Get a per-request timing breakdown
 
 The proxy already logs a structured timing line on each turn end:

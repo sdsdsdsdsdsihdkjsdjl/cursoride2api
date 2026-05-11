@@ -177,12 +177,24 @@ for chunk in resp:
 | `TOKEN_RATE_LIMIT_PARK_MS` | `60000` | Token 命中 429 后冷却时长 (ms) |
 | `DEBUG_LOG` | _(空=关)_ | `1` 写错误日志到 `logs/`；`verbose` 也记录请求体 |
 | `DEBUG_LOG_DIR` | `./logs` | 日志目录覆盖 |
+| `CURSOR_AGENT_DEBUG` | _(空=关)_ | `1` 启用 cursor-agent 调试日志（pool/recycler 事件等） |
 | `TOOL_INCLUDE` | _(空)_ | Anthropic 工具白名单（按工具名） |
 | `TOOL_LIMIT` | `0` | 工具数量上限 |
 | `TOOL_DESC_LIMIT` | `600` | 工具描述截断长度（字符） |
 | `TOOL_SCHEMA_TRIM_BYTES` | `30000` | 总 schema 超过此值则剥离 properties[].description |
 | `SMALL_MODEL` | `claude-sonnet-4-6` | 用于 compact / haiku 升级的小模型 |
 | `SUBAGENT_USE_SMALL_MODEL` | _(空)_ | `1` 时把 subagent 流量也降级到 `SMALL_MODEL` |
+| `H2_POOL_SIZE` | `3` | HTTP/2 客户端连接池大小 |
+| `CURSOR_POOL_MAX_IDLE_MS` | `300000` | 空闲池连接自动回收阈值 (ms)；防止 LB 静默轮转造成的级联失败 |
+| `CURSOR_STALL_TIMEOUT_MS` | _(自动)_ | 全局覆盖按模型计算的 pre-content stall 阈值；通常不需要 — 让 `src/stall-thresholds.js` 按模型推导 |
+| `CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT` | _(自动)_ | 全局覆盖 post-content stall 阈值；同上 |
+| `CURSOR_FORCE_THINKING` | _(空)_ | `on`/`off`/`adaptive` — 全局覆盖客户端的 `thinking.type` |
+| `CURSOR_EMIT_THINKING_BLOCKS` | _(空=off)_ | `1` 时输出 `thinking` 内容块（缺签名，会破坏切换到真实 Anthropic API 的会话续传）。默认关闭以保证可移植性 |
+| `RUNTIME_STATS_FILE` | `./logs/runtime-stats.json` | 运行时统计持久化文件路径 |
+| `RUNTIME_STATS_PERSIST_MS` | `60000` | 统计快照写盘间隔 (ms) |
+| `RUNTIME_STATS_RECENT` | `1000` | 滚动窗口大小（用于时间分桶视图） |
+| `RUNTIME_STATS_CONN_RING` | `500` | 连接事件环形缓冲区大小 |
+| `RUNTIME_STATS_LOG_INTERVAL_MS` | _(空=关)_ | 定期输出 `📈 runtime/last1h` 摘要行的间隔；用于长跑部署 |
 
 ## 🗺️ 模型映射
 
@@ -199,6 +211,28 @@ for chunk in resp:
 | `gemini-pro` | `gemini-3.1-pro` |
 
 > 💡 也可直接传 Cursor 原生模型名 (如 `composer-2`、`claude-4.5-sonnet-thinking`)，会直接透传。
+
+## 📊 观测端点 / Observability Endpoints
+
+代理内置一组只读 stats 端点，方便诊断和调参：
+
+| 端点 | 用途 |
+|------|------|
+| `GET /health` | 紧凑健康检查（token 池、stall 阈值、连接计数、最近一小时统计汇总） |
+| `GET /stats` | 按模型聚合的运行时统计（t-digest 分位数 + 计数器）。支持 `?window=last1h\|last24h\|<ms>`、`?model=<id>`、`?groupBy=model\|modelMode\|mode` |
+| `GET /stats/connections` | HTTP/2 连接池生命周期：每连接寿命、复用流数、关闭原因分布、每槽 churn |
+| `GET /stats/inflight` | 实时在飞 bridge 状态：`idleMsSinceLastUsefulFrame`、`currentThresholdMs`、`willTripStallInMs`、文本/思考 delta 计数、字节流。用于回答"现在这个 turn 是在思考还是卡住了？" |
+
+示例：
+
+```bash
+# 看看 opus-4-7-thinking-max 在 stream-continuation 模式下最近一小时的延迟分位
+curl 'http://localhost:4141/stats?window=last1h&groupBy=modelMode' \
+  | jq '.groups | with_entries(select(.key | startswith("claude-opus-4-7-thinking-max|stream|cont")))'
+
+# 实时盯一个可能卡住的 bridge
+watch -n 2 'curl -s http://localhost:4141/stats/inflight | jq ".bridges[0]"'
+```
 
 ## 🏗️ 技术原理
 

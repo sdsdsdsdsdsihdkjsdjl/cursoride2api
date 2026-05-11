@@ -947,6 +947,160 @@ What we explicitly chose **not** to copy:
 
 When chasing stalls, slow turns, or "stuck" sessions, the high-leverage move is to start the proxy in the background with logs to a file, then live-tail-and-filter for turn lifecycle markers (`📨` / `✅ turn ended` / `❌` / `Upstream stalled` / `pool slot` / `429` etc.). One notification per real event; silence between `📨` and `✅` is itself the signal. The grep alternation must cover failure modes — silence is not success. See [DEBUGGING.md](DEBUGGING.md) for the recipe and the list of bugs we caught with it.
 
+For *live* in-flight diagnosis (is this turn thinking, or stuck?), `GET /stats/inflight` exposes each active bridge's `idleMsSinceLastUsefulFrame`, `currentThresholdMs`, `willTripStallInMs`, `textDeltaCount`, `thinkingDeltaCount`, and `bytesInSinceLastUsefulFrame`. Decision rule: if delta counts rise between polls, the model is producing; if they're flat and `bytesInSinceLastUsefulFrame` is also flat, only heartbeats are flowing and the watchdog will trip in `willTripStallInMs`.
+
+---
+
+## Resilience: per-model adaptive stall thresholds + cascade backoff + idle pool recycling
+
+The single 60-second (later 120-second) stall watchdog was simultaneously too aggressive for heavy `claude-opus-4-7-thinking-max` turns (false stalls during legitimate long reasoning pauses) and too lax for fast non-thinking variants. Replaced with a two-layer scheme in `src/stall-thresholds.js`:
+
+**Layer 1 — feature-derived baseline.** Parse the Cursor model name into `isThinking`, `isOpus`, `effort` and compute thresholds from a small formula. Always available without warm-up:
+
+| Model | pre-content / post-content |
+|---|---|
+| `claude-opus-4-7-thinking-max` | 180 s / 270 s |
+| `claude-opus-4-7-thinking-medium` | 150 s / 225 s |
+| `claude-opus-4-7-max` (non-thinking) | 120 s / 180 s |
+| `claude-4.5-sonnet-thinking` | 120 s / 180 s |
+| `claude-4.5-sonnet` (non-thinking) | 60 s / 90 s |
+
+**Layer 2 — adaptive p99.** Each successful turn records its `maxIdleMs` (longest gap between useful frames) into a per-model rolling window of 50 samples. Once ≥20 samples for a model, the threshold becomes `max(MIN_PRE_MS, p99 × multiplier)`, clamped to `baseline × 2`. PRE_MULTIPLIER = 1.5, POST_MULTIPLIER = 2.5 (post-content stalls are expensive to retry — the partial response is already on the wire and the Anthropic SDK throws on mid-stream `event: error` — so we wait substantially longer there).
+
+**Stall-driven elevation.** Adaptive p99 is steady-state and slow to react to transient outages. Layered on top: each watchdog trip multiplies the model's threshold by `ELEVATION_BUMP` (1.5, capped at 4.0). A successful turn resets it. While quiet, elevation decays exponentially with `ELEVATION_DECAY_TAU_MS` = 5 min. Hard ceiling at `baseline × 4` so a runaway elevation can't hide a real hang indefinitely.
+
+Concrete trajectory for three consecutive stalls on opus-thinking-max (`baseline = 180 s`):
+
+| Attempt | Elevation | Effective pre-content threshold |
+|---|---|---|
+| 1 (cold) | 1.0× | adaptive p99 × 1.5 (typically ~45 s for fast streams) |
+| 2 (after 1st stall) | 1.5× | bumped from previous |
+| 3 (after 2nd stall) | 2.25× | further bumped |
+| 4 (after 3rd stall) | 3.375× | further bumped |
+| 5+ | 4.0× (cap) | up to `baseline × 4` = 720 s |
+| Any success | 1.0× | snaps back |
+
+**Cascade-aware retry backoff.** Bumped `MAX_REQUEST_RETRIES` from 3 → 5 with schedule `[100, 250, 750, 2000, 5000]` ms (~8 s total window). When two consecutive errors are both transport-level (`REFUSED_STREAM` / `GOAWAY` / `INTERNAL_ERROR`), the LB is in a real cascade — double the next backoff (capped at 8 s). Was: 3 retries in ~1 s. The wider gap gives Cursor's load balancer time to actually stabilize. Verified end-to-end: a real cascade observed in production exhausted retries in ~1 s; the new schedule rides through it.
+
+**Idle pool recycling.** Pre-warmed pool clients sat idle indefinitely under the previous design. Cursor's LB silently rotates connections under us — they look "open" from Node's POV but the LB has decided they're toast, so the first write returns `REFUSED_STREAM` with no `goaway` event firing. New background timer (every 60 s, `.unref()`-ed) closes any slot whose `_poolLastUsedAt` is older than `POOL_MAX_IDLE_MS` (5 min default, `CURSOR_POOL_MAX_IDLE_MS` to override). Eliminates the "first request after quiet period" cascade that used to require multiple caller-level retries to recover from.
+
+---
+
+## Runtime statistics: t-digest-backed per-mode + connection lifecycle aggregates
+
+Lives in `src/runtime-stats.js`. Persists to `logs/runtime-stats.json` (override path with `RUNTIME_STATS_FILE`); snapshotted every 60 s when dirty and on graceful shutdown. Schema-versioned (v2 currently); old schemas are dropped on load and rebuild.
+
+**Per-turn records** capture: `model`, `outcome` (`success`/`fail`), `isStream`, `isContinuation`, `durationMs`, `firstFrameMs`, `firstTextMs`, `firstToolMs`, `maxIdleMs`, `retries`, `transportErrors`, `stalls`, `cascadeDetected`, `toolCount`, `inputTokens`, `outputTokens`. Counters reset at every new-turn boundary in cursor-agent.js so values reflect just *this* turn (not the bridge's lifetime).
+
+**Aggregations** — two parallel maps, both updated atomically per record:
+
+- `byModel` — counters + t-digests keyed by model alone. Per-model lifetime totals.
+- `byModelMode` — same shape, keyed by `${model}|${stream|nonstream}|${fresh|cont}`. Lets you ask "what's `firstFrameMs.p95` for `claude-opus-4-7-thinking-max` in stream-continuation mode."
+
+For each model (or model+mode), the digests compute `p50`, `p95`, `p99`, and the counters give `successRate`, `firstTryRate` (success without any retry), `totalRetries`, `totalStalls`, `totalTransportErrors`, `totalCascades`, `totalToolCalls`.
+
+Library: [`tdigest`](https://www.npmjs.com/package/tdigest) (pure JS, ~1 KB per digest, accurate at the tail, serializes to centroids array). Chosen over HdrHistogram because we don't need to declare a value range upfront and the merge operation (used in time-windowed views) is trivial.
+
+**Time-windowed views.** A ring buffer (`recent`, last 1000 records by default; `RUNTIME_STATS_RECENT` to override) is replayed on demand for `?window=last1h` / `?window=last24h` / `?window=<ms>`. Lifetime view uses the pre-aggregated digests directly — O(1).
+
+**Connection lifecycle** is tracked separately in `runtimeStats.connections`. Each pool client gets an open/close event; on close we record `ageMs`, `streamsServed`, `streamErrors`, `closeReason` (one of `goaway` / `error` / `closed` / `idle-recycle` / `poison`). Aggregates: t-digest of lifetimes, t-digest of streams-served-per-connection, counter per close reason, per-slot churn snapshot.
+
+Endpoints:
+
+```
+GET /stats                                  # per-model lifetime
+GET /stats?window=last1h&groupBy=modelMode  # mode breakdown for last hour
+GET /stats?groupBy=mode                     # aggregated across models
+GET /stats?model=<id>                       # single-model filter
+GET /stats/connections                      # connection lifecycle + recent events
+GET /stats/inflight                         # live state for in-flight bridges
+GET /health                                 # adds compact last-1h totals + connection counters
+```
+
+Periodic log line every `RUNTIME_STATS_LOG_INTERVAL_MS` (off by default; useful in long-running deployments):
+
+```
+📈 runtime/last1h | turns=47 succ=95.7% firstTry=89.4% retries=8 stalls=2 cascades=1 | top opus-4-7-thinking-max: 32 (p95dur=14200ms p95first=2120ms)
+```
+
+The point of this whole apparatus: when stall thresholds need tuning, you should re-derive them from real `maxIdleMs.p99` per model rather than from my intuition. Pull `/stats?groupBy=modelMode` after a week of real traffic.
+
+---
+
+## Hallucination rescue v2: mixed-mode + streaming text suppression
+
+**The bug.** Cursor's model occasionally falls out of structured-tool-use mode and emits a tool call as TEXT instead — `[Tool call: Read({"path":"/foo"})]` as a plain content delta. Real Claude Code's UI doesn't render anything that looks like that; the appearance of bracketed text is itself the hallucination signal. claude-code displays it verbatim and the tool never actually runs, so the conversation stalls.
+
+Worse, the bracketed text often uses subtly-wrong schemas: `path` instead of `file_path` for Read/Write, `contents` instead of `content`, `old`/`new` instead of `old_string`/`new_string`. The model is making up the schema because it doesn't actually have the tool registered (or thinks it has a different one).
+
+**The original rescue** (described elsewhere in this DEVLOG) parsed `emittedTextForDetection` at `onTurnEnded`, synthesized `tool_use` blocks via `parseHallucinatedToolCalls` + `canonicalizeHallucinatedToolName` (`AskQuestion`→`AskUserQuestion`, `Shell`→`Bash`) + `normalizeHallucinatedToolArgs` (the schema fixups above) — see `src/anthropic-tools.js:436-598`. Worked for pure-hallucination turns but had **three gates that silently skipped it** in mixed-mode (real-tool-use + hallucinated-text-in-same-turn) cases.
+
+### Gate 1: `toolUseFinished` early-return
+
+When a real `tool_use` block arrived from Cursor, `finalizeToolUseTurn` fired after a 250 ms debounce (or immediately on `stepCompleted`), set `toolUseFinished = true`, and wrote `message_delta(stop_reason=tool_use)` + `message_stop` + `res.end()` — closing the response. `onTurnEnded`, when it later fired, hit `if (turnState.toolUseFinished) return;` *before* reaching the rescue check. Hallucinated text in the same turn was unrescuable.
+
+### Gate 2: `pendingToolCalls.length === 0`
+
+Even without finalize, the rescue scanner was gated on "zero real tool calls in this turn." Any real tool call → rescue skipped → hallucinated text left as text.
+
+### Gate 3: thinking content invisible to the scanner
+
+`emittedTextForDetection` was populated only by `onTextDelta`. If the model emitted `[Tool call: ...]` inside a thinking block, it went into `emittedThinkingForDetection` (or nowhere) — never scanned.
+
+### The fix
+
+Extracted the rescue body into `tryRescueHallucinatedToolCalls()` — a closure helper inside `buildTurnCallbacks` that:
+
+1. Concatenates both `emittedTextForDetection` and `emittedThinkingForDetection`.
+2. Uses a `rescuedHitCount` watermark on `turnState` so it's idempotent — calling it multiple times per turn doesn't re-rescue the same hits.
+3. Dedups by `(toolName, args)` against existing `pendingToolCalls`. So if the model emits a real `tool_use` AND a textual `[Tool call: X]` for the *same* call with the same args, we don't synthesize a duplicate.
+
+Called from two sites:
+
+- **Inside `finalizeToolUseTurn`**, *before* `toolUseFinished = true` and the final `message_delta`/`message_stop` writes. This is the mixed-mode case: real tool calls trigger finalize; we run rescue first so synthesized blocks ride out on the same response.
+- **Inside `onTurnEnded`** (replacing the old inline block). This handles the text-only-hallucination case where finalize doesn't fire.
+
+### Streaming text suppression
+
+After the structural rescue worked, the bracketed text was *still* visible in claude-code's UI — synthesized `tool_use` blocks ran the tool correctly, but the model's original `[Tool call: ...]` text was already on the wire. New module `src/streaming-hallucination-filter.js` adds a small streaming-text filter:
+
+- Text without `[` flows through immediately.
+- Text starting with `[` is held back until the next chars either (a) disambiguate against the `[Tool call: ` prefix → flush, or (b) complete a `[Tool call: NAME({...})]` pattern → drop the matched span, flush surrounding text.
+- Latency: at most one delta's worth.
+- Bounded buffer (64 KB default) — if a `[` opens but never closes within that, we leak rather than swallow unbounded content.
+- The full raw text still goes into `emittedTextForDetection` so the structural rescue sees what to rescue. The filter only suppresses the wire output.
+
+End-to-end: hallucinated `[Tool call: Read({"path":"/foo"})]` → suppressed from the wire → structural rescue synthesizes a `tool_use(Read, {file_path: "/foo"})` → claude-code displays only the tool result. Matches real Claude Code's UX.
+
+19/19 unit tests pass (`src/streaming-hallucination-filter.js` standalone), including the user's reported 3-sequential-identical-patterns case.
+
+---
+
+## Thinking blocks: dropped by default for cross-provider portability
+
+Sessions started via this proxy previously contained `thinking` content blocks in claude-code's stored history *without a valid signature*. Anthropic's extended-thinking spec requires a server-issued cryptographic MAC on every thinking block; without it, the API rejects subsequent requests with `400 messages.N.content.M: Invalid signature in thinking block` when the conversation is resumed.
+
+We cannot forge that signature — only Anthropic can sign — and Cursor's upstream Anthropic provider does not forward the original signatures to us over the `agent.v1.AgentService/Run` protocol. We receive `thinkingDelta` text frames but no companion signature frame.
+
+So:
+
+- **Emit thinking blocks** → sessions are poisoned against direct-Anthropic resume.
+- **Drop thinking blocks** → claude-code's `✻ Cogitated for Xs (ctrl+o to expand)` collapsed UI display disappears, but sessions stay portable.
+
+Default is now drop (`_emitThinkingBlocks = false` unless `CURSOR_EMIT_THINKING_BLOCKS=1`). Implementation in `server.js`:
+
+- `onThinkingDelta` always appends to the internal `emittedThinkingForDetection` buffer (so the hallucination rescue still scans thinking content for `[Tool call: ...]` patterns).
+- When `_emitThinkingBlocks` is false, the callback returns *before* writing any `content_block_start_thinking` / `content_block_delta_thinking` to the wire.
+- Non-streaming responses already never emit thinking blocks (the response builder only includes text + tool_use blocks).
+
+Startup banner shows the current setting: `💭 Thinking blocks: OFF (portable)` / `ON (non-portable)`.
+
+**Functionally lost: nothing** within the proxy path. The model's reasoning still happens upstream at Cursor's provider and influences the visible response text. Cross-turn thinking continuity through this proxy was already non-existent: `anthropicMessagesToPrompt` silently drops thinking blocks on the inbound side (no handler in the type switch at `src/anthropic-converter.js:331-410`), so Cursor never saw prior thinking blocks even when claude-code stored them. The proxy was always thinking-blind on inbound.
+
+**Functionally lost: only the cosmetic UI** in claude-code's display. The model's reasoning still happens; you just don't see it as a collapsed block.
+
+**Functionally gained:** cross-provider portability. Switch `ANTHROPIC_BASE_URL` from this proxy to `api.anthropic.com` mid-session and `claude --continue` works.
+
 ---
 
 ## Future work / open issues
