@@ -13,6 +13,16 @@ const converter = require('./src/converter');
 const anthropicConverter = require('./src/anthropic-converter');
 const config = require('./src/config');
 const cursorAgent = require('./src/cursor-agent');
+const cursorChat = require('./src/cursor-chat');
+
+// Experimental: route /v1/messages through aiserver.v1.ChatService instead
+// of agent.v1.AgentService when set. ChatService preserves signed thinking
+// blocks (Cursor IDE's own transport) — that's the only reason this exists.
+// Tools are NOT supported on the chat path yet (reverse-engineering of the
+// tool wire shape is future work); when this flag is on, requests containing
+// tools fall back to cursor-agent automatically. See DEVLOG.md for the
+// "ChatService migration" section.
+const _useChatService = process.env.CURSOR_USE_CHAT_SERVICE === '1';
 const anthropicTools = require('./src/anthropic-tools');
 const preprocess = require('./src/preprocess');
 const debugLog = require('./src/debug-log');
@@ -471,7 +481,13 @@ function buildTurnCallbacks(ctx) {
     // tokenPool.release(token, ...); release() is idempotent so the
     // res.on('close') backstop on the original handler is still safe.
     token,
+    // Force thinking-block emission on this turn even if the global
+    // `_emitThinkingBlocks` is off. Set true by the ChatService path
+    // because the signatures we forward on that path are real (and
+    // therefore safe for cross-provider session resume).
+    forceEmitThinking = false,
   } = ctx;
+  const emitThinkingBlocks = forceEmitThinking || _emitThinkingBlocks;
   function stamp(name) {
     if (timings && timings.t0 != null && timings[name] == null) {
       timings[name] = Date.now() - timings.t0;
@@ -721,9 +737,11 @@ function buildTurnCallbacks(ctx) {
 
       // Drop thinking content from the API response by default. Anthropic's
       // thinking blocks require a server-issued signature we cannot
-      // produce; emitting them poisons sessions against direct-Anthropic
-      // resume (see `_emitThinkingBlocks` comment at the top of this file).
-      if (!_emitThinkingBlocks) return;
+      // produce on the AgentService path; emitting them poisons sessions
+      // against direct-Anthropic resume (see `_emitThinkingBlocks` comment
+      // at the top of this file). The ChatService path passes
+      // `forceEmitThinking: true` because it provides real signatures.
+      if (!emitThinkingBlocks) return;
 
       if (turnState.textBlockOpen) closeOpenBlock();
       if (!turnState.thinkingBlockOpen) {
@@ -740,6 +758,20 @@ function buildTurnCallbacks(ctx) {
       }
       if (isStream && !res.writableEnded) {
         res.write(anthropicConverter.buildContentBlockDeltaThinking(turnState.nextBlockIndex - 1, text));
+      }
+    },
+
+    // ChatService-only: a signed-thinking signature arrived for the
+    // currently-open thinking block. Emit as a `signature_delta` SSE
+    // event inside the same content block so claude-code stores it
+    // with the thinking text — that's what makes the conversation
+    // resumable against direct Anthropic later.
+    onSignatureDelta: (signature) => {
+      if (!emitThinkingBlocks) return;
+      if (!turnState.thinkingBlockOpen) return;
+      if (!signature) return;
+      if (isStream && !res.writableEnded) {
+        res.write(anthropicConverter.buildContentBlockDeltaSignature(turnState.nextBlockIndex - 1, signature));
       }
     },
 
@@ -1215,6 +1247,9 @@ async function handleFreshTurn(req, res, token, params) {
   // Forward declaration — `bridge` is assigned below but the callbacks need
   // a stable getter so `getBridge()` returns the right object.
   let bridge = null;
+  // ChatService path: signatures arrive from upstream so thinking blocks
+  // are safe to emit regardless of the global `_emitThinkingBlocks` flag.
+  const useChatHerePreview = _useChatService && (mcpTools.length === 0);
   const callbacks = buildTurnCallbacks({
     res, isStream, turnState,
     convKey, bridgeKey, conversationId, sessionId,
@@ -1224,25 +1259,50 @@ async function handleFreshTurn(req, res, token, params) {
     isContinuation: false,  // fresh-turn handler
     timings,
     token,
+    forceEmitThinking: useChatHerePreview,
   });
 
-  bridge = cursorAgent.startConversation(token, {
-    prompt,
-    modelId: cursorModel,
-    conversationId,
-    conversationState,
-    tools: mcpTools,
-    // Reuse the per-bridge sessionId we already minted for tool_use_id
-    // encoding: it now also serves as the IDE-style x-session-id header
-    // so Cursor's backend can schedule this stream independently.
-    sessionId,
-    onTextDelta: callbacks.onTextDelta,
-    onThinkingDelta: callbacks.onThinkingDelta,
-    onMcpCall: callbacks.onMcpCall,
-    onStepCompleted: callbacks.onStepCompleted,
-    onTurnEnded: callbacks.onTurnEnded,
-    onError: callbacks.onError,
-  });
+  // Routing decision: ChatService vs AgentService.
+  //
+  // ChatService preserves signed thinking blocks end-to-end (Anthropic's
+  // extended-thinking spec) but doesn't (yet) carry tool calls in this
+  // implementation. We route here when:
+  //   (a) the user opted in via CURSOR_USE_CHAT_SERVICE=1, AND
+  //   (b) the request has no registered tools (mcpTools.length === 0).
+  // Otherwise we use the battle-tested AgentService.Run path below.
+  const useChatHere = _useChatService && (mcpTools.length === 0);
+  if (useChatHere) {
+    bridge = cursorChat.startConversation(token, {
+      messages, system,
+      modelId: cursorModel,
+      conversationId,
+      sessionId,
+      onTextDelta: callbacks.onTextDelta,
+      onThinkingDelta: callbacks.onThinkingDelta,
+      onSignatureDelta: callbacks.onSignatureDelta,
+      onTurnEnded: callbacks.onTurnEnded,
+      onError: callbacks.onError,
+    });
+    console.log(`  💭 routed via ChatService (signed thinking preserved) | sessionId=${sessionId.slice(0,8)}`);
+  } else {
+    bridge = cursorAgent.startConversation(token, {
+      prompt,
+      modelId: cursorModel,
+      conversationId,
+      conversationState,
+      tools: mcpTools,
+      // Reuse the per-bridge sessionId we already minted for tool_use_id
+      // encoding: it now also serves as the IDE-style x-session-id header
+      // so Cursor's backend can schedule this stream independently.
+      sessionId,
+      onTextDelta: callbacks.onTextDelta,
+      onThinkingDelta: callbacks.onThinkingDelta,
+      onMcpCall: callbacks.onMcpCall,
+      onStepCompleted: callbacks.onStepCompleted,
+      onTurnEnded: callbacks.onTurnEnded,
+      onError: callbacks.onError,
+    });
+  }
 
   // NOTE: We intentionally do NOT register req.on('close') here. In some Node
   // versions the 'close' event on the incoming request can fire as soon as the

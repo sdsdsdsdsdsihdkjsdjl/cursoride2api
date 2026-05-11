@@ -908,6 +908,20 @@ function buildContentBlockDeltaThinking(index, text) {
 }
 
 /**
+ * content_block_delta 事件 (signature) — Anthropic's signed thinking block
+ * carries the cryptographic signature via a `signature_delta` event, emitted
+ * after the thinking text deltas, before content_block_stop. Used by the
+ * ChatService transport path where Cursor's upstream returns real signatures.
+ */
+function buildContentBlockDeltaSignature(index, signature) {
+  return formatSSE('content_block_delta', {
+    type: 'content_block_delta',
+    index: index,
+    delta: { type: 'signature_delta', signature: signature },
+  });
+}
+
+/**
  * content_block_stop 事件
  */
 function buildContentBlockStop(index) {
@@ -1043,7 +1057,7 @@ module.exports = {
   formatSSE,
   buildMessageStart, buildContentBlockStart, buildContentBlockDelta,
   buildContentBlockStartToolUse, buildContentBlockDeltaInputJson,
-  buildContentBlockStartThinking, buildContentBlockDeltaThinking,
+  buildContentBlockStartThinking, buildContentBlockDeltaThinking, buildContentBlockDeltaSignature,
   buildContentBlockStop, buildMessageDelta, buildMessageStop, buildPing,
   buildModelsResponseWithAnthropicAliases,
   buildSseErrorEvent,
