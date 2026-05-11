@@ -1103,6 +1103,127 @@ Startup banner shows the current setting: `💭 Thinking blocks: OFF (portable)`
 
 ---
 
+## ChatService migration (experimental, account-gated)
+
+**Goal**: enable cross-turn thinking continuity by switching the proxy's wire transport from `agent.v1.AgentService/Run` to `aiserver.v1.ChatService/StreamUnifiedChatWithTools` — the RPC Cursor IDE itself uses internally for its chat panel. The agent transport strips Anthropic's signed thinking blocks (no signature field exists in its `ThinkingDeltaUpdate` message); the chat transport's `ConversationMessage.Thinking` has explicit `text`, `signature`, `redacted_thinking`, and `is_last_thinking_chunk` fields, preserving signatures end-to-end.
+
+**What we built:**
+
+1. **`src/proto/chat_pb.mjs`** (335 KB, 4839 lines, 365 message types).
+   Generated from `/tmp/extract-cursor-protos/cursor/aiserver/v1/aiserver.proto`
+   using `protoc` + `@bufbuild/protoc-gen-es`. Transitive closure starting
+   from `ChatService` RPCs. Covers `StreamUnifiedChatRequest{,WithTools,
+   WithToolsIdempotent}`, `StreamUnifiedChatResponse{,WithTools,...}`,
+   `ConversationMessage` (with `Thinking { text, signature, redacted_thinking,
+   is_last_thinking_chunk }`), `ClientSideToolV2*` family for tool calls,
+   `BuiltinTool` enum, plus all common deps (`ModelDetails`, `CodeBlock`,
+   `LinterError`, etc.). Verified roundtrip: signature field survives
+   `create → toBinary → fromBinary` cycle.
+
+2. **`src/cursor-chat.js`** — new client module mirroring `cursor-agent.js`'s
+   `startConversation()` interface. Hits
+   `POST https://api2.cursor.sh/aiserver.v1.ChatService/StreamUnifiedChatWithTools`
+   via `application/connect+proto`. Wraps the inner `StreamUnifiedChatRequest`
+   in `StreamUnifiedChatRequestWithTools` (which holds the inner at field 1 +
+   optional `client_side_tool_v2_result` at field 2 for tool-result feedback).
+   Translates Anthropic messages to `ConversationMessage[]` preserving signed
+   `thinking` blocks (text + signature) verbatim on inbound; reads the
+   response stream, extracts incremental `thinking`/`text` from
+   `ConversationMessage` frames, fires `onSignatureDelta` when an
+   `is_last_thinking_chunk: true` arrives. Connect-framing decoder (1-byte
+   flags + 4-byte BE length + payload) buffers across HTTP/2 chunk
+   boundaries.
+
+3. **`buildContentBlockDeltaSignature(index, signature)`** in
+   `anthropic-converter.js`. Emits the `signature_delta` SSE event
+   Anthropic uses inside a thinking content block:
+   `{ type: "content_block_delta", index, delta: { type: "signature_delta",
+   signature } }`. claude-code's SDK consumes this and stores the
+   signature with the thinking block in its session file.
+
+4. **server.js wiring** — `CURSOR_USE_CHAT_SERVICE=1` opts in. Route picks
+   `cursorChat.startConversation` over `cursorAgent.startConversation` when
+   the flag is on AND `mcpTools.length === 0` (no registered tools — chat
+   service tool envelope is out of scope for v1). Forces
+   `forceEmitThinking: true` on the buildTurnCallbacks options so thinking
+   blocks ride out on the wire (signatures are real, portable to direct
+   Anthropic). Banner shows the setting:
+   `💭 Thinking blocks: OFF (portable)` / `ON (non-portable)` — toggles
+   based on `_emitThinkingBlocks` semantics.
+
+**What we hit:**
+
+```
+[cursor-chat] trailer: {
+  "error": {
+    "code": "unauthenticated",
+    "message": "You are not authorized to use cloud agents in this team.
+                Please contact your team admin.",
+    "details": [{
+      "type": "aiserver.v1.ErrorDetails",
+      "debug": {
+        "error": "ERROR_UNAUTHORIZED",
+        "details": {
+          "title": "Unauthorized request.",
+          "detail": "You are not authorized to use cloud agents in this team.
+                     Please contact your team admin.",
+          "isRetryable": false,
+          "analyticsMetadata": { "actionRequired": "login" }
+        },
+        "isExpected": true
+      }
+    }]
+  }
+}
+```
+
+`isExpected: true` in the debug section is the load-bearing bit: Cursor's
+backend deliberately gates access to `aiserver.v1.ChatService.*` (and the
+"cloud agents" / Background Composer family it powers) on a team
+entitlement that the token we hold lacks. The protobuf request shape was
+correct — the server parsed it, validated it, and returned a structured
+authorization error rather than a wire-level parse failure.
+
+This is consistent with Cursor's product structure: cloud-side chat history
+plus signed-thinking continuity is part of their paid "Background Agents"
+feature, billed per team. Tokens minted from a free or unaffiliated account
+get a 403-style refusal.
+
+**Status of the work:**
+
+- `chat_pb.mjs`, `cursor-chat.js`, and the wiring are in tree behind the
+  `CURSOR_USE_CHAT_SERVICE=1` env flag. Default off. Default behavior
+  (AgentService path) unchanged.
+- If a future deployment uses a token that has the entitlement (a paid
+  team account where the user has admin or chat access), flipping the env
+  flag should Just Work for tool-less text+thinking turns.
+- The error message is surfaced verbatim through `[cursor-chat] trailer: ...`
+  logging so an upgrade path is observable.
+
+**What's still future work even if the entitlement is granted:**
+
+- **Tool support on the chat path.** `ClientSideToolV2*` types are in
+  `chat_pb.mjs` but the request-side population (mapping Anthropic's
+  `tools[]` to Cursor's per-tool envelopes) wasn't implemented. Tool turns
+  currently fall back to AgentService automatically (`mcpTools.length > 0`
+  → AgentService).
+- **Response-side tool extraction.** When the model on the chat path emits
+  a tool call, we'd need to decode it from the `ConversationMessage`
+  response and synthesize an Anthropic `tool_use` block.
+- **Tool-result feedback.** The wrapper has a slot
+  (`client_side_tool_v2_result` at field 2) but the per-call wire shape
+  needs reverse-engineering from real Cursor IDE traffic with tools
+  enabled.
+
+**Bottom line.** The engineering migration is structurally complete; the
+blocker is an external entitlement Cursor controls. For accounts that lack
+it, the AgentService path remains the only viable transport — and is the
+default. The codepath is checked in for the day the entitlement becomes
+available, with a clear opt-in flag and a verbose error trailer to make the
+gating immediately observable.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
