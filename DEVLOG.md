@@ -1243,6 +1243,87 @@ Defaults are off because the token cost is real (a few hundred to a few thousand
 
 Implementation: `src/thinking-history.js` is ~80 lines, integration in `server.js` and `anthropic-converter.js` adds about 30 more. The hallucination-rescue text buffer (`emittedThinkingForDetection`) was already populated regardless of whether thinking blocks reached the wire, so capture-side cost is negligible.
 
+### Cross-implementation study (what others do)
+
+We surveyed how three implementations handle thinking-block continuity, to inform the design of the re-injection strategy above. Findings:
+
+**Cursor IDE — sends ALL prior thinking per request, with signatures verbatim.**
+
+Direct wire-capture evidence in `/tmp/cursor-tap/cursor-reverse-notes-1.md:1925`:
+
+```json
+{
+  "id": "1",
+  "role": "assistant",
+  "content": [
+    { "type": "reasoning",
+      "text": "Now build to verify.",
+      "providerOptions": {"cursor": {"modelName": "claude-4.5-opus-high-thinking"}},
+      "signature": "ErwBCkYICxgCKkAhMRmRyrCdeWMgxe61O9ZaqQckrofZra..." },
+    { "type": "tool-call", "toolCallId": "toolu_012k...", ... }
+  ]
+}
+```
+
+Each assistant turn is stored as an AI SDK-style blob with the full signed reasoning block, alongside the tool calls. On reconnect, the client re-sends `conversationState.turns = [<all blob IDs>]`; the server reconstructs the full transcript. `ConversationSummaryArchive` (proto line 2648) is a last-resort compactor — observed only twice in 80k requests per the cursor-tap notes. Schema reinforces this: `StreamUnifiedChatRequest.conversation` is `repeated ConversationMessage`, and each message has `repeated Thinking all_thinking_blocks = 46`.
+
+Conclusion: Cursor's design is "send everything, summarize only when context is genuinely exhausted."
+
+**claude-code — sends ALL prior thinking from every assistant message in history, verbatim with signatures.**
+
+Storage: `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`, one JSONL line per streamed content block. Verbatim, full signatures (332–20436 chars observed across sessions). The `lkY()` recombiner in `cli.js` concatenates content blocks from the same `message.id` without dropping thinking. The final `P6A` / `w6A` API builders pass them through unchanged. No filter anywhere in the binary removes `thinking` / `redacted_thinking` from history.
+
+Anthropic's API documentation makes a distinction claude-code does not act on:
+
+> "It is only strictly necessary to send back thinking blocks when using tools with extended thinking. Otherwise, you can omit thinking blocks from previous turns, or let the API strip them for you if you pass them back."
+
+So the protocol is *asymmetric*: within a tool-use chain (model's POV: same assistant turn), thinking MUST be preserved exact-bytes. Across user-facing turns it's OPTIONAL — the server will silently strip them if forwarded. claude-code doesn't make that distinction and just forwards everything (which is why a single bad signature deep in history surfaces as a 400 — Anthropic validates every block, even the optional ones).
+
+The claude-code env vars that DO exist on the thinking surface are all **generation-side**, not storage-side:
+
+- `MAX_THINKING_TOKENS=<N>` — request-side `body.thinking.budget_tokens`. N=0 disables thinking.
+- `CLAUDE_CODE_DISABLE_THINKING=1` — strips thinking from the request entirely.
+- `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` — forces explicit budget, disables `type: "adaptive"`.
+- `DISABLE_INTERLEAVED_THINKING=1` — disables thinking between tool calls.
+- `--effort low/medium/high/xhigh/max` — CLI flag mapping to the same budget.
+
+There is no equivalent of a per-turn storage cap; claude-code stores whatever the model emitted, however large.
+
+The `i_7 = 1024` constant in the binary is the fallback for `countTokens` probes (used during compaction planning), NOT the default for real generation. For real generation, defaults to `type: "adaptive"` for newer models, model picks its own budget per turn — typically thousands to tens of thousands of tokens (~10–60 KB of text for `--effort max` on opus-thinking).
+
+**opencode-cursor — preserves NOTHING.**
+
+Both `/tmp/opencode-cursor` and `/tmp/opencode-cursor-eph` drop thinking from inbound history. `parseMessages` extracts only `type === "text"` parts; `buildCursorRequest` never creates a `ConversationStep{case:"thinkingMessage"}` despite the schema supporting it (`agent_pb.ts:1544-1547`, `ThinkingMessage` at 1879). They forward thinking deltas to the client live as OpenAI-style `reasoning_content` chunks, then forget them. Zero re-injection logic of any kind.
+
+The one related pattern is in the `eph` variant (`src/proxy.ts:633-635`): they cache Cursor's opaque `ConversationStateStructure` checkpoint blob and replay it verbatim on the next request. If Cursor's server-side checkpoint contains thinking, it rides along incidentally — but opencode itself does no management. Not portable to our flow because we hit a different RPC path and `conversationCheckpointUpdate` references per-stream blobs that don't replay.
+
+### Strategic implications for our text-form re-injection
+
+The three-way pattern is consistent but applies to two different worlds:
+
+| Implementation | Strategy | Effective on our path? |
+|---|---|---|
+| Cursor IDE | Send ALL signed blocks | Not us — we don't have ChatService entitlement, signatures stripped on AgentService |
+| claude-code | Send ALL signed blocks | Doesn't apply — we're the *server* claude-code talks to, not the client |
+| opencode | Send NOTHING | An honest minimal-overhead choice if we accept losing continuity |
+| Us | Inject text-form blocks (proxy-side) | Yes — closest analog to mimicking what they do without signatures |
+
+The key uncertainty: we don't know if the model treats text-form `<thinking>` as comparably useful to signed thinking. Signatures are for API-level integrity (preventing tampering), not for how the model weights the content — so in principle the model might use text-form thinking similarly. But this is unverified.
+
+Architecturally the right move is to mirror the canonical "send what you have" pattern unless we get evidence text-form is weaker. Practically that means: keep all recent turns up to a total-byte budget, drop oldest first when it overflows.
+
+Anthropic's docs actually give us one shortcut: **thinking from older user-facing turns is OPTIONAL.** So if compute/token cost matters, dropping the oldest is safe by Anthropic's spec — exactly what a bounded ring-buffer does.
+
+### Per-turn byte cap re-examined
+
+The default `CURSOR_REINJECT_THINKING_MAX_BYTES_PER_TURN=4096` was set defensively when this feature was first built. Cross-implementation evidence suggests it's too aggressive:
+
+- Typical `claude-opus-4-7-thinking-max` thinking blocks are 10–60 KB per turn (well under the 64K token = ~256 KB ceiling, well over our 4 KB cap).
+- claude-code stores them whole; Cursor IDE sends them whole.
+- Our 4 KB cap truncates ~80% of a typical block — capturing only the opening paragraph.
+
+A more honest default given the evidence: **16–32 KB per turn**, with a separate global `MAX_TOTAL_BYTES` backstop if a single-conversation budget is needed. The current per-turn cap remains as a "safety valve for outlier turns," not a routine truncation.
+
 ---
 
 ## Future work / open issues
