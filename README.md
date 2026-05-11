@@ -190,6 +190,9 @@ for chunk in resp:
 | `CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT` | _(自动)_ | 全局覆盖 post-content stall 阈值；同上 |
 | `CURSOR_FORCE_THINKING` | _(空)_ | `on`/`off`/`adaptive` — 全局覆盖客户端的 `thinking.type` |
 | `CURSOR_EMIT_THINKING_BLOCKS` | _(空=off)_ | `1` 时输出 `thinking` 内容块（缺签名，会破坏切换到真实 Anthropic API 的会话续传）。默认关闭以保证可移植性 |
+| `CURSOR_REINJECT_THINKING` | _(空=off)_ | `1` 时启用代理端思考连续性：把模型上一轮的思考内容（带 `<thinking>...</thinking>` 标签）回注到下一轮提示中。在 Cursor 的 ChatService（带签名）不可用时的近似方案。代价是每次续传都会多出几百到几千 token。详见 [DEVLOG.md](DEVLOG.md) 中的 "Proxy-side thinking re-injection" 章节。 |
+| `CURSOR_REINJECT_THINKING_MAX_BYTES_PER_TURN` | `4096` | 每轮存储的思考字节上限（避免长会话膨胀） |
+| `CURSOR_REINJECT_THINKING_MAX_TURNS` | `5` | 每个会话保留的思考轮数上限 |
 | `RUNTIME_STATS_FILE` | `./logs/runtime-stats.json` | 运行时统计持久化文件路径 |
 | `RUNTIME_STATS_PERSIST_MS` | `60000` | 统计快照写盘间隔 (ms) |
 | `RUNTIME_STATS_RECENT` | `1000` | 滚动窗口大小（用于时间分桶视图） |

@@ -117,8 +117,23 @@ function _extractBashFileWrites(command) {
  * "do something different now" instruction as just more history text
  * and continues the prior plan instead of pivoting.
  */
-function anthropicMessagesToPrompt(messages, system) {
+function anthropicMessagesToPrompt(messages, system, opts = {}) {
   if (!messages || messages.length === 0) return '';
+
+  // Optional thinking-history injection: a list of {assistantMsgIndex, text}
+  // entries, used to attach `<thinking>...</thinking>` blocks to prior
+  // assistant messages so the model can reference its own reasoning across
+  // turns. Indexed by the assistant message's position in `messages` (the
+  // i'th assistant role message, NOT the i'th array slot). Source:
+  // src/thinking-history.js — opt-in via CURSOR_REINJECT_THINKING=1.
+  const thinkingByAssistantIdx = new Map();
+  if (Array.isArray(opts.thinkingHistory)) {
+    for (const e of opts.thinkingHistory) {
+      if (e && Number.isFinite(e.turnIndex) && typeof e.text === 'string') {
+        thinkingByAssistantIdx.set(e.turnIndex, e.text);
+      }
+    }
+  }
 
   const parts = [];
 
@@ -327,6 +342,10 @@ function anthropicMessagesToPrompt(messages, system) {
   // Backwards-compat alias used by existing code paths below
   const toolUseInputById = toolUseInfoById;
 
+  // Counter for assistant messages — used to correlate stored thinking
+  // (keyed by assistant-message index, not array index) when re-injecting.
+  let assistantIdx = -1;
+
   // 处理 messages
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -478,7 +497,17 @@ function anthropicMessagesToPrompt(messages, system) {
     if (!content) continue;
 
     if (role === 'assistant') {
-      parts.push(`<assistant>\n${content}\n</assistant>`);
+      assistantIdx++;
+      // If we have stored thinking for this assistant turn, prepend it as
+      // a <thinking>...</thinking> block inside the <assistant> wrapper.
+      // The model treats it as visible reasoning context — not as its own
+      // signed extended-thinking, but enough to reference its prior logic
+      // when the next user message asks a follow-up.
+      const priorThinking = thinkingByAssistantIdx.get(assistantIdx);
+      const body = priorThinking
+        ? `<thinking>\n${priorThinking}\n</thinking>\n${content}`
+        : content;
+      parts.push(`<assistant>\n${body}\n</assistant>`);
     } else if (role === 'user') {
       // Tag every user turn so the model can see role boundaries; mark
       // the latest one so it doesn't drown in 1000+ messages of history.

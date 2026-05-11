@@ -1220,6 +1220,31 @@ if the entitlement is later granted.
 
 ---
 
+## Proxy-side thinking re-injection (opt-in approximation)
+
+Since the only transport we can use (`agent.v1.AgentService/Run`) strips Anthropic's signed thinking blocks, and the transport that preserves them (`aiserver.v1.ChatService.*`) is gated on an entitlement the token doesn't have, the model on Cursor's side sees the flattened conversation text on every fresh user turn but not its prior reasoning. This is the gap behind the "no cross-turn thinking continuity through the proxy" caveat that recurred throughout this work.
+
+`src/thinking-history.js` is the proxy-side approximation. When `CURSOR_REINJECT_THINKING=1`:
+
+- After every successful turn, the model's emitted thinking text (already buffered internally for the hallucination rescue at `turnState.emittedThinkingForDetection`) is scrubbed of `[Tool call: ...]` patterns and stored per-conversation, keyed by `convKey`, with bounds (`MAX_BYTES_PER_TURN`=4096, `MAX_TURNS`=5 by default, both env-overridable).
+- On every subsequent turn, `anthropicMessagesToPrompt` walks the message history, counts assistant messages, and prepends `<thinking>...</thinking>` to the body of each assistant message whose index has a stored entry. The model sees its own reasoning as visible context inside its prior assistant turns.
+
+What this is **not**: native Anthropic extended-thinking continuity. The model treats injected text as part of the conversation it can reference, not as signed reasoning the server validates. The model on Cursor's side has no notion that "this is *my* prior thinking" — it's just text labeled `<thinking>`. Different mechanism, similar effect for the use cases where it helps.
+
+What this **is** useful for:
+- Sequential reasoning questions where turn N+1 references the analytical work of turn N. The model can see its earlier logic and build on it.
+- Long-running coding sessions where the model's reasoning chain is itself the artifact (e.g., "now apply that insight to the other file").
+
+What this **is not** useful for:
+- Short answers or tool-call-heavy turns where the prior thinking has no bearing on the next question. Pure overhead.
+- Cross-provider portability — this is purely proxy-internal state, not reflected in claude-code's stored session.
+
+Defaults are off because the token cost is real (a few hundred to a few thousand tokens per continuation, compounding with conversation length) and the benefit is workload-specific. Storage is in-memory, bounded, and TTL'd at 30 min to match the bridge cache.
+
+Implementation: `src/thinking-history.js` is ~80 lines, integration in `server.js` and `anthropic-converter.js` adds about 30 more. The hallucination-rescue text buffer (`emittedThinkingForDetection`) was already populated regardless of whether thinking blocks reached the wire, so capture-side cost is negligible.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).

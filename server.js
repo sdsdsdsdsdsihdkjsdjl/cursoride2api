@@ -13,6 +13,7 @@ const converter = require('./src/converter');
 const anthropicConverter = require('./src/anthropic-converter');
 const config = require('./src/config');
 const cursorAgent = require('./src/cursor-agent');
+const thinkingHistory = require('./src/thinking-history');
 const anthropicTools = require('./src/anthropic-tools');
 const preprocess = require('./src/preprocess');
 const debugLog = require('./src/debug-log');
@@ -471,6 +472,12 @@ function buildTurnCallbacks(ctx) {
     // tokenPool.release(token, ...); release() is idempotent so the
     // res.on('close') backstop on the original handler is still safe.
     token,
+    // Position of the assistant message this turn produces in the
+    // conversation history. Used to key recorded thinking content so it
+    // can be re-injected against the matching assistant message on later
+    // turns. Only meaningful for fresh-turn handlers; continuations reuse
+    // the previous assistant message slot.
+    assistantTurnIdx = null,
   } = ctx;
   function stamp(name) {
     if (timings && timings.t0 != null && timings[name] == null) {
@@ -826,6 +833,15 @@ function buildTurnCallbacks(ctx) {
       // above via toolUseFinished, but the helper guards anyway.)
       try { tryRescueHallucinatedToolCalls(); } catch { /* never let rescue crash end_turn */ }
 
+      // Record this turn's thinking content into the per-conversation
+      // store so the NEXT turn can re-inject it as <thinking> context.
+      // No-op when CURSOR_REINJECT_THINKING is off.
+      if (thinkingHistory.isEnabled() && assistantTurnIdx != null && turnState.emittedThinkingForDetection) {
+        try {
+          thinkingHistory.recordTurnThinking(convKey, assistantTurnIdx, turnState.emittedThinkingForDetection);
+        } catch { /* ignore */ }
+      }
+
       const hasTools = turnState.pendingToolCalls.length > 0;
       const stopReason = hasTools ? 'tool_use' : 'end_turn';
       // If every pending tool call is synthetic (rescued from hallucinated
@@ -1168,7 +1184,16 @@ async function handleFreshTurn(req, res, token, params) {
   } = params;
 
   const timings = { t0: Date.now() };
-  const prompt = anthropicConverter.anthropicMessagesToPrompt(messages, system);
+  // Pull any prior-turn thinking we've stored for this conversation, so
+  // anthropicMessagesToPrompt can inject it back as `<thinking>` context
+  // (opt-in via CURSOR_REINJECT_THINKING=1; otherwise empty array).
+  const thinkingHist = thinkingHistory.getHistory(convKey);
+  const prompt = anthropicConverter.anthropicMessagesToPrompt(messages, system, {
+    thinkingHistory: thinkingHist,
+  });
+  // The assistant-message index this new turn will land at — used by the
+  // onTurnEnded handler to key the recorded thinking by position.
+  const newAssistantTurnIdx = (messages || []).filter(m => m && m.role === 'assistant').length;
   const mcpTools = anthropicTools.anthropicToolsToMcpTools(tools, 'cursoride2api');
 
   // Diagnostic-only: dump the EXACT flattened prompt we send to Cursor so we
@@ -1224,6 +1249,9 @@ async function handleFreshTurn(req, res, token, params) {
     isContinuation: false,  // fresh-turn handler
     timings,
     token,
+    // The position this turn's assistant message will occupy in the
+    // conversation history — used to key recorded thinking content.
+    assistantTurnIdx: newAssistantTurnIdx,
   });
 
   bridge = cursorAgent.startConversation(token, {
