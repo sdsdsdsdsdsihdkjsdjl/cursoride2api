@@ -42,6 +42,8 @@ The current branch `feat/anthropic-api-support` has commits up to and including 
 
 ### Reference repos (already cloned locally — read these)
 
+The complete Cursor RE reference catalog (every repo we've consulted, adopted, or skipped, plus the local `/tmp/` working-copy paths) lives at [REFERENCES.md](REFERENCES.md). The four hot paths most relevant to a handover:
+
 | Path | Purpose |
 |---|---|
 | `/root/git_farm/opencode/packages/opencode/src/tool/` | **Open-source tool implementations.** Read/Write/Edit/Bash/Glob/Grep, all in TypeScript with the Effect library. ~2000 LOC total across these tools. Source you'll port from. MIT licensed. |

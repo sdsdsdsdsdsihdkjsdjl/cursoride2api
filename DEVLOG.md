@@ -389,6 +389,8 @@ curl http://localhost:4141/v1/chat/completions \
 
 ## References
 
+The full catalog of every Cursor RE repo and material we've consulted (including the ones we deliberately skipped, the local `/tmp/` working copies, and the broader 29-repo landscape from the upstream survey) lives at [REFERENCES.md](REFERENCES.md). The lists below are the per-purpose subset relevant to this dev log; see the consolidated file for the wider picture.
+
 ### Primary references (foundational)
 
 - [`ephraimduncan/opencode-cursor`](https://github.com/ephraimduncan/opencode-cursor) — the working TypeScript reference proxy. Read its `src/proxy.ts` if anything here is unclear.

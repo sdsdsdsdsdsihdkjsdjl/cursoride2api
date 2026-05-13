@@ -251,7 +251,7 @@ watch -n 2 'curl -s http://localhost:4141/stats/inflight | jq ".bridges[0]"'
 
 ## 🔗 相关项目 / Related Projects
 
-本项目交叉参考了下列 Cursor 逆向研究（详见 [DEVLOG.md](DEVLOG.md) 的 "Cross-referencing with other Cursor RE projects" 章节）：
+本项目交叉参考了下列 Cursor 逆向研究（完整清单和取舍说明见 [REFERENCES.md](REFERENCES.md)；具体技术细节见 [DEVLOG.md](DEVLOG.md) "Cross-referencing with other Cursor RE projects" 章节）：
 
 - [`JJDTrump/cursor-reverse-engineering`](https://github.com/JJDTrump/cursor-reverse-engineering) — Cursor IDE 深度逆向分析（gRPC services, headers, ModelDetails）。
 - [`anyrobert/cursor-api-proxy`](https://github.com/anyrobert/cursor-api-proxy) — `cursor-agent` CLI → OpenAI 兼容代理；本项目的 health-aware TokenPool 设计参考自其 `account-pool.ts`。
