@@ -878,6 +878,21 @@ function startConversation(token, options = {}) {
   let buffer = Buffer.alloc(0);
   let inputTokens = 0;
   let outputTokens = 0;
+  // Char-count-based fallback estimate for input tokens. Used when Cursor
+  // doesn't send a `conversationCheckpointUpdate` with `tokenDetails.usedTokens`
+  // for the turn — common for short responses. Without this, claude-code's
+  // `/context` displays 0 used because we emit message_delta.usage without
+  // an input_tokens field. The real (Cursor-reported) value overrides this
+  // as soon as it arrives via the checkpoint handler.
+  // Ratio ~3.5 chars/token matches `_countCharsRecursive` in server.js's
+  // count_tokens endpoint, which Anthropic SDK clients trust for fit checks.
+  const _promptTokensEstimate = (() => {
+    let chars = prompt.length;
+    for (const t of (tools || [])) {
+      try { chars += JSON.stringify(t).length; } catch { /* ignore */ }
+    }
+    return Math.ceil(chars / 3.5);
+  })();
   let capturedState = null;
   // Tracks whether Cursor sent us a turnEnded message. If req.on('end') fires
   // before this is set, the upstream cut us off mid-conversation and we need
@@ -1198,7 +1213,14 @@ function startConversation(token, options = {}) {
         try { stallThresholds.recordTurn(modelId, maxIdleMs); } catch { /* ignore */ }
         try {
           currentCallbacks.onTurnEnded({
-            inputTokens, outputTokens, conversationState: capturedState,
+            // Surface the real Cursor-reported count when available;
+            // fall back to the prompt-based estimate so claude-code's
+            // /context tracker has SOMETHING to display instead of 0.
+            // Short turns rarely trigger a checkpointUpdate, so the
+            // fallback covers the common case.
+            inputTokens: inputTokens > 0 ? inputTokens : _promptTokensEstimate,
+            outputTokens,
+            conversationState: capturedState,
             maxIdleMs,
             stallThresholdSource: _stallSource,
             turnRetries: _turnRetries,
@@ -1732,8 +1754,13 @@ function startConversation(token, options = {}) {
       const idleMs = lastUsefulFrameAt > 0 ? now - lastUsefulFrameAt : 0;
       const thresholdMs = hasEmittedContent ? _stallPostMs : _stallPreMs;
       return {
-        // Token counts
-        inputTokens, outputTokens,
+        // Token counts. inputTokens falls back to a prompt-based
+        // estimate when Cursor hasn't sent a tokenDetails checkpoint
+        // yet (common on short turns). Without this, the tool_use
+        // finalize path emits message_delta.usage with no input_tokens
+        // field — breaking claude-code's /context tracker.
+        inputTokens: inputTokens > 0 ? inputTokens : _promptTokensEstimate,
+        outputTokens,
         // Per-turn aggregate signals (final values after turnEnded)
         maxIdleMs,
         turnRetries: _turnRetries,
