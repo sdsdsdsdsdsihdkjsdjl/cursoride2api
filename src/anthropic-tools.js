@@ -379,8 +379,33 @@ function _toolListHash(tools) {
  *                       single keep-alive socket; two concurrent
  *                       processes get distinct ports)
  *   - tool-list hash  — different tool sets diverge automatically
+ *
+ * Collision class the circumstantial-hash form has: two SEQUENTIAL or
+ * PARALLEL conversations from the same claude-code process (same
+ * keep-alive socket → same remotePort) with identical first 200 chars
+ * of user text hash to the same convKey. Within the 30-min TTL this
+ * causes activeBridges / bridgesBySessionId collisions — manifesting
+ * as hangs or cross-conversation bleed when a parallel pair starts
+ * simultaneously.
+ *
+ * Fix: prefer the `x-claude-code-session-id` header that claude-code
+ * 2.1.x sends on every /v1/messages request. It's stable across
+ * continuations within one conversation and distinct across separate
+ * conversations even when prompts are identical (verified empirically,
+ * see DEVLOG "Conversation key collision" entry). The circumstantial
+ * form is preserved as the fallback for clients that don't send it.
+ *
+ * `conv-v2:` / `bridge-v2:` prefix on the new path means rollout-
+ * during-traffic doesn't accidentally alias to old cached entries.
  */
-function deriveConversationKey(messages, modelId, system, tools, remoteAddr, remotePort) {
+function deriveConversationKey(messages, modelId, system, tools, remoteAddr, remotePort, clientSessionId) {
+  if (clientSessionId) {
+    return crypto
+      .createHash('sha256')
+      .update('conv-v2:' + (modelId || '') + ':' + clientSessionId)
+      .digest('hex')
+      .slice(0, 16);
+  }
   const first = extractFirstUserText(messages).slice(0, 200);
   const sys = _systemFingerprint(system);
   const addr = remoteAddr || '';
@@ -395,9 +420,18 @@ function deriveConversationKey(messages, modelId, system, tools, remoteAddr, rem
 
 /**
  * Stable bridge cache key — used to find the open H2 stream when a tool_result
- * continuation request lands. Same salt shape as conversation key.
+ * continuation request lands. Same scheme as the conversation key (with a
+ * different namespace prefix) — see deriveConversationKey for the rationale
+ * behind the v2/fallback split.
  */
-function deriveBridgeKey(modelId, messages, system, tools, remoteAddr, remotePort) {
+function deriveBridgeKey(modelId, messages, system, tools, remoteAddr, remotePort, clientSessionId) {
+  if (clientSessionId) {
+    return crypto
+      .createHash('sha256')
+      .update('bridge-v2:' + (modelId || '') + ':' + clientSessionId)
+      .digest('hex')
+      .slice(0, 16);
+  }
   const first = extractFirstUserText(messages).slice(0, 200);
   const sys = _systemFingerprint(system);
   const addr = remoteAddr || '';
@@ -408,6 +442,35 @@ function deriveBridgeKey(modelId, messages, system, tools, remoteAddr, remotePor
     .update('bridge:' + (modelId || '') + ':' + sys + ':' + first + ':' + addr + ':' + port + ':' + toolHash)
     .digest('hex')
     .slice(0, 16);
+}
+
+/**
+ * Pull claude-code's stable conversation UUID off the inbound request.
+ * Preference order:
+ *   1. `x-claude-code-session-id` header — cleanest, no parsing.
+ *   2. `body.metadata.user_id` — claude-code encodes
+ *      `{device_id, account_uuid, session_id}` as a JSON STRING here;
+ *      we parse it as the documented fallback.
+ *
+ * Returns null when neither is present (non-claude-code callers fall
+ * back to the circumstantial-hash path in deriveConversationKey).
+ */
+function extractClientSessionId(req) {
+  if (!req) return null;
+  // 1. Direct header.
+  const h = req.headers && req.headers['x-claude-code-session-id'];
+  if (typeof h === 'string' && /^[0-9a-fA-F-]{16,}$/.test(h)) return h;
+  // 2. body.metadata.user_id is a JSON-encoded string. Defensive parse.
+  try {
+    const raw = req.body && req.body.metadata && req.body.metadata.user_id;
+    if (typeof raw === 'string' && raw.length > 0 && raw[0] === '{') {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.session_id === 'string' && parsed.session_id.length >= 8) {
+        return parsed.session_id;
+      }
+    }
+  } catch { /* ignore — body shape varied or absent */ }
+  return null;
 }
 
 /**
@@ -603,6 +666,7 @@ module.exports = {
   extractToolResults, extractTools,
   findLatestUserMessage, extractFirstUserText,
   deriveConversationKey, deriveBridgeKey,
+  extractClientSessionId,
   deterministicConversationId,
   hasToolResults,
   parseHallucinatedToolCalls, canonicalizeHallucinatedToolName,

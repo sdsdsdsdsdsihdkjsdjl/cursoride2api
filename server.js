@@ -1362,18 +1362,27 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
   }
   const isStream = stream === true;
 
-  // Salt the cache keys with the client's remote address + remote port + tool
-  // list hash. Two concurrent sessions that happen to send the same
-  // first-user-text would otherwise collide on the bridge cache and clobber
-  // each other's H2 streams (the second's `continuation=false` overwrites the
-  // first's bridge entry; the first then routes its tool_result onto the
-  // wrong stream and hangs). `remotePort` is the cheapest distinguisher: a
-  // claude-code process keeps a single keep-alive socket, so within a session
-  // the port is stable; two concurrent processes get distinct ports.
+  // Conversation/bridge cache keys.
+  //
+  // Preferred path: pull claude-code's stable per-conversation UUID from
+  // `x-claude-code-session-id` (or its `body.metadata.user_id.session_id`
+  // mirror) — this is the only signal we have that survives two clients
+  // sharing remoteAddr+remotePort+firstUserText, which DOES happen in
+  // practice (e.g. two simultaneous `claude -p 'foo'` invocations on the
+  // same host can both reach us through one keep-alive socket).
+  //
+  // Fallback path (no session header): salt with remoteAddr + remotePort +
+  // tool-list hash + first-user-text. Less robust but the historical
+  // behavior — preserved for non-claude-code callers and to keep this
+  // change additive. Without the salt, two concurrent same-prompt sessions
+  // would clobber each other's H2 stream (the second's `continuation=false`
+  // overwrites the first's bridge entry; the first then routes its
+  // tool_result onto the wrong stream and hangs).
   const remoteAddr = (req.ip || req.socket?.remoteAddress || '').toString();
   const remotePort = req.socket?.remotePort;
-  const convKey = anthropicTools.deriveConversationKey(messages, cursorModel, system, tools, remoteAddr, remotePort);
-  const bridgeKey = anthropicTools.deriveBridgeKey(cursorModel, messages, system, tools, remoteAddr, remotePort);
+  const clientSessionId = anthropicTools.extractClientSessionId(req);
+  const convKey = anthropicTools.deriveConversationKey(messages, cursorModel, system, tools, remoteAddr, remotePort, clientSessionId);
+  const bridgeKey = anthropicTools.deriveBridgeKey(cursorModel, messages, system, tools, remoteAddr, remotePort, clientSessionId);
   const conversationId = anthropicTools.deterministicConversationId(convKey);
 
   const isContinuation = anthropicTools.hasToolResults(messages);

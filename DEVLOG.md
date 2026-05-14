@@ -895,8 +895,14 @@ Limits: only retries if zero bytes have arrived (mid-stream errors are not retri
 
 We maintain two in-memory caches on the proxy:
 
-- `activeBridges` keyed by `bridgeKey = sha256("bridge:" + modelId + ":" + firstUserText.slice(0,200))` — stores the open H2 stream + pending exec list. Used to route `tool_result` follow-ups back to the **same** Cursor stream. This works.
-- `conversationStates` keyed by `convKey = sha256("conv:" + modelId + ":" + firstUserText.slice(0,200))` — was supposed to cache the opaque protobuf checkpoint Cursor sends back via `conversationCheckpointUpdate`, so a fresh `/v1/messages` request could resume a previous conversation without re-uploading context. **This does not work** — Cursor's KV blob store is scoped per-H2-stream, not per-conversation-id. Replaying a saved checkpoint on a fresh stream causes `Connect error internal: Blob not found` because the stored blob hashes only existed in the closed stream.
+- `activeBridges` keyed by `bridgeKey` — stores the open H2 stream + pending exec list. Used to route `tool_result` follow-ups back to the **same** Cursor stream. This works.
+- `conversationStates` keyed by `convKey` — was supposed to cache the opaque protobuf checkpoint Cursor sends back via `conversationCheckpointUpdate`, so a fresh `/v1/messages` request could resume a previous conversation without re-uploading context. **This does not work** — Cursor's KV blob store is scoped per-H2-stream, not per-conversation-id. Replaying a saved checkpoint on a fresh stream causes `Connect error internal: Blob not found` because the stored blob hashes only existed in the closed stream.
+
+Key derivation has a preferred path and a fallback path (see `deriveConversationKey` / `deriveBridgeKey` in `src/anthropic-tools.js`):
+- **Preferred (v2):** if the client sends `x-claude-code-session-id` (or the same UUID nested as `body.metadata.user_id.session_id`), keys are `sha256("conv-v2:" + modelId + ":" + sessionId)` / `sha256("bridge-v2:" + ...)`. This is the only signal that reliably distinguishes two concurrent claude-code sessions sharing remoteAddr+remotePort+firstUserText.
+- **Fallback (v1):** for callers that don't send the session header, keys remain `sha256("conv:" + modelId + ":" + sysFingerprint + ":" + firstUserText.slice(0,200) + ":" + addr + ":" + port + ":" + toolHash)`. Less robust but historical behavior.
+
+See the [convKey collision fix](#convkey-collision-fix-2026-05-14) entry below for the bug this addresses.
 
 **Current behavior:** every fresh `/v1/messages` request starts with empty `conversationState`. Cursor rebuilds its blob store from `setBlobArgs` (system prompt, etc.) and the client re-supplies the message history in the prompt anyway. The `conversationStates` Map is preserved as scaffolding for a future architecture where we share an H2 client across requests, but it's not currently populated.
 
@@ -1325,6 +1331,51 @@ The default `CURSOR_REINJECT_THINKING_MAX_BYTES_PER_TURN=4096` was set defensive
 - Our 4 KB cap truncates ~80% of a typical block — capturing only the opening paragraph.
 
 A more honest default given the evidence: **16–32 KB per turn**, with a separate global `MAX_TOTAL_BYTES` backstop if a single-conversation budget is needed. The current per-turn cap remains as a "safety valve for outlier turns," not a routine truncation.
+
+---
+
+## convKey collision fix (2026-05-14)
+
+### The collision class
+
+`deriveConversationKey` and `deriveBridgeKey` hashed `(modelId, systemFingerprint, firstUserText.slice(0,200), remoteAddr, remotePort, toolHash)`. The remoteAddr+remotePort salt was added to defend against two concurrent claude-code processes sharing a host — port is normally distinct per process keep-alive socket. But the defense leaks under two real conditions:
+
+1. **Same prompt, same socket.** Claude Code reuses a single keep-alive socket within a session, but at the *Node HTTP server* level, multiple in-flight requests on one TCP connection report the *same* `remotePort` (the client port doesn't change per request). If a user fires `claude -p "foo"` twice from the same host in close succession and connection reuse picks up, the two POSTs land on the same socket → same port → same firstUserText → **identical convKey**.
+
+2. **Tool-result race.** When the model emits a tool_use, claude-code POSTs the tool_result on the same socket. The bridgeKey lookup happens on that POST — if the proxy has another fresh conversation cached under the same key, the tool_result routes to the wrong stream and the original conversation hangs (we've seen this manifest as stuck "thinking" indicators that never resolve).
+
+The colleague flagged this with a concrete reproducer: two simultaneous prompts → both keyed identically → second overwrites first's bridge entry → first's continuation goes to the wrong H2 stream.
+
+### The signal we found
+
+Empirical capture via a transparent HTTP tap (`/tmp/tap.js`, sits between claude-code and our proxy and logs every request) revealed that claude-code sends two headers carrying a stable per-conversation UUID:
+
+| Source | Path | Notes |
+|---|---|---|
+| `x-claude-code-session-id` | direct header | UUIDv4, stable for the lifetime of one claude-code session |
+| `body.metadata.user_id` | JSON-encoded string with `{device_id, account_uuid, session_id}` | session_id field carries the same UUID as the header |
+
+Verified properties from 3 parallel `claude -p` runs with identical prompts:
+- Within one session, every POST (initial + each tool_result continuation) carries the same UUID.
+- Across two separate `claude -p` invocations, the UUIDs are distinct even with identical prompts, identical remoteAddr, and overlapping wall clock.
+
+### The fix
+
+`extractClientSessionId(req)` (in `src/anthropic-tools.js`) returns the header if present, otherwise parses `body.metadata.user_id` as JSON and pulls `.session_id`. `deriveConversationKey` and `deriveBridgeKey` now accept this id as an additional argument; when present they produce `sha256("conv-v2:" + modelId + ":" + sessionId)` / `sha256("bridge-v2:" + modelId + ":" + sessionId)`. The `-v2:` namespace prevents accidental aliasing with old cache entries during rollout.
+
+The fallback path (no session id) is preserved unchanged for non-claude-code callers (opencode, raw API clients), so this change is purely additive.
+
+### Verification
+
+- 25-assertion unit test (`/tmp/test-conv-key.js`): covers v1 determinism, v2 ignores port/addr but respects sessionId, v2 namespace doesn't alias v1, bridgeKey distinct from convKey, all extract paths (header/body/null/garbage).
+- End-to-end smoke test: two parallel `claude -p "echo parallel test 1"` invocations produce two distinct session UUIDs (`1a9c0a28-…` / `a3d50cf3-…`) → two distinct convKeys, observed in proxy log and confirmed by hashing the captured session ids through the public function.
+- Without sessionId (legacy fallback), the same inputs collide as expected — proves the bug existed and is now skipped by the v2 path.
+
+### Why not just include sessionId in the salt of the existing key?
+
+Considered. Rejected because:
+- Mixing the optional sessionId into the same hash with the always-present (`firstUserText`, etc.) inputs makes "did we use the session id?" un-observable from the wire — debugging two collided conversations becomes ambiguous.
+- A separate v2 namespace makes the rollout cache-safe: existing in-flight conversations under v1 keys keep resolving correctly while new conversations from claude-code start using v2.
 
 ---
 
