@@ -400,9 +400,19 @@ function _toolListHash(tools) {
  */
 function deriveConversationKey(messages, modelId, system, tools, remoteAddr, remotePort, clientSessionId) {
   if (clientSessionId) {
+    // v2: salt with firstUserText + toolHash so a WebSearch / Task
+    // subagent spawned within the same claude-code session (same
+    // sessionId, different prompt, different tool set) gets a distinct
+    // convKey. Without these, parent + subagent collide on the bridge
+    // cache and the subagent's tool_use_id routes onto the wrong H2
+    // stream — observed symptom is the subagent's tool returning empty
+    // and the parent turn stalling. Cross-session collisions (the
+    // original bug) are still defended by sessionId.
+    const first = extractFirstUserText(messages).slice(0, 200);
+    const toolHash = _toolListHash(tools);
     return crypto
       .createHash('sha256')
-      .update('conv-v2:' + (modelId || '') + ':' + clientSessionId)
+      .update('conv-v2:' + (modelId || '') + ':' + clientSessionId + ':' + first + ':' + toolHash)
       .digest('hex')
       .slice(0, 16);
   }
@@ -426,9 +436,11 @@ function deriveConversationKey(messages, modelId, system, tools, remoteAddr, rem
  */
 function deriveBridgeKey(modelId, messages, system, tools, remoteAddr, remotePort, clientSessionId) {
   if (clientSessionId) {
+    const first = extractFirstUserText(messages).slice(0, 200);
+    const toolHash = _toolListHash(tools);
     return crypto
       .createHash('sha256')
-      .update('bridge-v2:' + (modelId || '') + ':' + clientSessionId)
+      .update('bridge-v2:' + (modelId || '') + ':' + clientSessionId + ':' + first + ':' + toolHash)
       .digest('hex')
       .slice(0, 16);
   }

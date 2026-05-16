@@ -1379,6 +1379,20 @@ Considered. Rejected because:
 
 ---
 
+## convKey v2 subagent regression (2026-05-15)
+
+The first cut at the v2 convKey path (commit `b879706`) hashed only `(modelId, clientSessionId)`. This fixed cross-session collisions (the original colleague-reported bug) but introduced a *within-session* collision: when claude-code spawns a `WebSearch` or `Task` subagent it issues a fresh `/v1/messages` POST with the same `x-claude-code-session-id` as the parent, a different first user prompt, and a different (typically much smaller) tool set. Both POSTs hashed to the same v2 convKey/bridgeKey. The subagent's `bridgeKey=parent` lookup hit the parent's open H2 stream → the parent's `tool_use_id` continuation routed onto the subagent's stream → user-visible symptom was `Web Search(…) ⎿ Did 0 searches in 8s` followed by a 2m+ stall.
+
+Fix: salt the v2 hash with `firstUserText + toolHash` as well. Within one claude-code conversation, the first user message stays stable across continuation turns, so the parent's convKey stays stable. The subagent has a different first user message (and usually a single-tool set), so it gets a distinct convKey. Cross-session defense is unaffected — distinct sessionIds still dominate.
+
+```
+conv-v2: sha256("conv-v2:" + modelId + ":" + sessionId + ":" + firstUserText(0..200) + ":" + toolListHash)
+```
+
+Verified empirically with `claude -p ... --allowed-tools WebSearch`: parent convKey `b801d20f...` and WebSearch subagent convKey `ce6d05fe...` diverge as required; the parent's continuation POST (`toolResults=1`) reuses the parent's convKey and the turn completes with the search result returned through. Unit test (`/tmp/test-conv-key.js`, 28 assertions) covers: parent ≠ subagent same-session, parent-turn-2 == parent-turn-1, cross-session still distinct, v1 fallback unchanged.
+
+---
+
 ## MCP resource discovery handler (2026-05-15)
 
 ### Symptom
