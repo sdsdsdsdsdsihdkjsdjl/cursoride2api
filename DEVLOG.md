@@ -1420,6 +1420,20 @@ Verified by unit test that exercises both paths through `_handleExecMessage` (a 
 
 ---
 
+## Vendored proto regen — attempted, reverted (2026-05-15)
+
+Tried regenerating `src/proto/agent_pb.mjs` from `/tmp/cursor-tap/cursor_proto/agent_v1.proto` via `protoc-gen-es` to add `WebFetchRequestQuery` / `WebFetchRequestResponse` (proto fields 9 in InteractionQuery/Response — currently absent from the vendored file, so the existing `case 'webFetchRequestQuery'` handler in `handleInteractionQuery` is dead code and the model's WebFetch interactions fall through to the default abandon path, generating `interactionQuery case=undefined id=N not handled in vendored proto` log noise).
+
+**Diff is purely additive** — 21 messages get new fields, no field numbers reassigned, no removals. Wire bytes are byte-identical for every message our app encodes (verified via `toBinary` comparison on `AgentRunRequest`, `RequestContext`, `McpToolDefinition`, `ModelDetails`).
+
+**But baseline `claude -p "say only baseline"` consistently times out at 60s+ with the new proto** (3/3 attempts), while the old proto succeeds in <5s on the same machine, same prompt, same proxy code. Direct `curl` against `/v1/messages` with the new proto WORKS and produces a complete SSE stream including `message_stop`. claude-code's specific request pattern (two parallel POSTs — `xhigh` probe with `tools=0` and `low` with `tools=51`, hedging) breaks somewhere. Root cause not identified in this session; suspect a subtle behavioral change in proto-es v2.10.2 → v2.12.0, or an interaction with Cursor's backend treating one of the parallel POSTs differently. Reverted to v2.10.2-generated file.
+
+**Investigation aside**: the original hypothesis that the `interactionQuery case=undefined` log flood was *causing* user-visible stalls turned out to be wrong. The user's reproducer log shows 10 abandons inside a subagent turn that nevertheless *ended successfully* with 866 output bytes. The actual stall was on the parent's `tool_result` roundtrip afterwards — a Cursor-backend `Upstream stalled — no progress for 165s` event, which our watchdog handles via retry. The abandon noise is cosmetic, not load-bearing.
+
+**Status**: vendored proto stays at v2.10.2 generation. If we want to revisit proto regen later, the breaking pattern to reproduce is "claude-code baseline `say only X` timeout"; bisect by adding new schemas one at a time to find the offender. The `protoc-gen-es`-generated file is preserved at `/tmp/proto-regen/agent_pb.mjs` for that future investigation.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
