@@ -467,20 +467,32 @@ function shouldPrefixToolName(name) {
 
 function buildMcpToolDefinitions(mcpToolsRaw) {
   if (!Array.isArray(mcpToolsRaw) || mcpToolsRaw.length === 0) return [];
-  const { create, fromJson, toBinary, wkt, agent } = _requireProto();
+  const { create, fromJson, fromBinary, toBinary, wkt, agent } = _requireProto();
   const out = [];
   for (const t of mcpToolsRaw) {
     if (!t || !t.name) continue;
-    // Two shapes are accepted:
-    //   { name, toolName, description, providerIdentifier, jsonSchema }
-    //   { name, toolName, description, providerIdentifier, inputSchema } (raw bytes)
+    // McpToolDefinition.input_schema is `google.protobuf.Value` in the proto.
+    // proto-es expects a Value MESSAGE OBJECT here, not raw bytes. Passing a
+    // Uint8Array silently produces a 0-length encoding (no error, just drops
+    // the schema), so Cursor's model receives tools without schemas and stalls
+    // waiting for proper context. Always materialize a Value object.
+    //
+    // Two input shapes from callers:
+    //   { ..., jsonSchema: {...} }           — plain JSON Schema object
+    //   { ..., inputSchema: Uint8Array }     — pre-encoded Value bytes (legacy)
     let inputSchema;
     if (t.inputSchema && (t.inputSchema instanceof Uint8Array || Buffer.isBuffer(t.inputSchema))) {
-      inputSchema = t.inputSchema instanceof Uint8Array ? t.inputSchema : new Uint8Array(t.inputSchema);
+      // Legacy: decode bytes back to a Value object.
+      const bytes = t.inputSchema instanceof Uint8Array ? t.inputSchema : new Uint8Array(t.inputSchema);
+      try {
+        inputSchema = fromBinary(wkt.ValueSchema, bytes);
+      } catch (e) {
+        continue; // Skip if we can't round-trip
+      }
     } else {
       const schema = t.jsonSchema || t.input_schema || { type: 'object', properties: {}, required: [] };
       try {
-        inputSchema = toBinary(wkt.ValueSchema, fromJson(wkt.ValueSchema, schema));
+        inputSchema = fromJson(wkt.ValueSchema, schema);
       } catch (e) {
         // Skip tools whose schema can't be encoded
         continue;

@@ -1420,17 +1420,31 @@ Verified by unit test that exercises both paths through `_handleExecMessage` (a 
 
 ---
 
-## Vendored proto regen — attempted, reverted (2026-05-15)
+## Vendored proto regen — root cause of `input_schema` silent drop (2026-05-15)
 
-Tried regenerating `src/proto/agent_pb.mjs` from `/tmp/cursor-tap/cursor_proto/agent_v1.proto` via `protoc-gen-es` to add `WebFetchRequestQuery` / `WebFetchRequestResponse` (proto fields 9 in InteractionQuery/Response — currently absent from the vendored file, so the existing `case 'webFetchRequestQuery'` handler in `handleInteractionQuery` is dead code and the model's WebFetch interactions fall through to the default abandon path, generating `interactionQuery case=undefined id=N not handled in vendored proto` log noise).
+Regenerated `src/proto/agent_pb.mjs` from `/tmp/cursor-tap/cursor_proto/agent_v1.proto` via `protoc-gen-es` to pick up `WebFetchRequestQuery` / `WebFetchRequestResponse` (proto fields 9 in InteractionQuery/Response — absent from the previous v2.10.2 generation, which caused the existing `case 'webFetchRequestQuery'` handler in `handleInteractionQuery` to be dead code; the model's WebFetch interactions fell through to the default abandon path with `interactionQuery case=undefined id=N` log spam).
 
-**Diff is purely additive** — 21 messages get new fields, no field numbers reassigned, no removals. Wire bytes are byte-identical for every message our app encodes (verified via `toBinary` comparison on `AgentRunRequest`, `RequestContext`, `McpToolDefinition`, `ModelDetails`).
+First-pass regen broke baseline `claude -p` with consistent 60s+ timeouts even though wire bytes for every message we *send* were byte-identical between old and new proto and direct `curl` against `/v1/messages` worked. Root cause was a schema-definition difference for `McpToolDefinition.input_schema`:
 
-**But baseline `claude -p "say only baseline"` consistently times out at 60s+ with the new proto** (3/3 attempts), while the old proto succeeds in <5s on the same machine, same prompt, same proxy code. Direct `curl` against `/v1/messages` with the new proto WORKS and produces a complete SSE stream including `message_stop`. claude-code's specific request pattern (two parallel POSTs — `xhigh` probe with `tools=0` and `low` with `tools=51`, hedging) breaks somewhere. Root cause not identified in this session; suspect a subtle behavioral change in proto-es v2.10.2 → v2.12.0, or an interaction with Cursor's backend treating one of the parallel POSTs differently. Reverted to v2.10.2-generated file.
+- **Old `.proto` (vendored)**: `bytes input_schema = 3;`
+- **New `.proto` (current upstream)**: `google.protobuf.Value input_schema = 3;`
 
-**Investigation aside**: the original hypothesis that the `interactionQuery case=undefined` log flood was *causing* user-visible stalls turned out to be wrong. The user's reproducer log shows 10 abandons inside a subagent turn that nevertheless *ended successfully* with 866 output bytes. The actual stall was on the parent's `tool_result` roundtrip afterwards — a Cursor-backend `Upstream stalled — no progress for 165s` event, which our watchdog handles via retry. The abandon noise is cosmetic, not load-bearing.
+Our code at `cursor-agent.js:483` pre-encoded the JSON Schema into raw `Value` bytes via `toBinary(wkt.ValueSchema, fromJson(...))` and passed those bytes as `inputSchema`. With the old `bytes`-typed field, that's exactly what proto-es expects. With the new `Value`-typed field, proto-es expects a Value MESSAGE OBJECT and **silently drops the field when handed a Uint8Array** — no error, no warning, just a 0-length encoding for the field. The 51 tools we send to Cursor end up with empty input schemas → Cursor's model can't invoke them → turn never produces text → claude-code times out.
 
-**Status**: vendored proto stays at v2.10.2 generation. If we want to revisit proto regen later, the breaking pattern to reproduce is "claude-code baseline `say only X` timeout"; bisect by adding new schemas one at a time to find the offender. The `protoc-gen-es`-generated file is preserved at `/tmp/proto-regen/agent_pb.mjs` for that future investigation.
+Verified by a minimal round-trip:
+
+```
+raw input_schema bytes: 67
+OLD proto McpToolDefinition encoded: 87 bytes (schema included)
+NEW proto McpToolDefinition encoded: 20 bytes (schema DROPPED)
+NEW proto with Value object: 87 bytes (schema included, identical to OLD)
+```
+
+Fix: `buildMcpToolDefinitions` now produces a `Value` object (`fromJson(wkt.ValueSchema, schema)`) instead of raw bytes. The legacy `inputSchema: Uint8Array` caller shape is preserved by decoding the bytes back into a `Value` via `fromBinary`. Both paths now feed proto-es a Value object, which works under both the old and new schema definitions (proto3 wire-compat: a `Value`-typed field and a `bytes`-typed field with serialized Value content produce identical bytes when the value is present).
+
+End-to-end verification: `claude -p "use WebSearch ..." --dangerously-skip-permissions` now completes; proxy log shows zero `unhandled exec` events and zero `interactionQuery case=undefined` abandons. The model's WebFetch interactionQueries are now properly recognized as `webFetchRequestQuery` and rejected via the existing handler (which causes the model to fall back to MCP-prefixed equivalents).
+
+**Investigation aside**: the original hypothesis that the `interactionQuery case=undefined` log flood was *causing* user-visible stalls was wrong. The original reproducer log shows 10 abandons inside a subagent turn that nevertheless ended successfully with 866 output bytes. The user-visible stall in that case was a Cursor-backend `Upstream stalled — no progress for 165s` event on the parent's `tool_result` roundtrip, handled by our existing watchdog retry. The abandon noise was cosmetic.
 
 ---
 
