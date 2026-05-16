@@ -10,6 +10,9 @@ A working notebook of what we learned reverse-engineering Cursor's `agent.v1.Age
 4. The Cursor stream stays paused after emitting `mcpArgs` — it will NOT fire `turnEnded` until we send `mcpResult`. So when bridging to Anthropic semantics we have to *synthesize* `stop_reason=tool_use` ourselves (we use a 250 ms debounce to batch parallel tool calls).
 5. Cursor's KV blob channel must be ACKed (both `setBlobArgs` → `setBlobResult: {}` and `getBlobArgs` → `getBlobResult` with whatever we cached). Without this the model just sits there idle.
 6. Verified end-to-end through `claude -p` with `claude-opus-4-7`, `claude-sonnet-4-6`, and `claude-haiku-4-5`. Tool-use round-trip works.
+7. `McpToolDefinition.input_schema` and `McpArgs.args` (map values) changed from `bytes` to `google.protobuf.Value` between Cursor proto versions. The proxy now passes a `Value` *object* on encode and unwraps `Value` *objects* on decode (instead of relying on `bytes`), which works under both definitions. See "Vendored proto regen" entry for the silent-drop failure mode and "decodeMcpArgs" entry for the inbound mirror.
+8. `convKey`/`bridgeKey` derive from claude-code's `x-claude-code-session-id` header (with `firstUserText` + `toolHash` salt) when present, so parallel claude-code sessions with identical prompts don't alias their bridges, and a session's WebSearch/Task subagent doesn't collide with its parent. Fallback to the older circumstantial-hash scheme for non-claude-code callers. See "convKey collision fix" + "convKey v2 subagent regression" entries.
+9. **WebFetch through the proxy works end-to-end.** **WebSearch does not** — claude-code's WebSearch is an Anthropic-server-side tool that bypasses the model's tool-use path; with `ANTHROPIC_BASE_URL=our-proxy` it has no reachable backend. Use an MCP web-search server (Brave/SerpAPI/etc.) if you need real search through this stack.
 
 ---
 
@@ -1458,6 +1461,22 @@ Fix: when the map value is a Value proto message (detected by `obj.kind.case`), 
 Verified end-to-end: `claude -p "use WebFetch to fetch https://example.com..." --dangerously-skip-permissions` completes, model gets real page content, no `Invalid tool parameters` errors. Tool calls in the log show clean JSON args, e.g. `WebFetch({"url":"https://example.com","prompt":"What is on this page?"})`.
 
 **Investigation aside**: the original hypothesis that the `interactionQuery case=undefined` log flood was *causing* user-visible stalls was wrong. The original reproducer log shows 10 abandons inside a subagent turn that nevertheless ended successfully with 866 output bytes. The user-visible stall in that case was a Cursor-backend `Upstream stalled — no progress for 165s` event on the parent's `tool_result` roundtrip, handled by our existing watchdog retry. The abandon noise was cosmetic.
+
+---
+
+## WebFetch works through proxy; WebSearch is architecturally blocked (2026-05-16)
+
+After the proto regen + the two bytes↔Value fixes (encode + decode), end-to-end behavior settled into a clear split:
+
+**WebFetch — works fully through the proxy.** Direct URL fetch, no search backend needed. Verified by `claude -p "use WebFetch to fetch https://github.com/slopus/happy ..." --dangerously-skip-permissions` returning real page content (335,960 bytes from the live page) and the model parsing it to report the real star count.
+
+**WebSearch — fails with `searchCount: 0` regardless of proxy state.** claude-code's `WebSearch` is an Anthropic-server-side tool: it talks directly to Anthropic's search backend, not via the model's MCP/tool-use path. With `ANTHROPIC_BASE_URL=our-proxy`, claude-code's WebSearch HTTP client points at our proxy → our proxy forwards to Cursor → Cursor has no concept of Anthropic's search backend → WebSearch reports `searchCount: 0` and "no web search capability configured." The proxy cannot fix this — it's an architectural mismatch.
+
+Practical workarounds for real web search through this stack:
+- Wire an MCP web-search server (Brave Search MCP, SerpAPI MCP, etc.) into claude-code's `~/.claude/mcp_servers.json` or `.mcp.json`. Those calls traverse as standard MCP tool calls through our proxy and work end-to-end.
+- Use `WebFetch` for direct URL fetches when you already know the URL.
+
+**Earlier misclaim**: in a prior turn I read "Eiffel Tower stands 330 meters..." output from `claude -p "use WebSearch..."` as evidence that WebSearch worked end-to-end. It didn't — the model's own tool_result text explicitly included "(Note: Web search tools were unavailable in this environment, so this answer is from general knowledge rather than a live search)" and I missed that line. Knowledge-based answers from the model are not proof of tool function. When verifying a tool, check the `toolUseResult` block in the session JSONL (`/root/.claude/projects/.../*.jsonl`) for the actual `searchCount`/`results`/`bytes` — that's the ground truth, not the model's prose output.
 
 ---
 
