@@ -386,32 +386,47 @@ function decodeValueBytes(buf) {
   return toJson(wkt.ValueSchema, v);
 }
 
-// ── Decode mcpArgs.args (Map<string, bytes>) into a plain JS object ──
+// ── Decode mcpArgs.args into a plain JS object ──
+// Wire shape varies by McpArgs.args field definition in the .proto:
+//   OLD: map<string, bytes>  — values arrive as Uint8Array of Value bytes
+//   NEW: map<string, google.protobuf.Value> — values arrive as parsed Value objects
+// claude-code's MCP validator needs plain JS values (string/number/bool/object/array),
+// not Value proto messages. If we forward `{url: {kind: {case: 'stringValue', value: 'https://...'}}}`
+// instead of `{url: 'https://...'}`, the validator rejects with "Invalid tool parameters".
 function decodeMcpArgs(argsMap) {
   const out = {};
   if (!argsMap) return out;
-  // Proto-decoded map is a plain object whose values are Uint8Array
   if (typeof argsMap !== 'object') return out;
+  const { wkt, toJson } = _requireProto();
   for (const k of Object.keys(argsMap)) {
     const v = argsMap[k];
-    if (!v) { out[k] = null; continue; }
-    let bytes;
-    if (v instanceof Uint8Array) bytes = v;
-    else if (Buffer.isBuffer(v)) bytes = new Uint8Array(v);
-    else if (typeof v === 'string') {
-      // Legacy connect+json path stored values as base64 strings
-      try { bytes = new Uint8Array(Buffer.from(v, 'base64')); } catch { bytes = null; }
-    } else {
-      out[k] = v; // already a JS value
+    if (v == null) { out[k] = null; continue; }
+    // Raw bytes (old `bytes`-typed map values) — decode via Value codec.
+    if (v instanceof Uint8Array || Buffer.isBuffer(v)) {
+      const bytes = v instanceof Uint8Array ? v : new Uint8Array(v);
+      try { out[k] = decodeValueBytes(bytes); continue; }
+      catch {
+        try { out[k] = Buffer.from(bytes).toString('utf8'); continue; }
+        catch { out[k] = null; continue; }
+      }
+    }
+    // Legacy connect+json path stored values as base64 strings.
+    if (typeof v === 'string') {
+      try {
+        const bytes = new Uint8Array(Buffer.from(v, 'base64'));
+        out[k] = decodeValueBytes(bytes);
+      } catch { out[k] = v; }
       continue;
     }
-    if (!bytes) { out[k] = null; continue; }
-    try {
-      out[k] = decodeValueBytes(bytes);
-    } catch {
-      try { out[k] = Buffer.from(bytes).toString('utf8'); }
-      catch { out[k] = null; }
+    // Already-parsed `Value` message (new `google.protobuf.Value`-typed map values).
+    // Distinguish a Value proto message from a plain JS object by looking for the
+    // tell-tale `kind` oneof. toJson unwraps Value to a plain JSON value.
+    if (typeof v === 'object' && v.kind && typeof v.kind.case === 'string') {
+      try { out[k] = toJson(wkt.ValueSchema, v); continue; }
+      catch { out[k] = null; continue; }
     }
+    // Anything else (plain JS value already): pass through.
+    out[k] = v;
   }
   return out;
 }

@@ -1444,6 +1444,19 @@ Fix: `buildMcpToolDefinitions` now produces a `Value` object (`fromJson(wkt.Valu
 
 End-to-end verification: `claude -p "use WebSearch ..." --dangerously-skip-permissions` now completes; proxy log shows zero `unhandled exec` events and zero `interactionQuery case=undefined` abandons. The model's WebFetch interactionQueries are now properly recognized as `webFetchRequestQuery` and rejected via the existing handler (which causes the model to fall back to MCP-prefixed equivalents).
 
+### Round 2: `decodeMcpArgs` had the same bytes-vs-Value mismatch
+
+After the schema regen unblocked WebFetch tool definitions, the MODEL's `mcp_WebFetch` calls started failing in claude-code with `Invalid tool parameters`. Same proto change, opposite direction:
+
+- old .proto:  `map<string, bytes> args = 2;`            (values arrive as Uint8Array of Value bytes)
+- new .proto:  `map<string, google.protobuf.Value> args = 2;`  (values arrive as parsed Value proto objects)
+
+`decodeMcpArgs` checked `instanceof Uint8Array` / `typeof === 'string'` / else "already a JS value". The else branch passed the raw Value proto object through unchanged. claude-code received `{url: {kind: {case: 'stringValue', value: 'https://...'}}}` instead of `{url: 'https://...'}` and its MCP validator rejected.
+
+Fix: when the map value is a Value proto message (detected by `obj.kind.case`), unwrap via `toJson(wkt.ValueSchema, v)`. Bytes / base64 / Uint8Array paths preserved for backward compat. Both wire shapes now produce identical plain JS values.
+
+Verified end-to-end: `claude -p "use WebFetch to fetch https://example.com..." --dangerously-skip-permissions` completes, model gets real page content, no `Invalid tool parameters` errors. Tool calls in the log show clean JSON args, e.g. `WebFetch({"url":"https://example.com","prompt":"What is on this page?"})`.
+
 **Investigation aside**: the original hypothesis that the `interactionQuery case=undefined` log flood was *causing* user-visible stalls was wrong. The original reproducer log shows 10 abandons inside a subagent turn that nevertheless ended successfully with 866 output bytes. The user-visible stall in that case was a Cursor-backend `Upstream stalled — no progress for 165s` event on the parent's `tool_result` roundtrip, handled by our existing watchdog retry. The abandon noise was cosmetic.
 
 ---
