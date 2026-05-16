@@ -666,6 +666,29 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
     sendExecClientMessage(id, execId, 'diagnosticsResult', result, sendBinaryFrame);
     return 'diagnostics';
   }
+  // MCP resource discovery: we host zero MCP resource servers, so reply
+  // with an empty success list. Without a reply the model stalls waiting
+  // for our response (the symptom: `unhandled exec case=
+  // listMcpResourcesExecArgs` followed by the turn never reaching
+  // turnEnded). Empty success is more honest than `rejected` here — the
+  // listing succeeded, the result set is just empty.
+  if (msgCase === 'listMcpResourcesExecArgs') {
+    const result = create(A.ListMcpResourcesExecResultSchema, {
+      result: { case: 'success', value: create(A.ListMcpResourcesSuccessSchema, { resources: [] }) },
+    });
+    sendExecClientMessage(id, execId, 'listMcpResourcesExecResult', result, sendBinaryFrame);
+    return 'listMcpResources';
+  }
+  // Same shape for individual resource reads. With list returning empty
+  // the model shouldn't issue these, but defensively answer not_found so
+  // a confused model doesn't stall the turn.
+  if (msgCase === 'readMcpResourceExecArgs') {
+    const result = create(A.ReadMcpResourceExecResultSchema, {
+      result: { case: 'notFound', value: create(A.ReadMcpResourceNotFoundSchema, { uri: msgValue?.uri || '' }) },
+    });
+    sendExecClientMessage(id, execId, 'readMcpResourceExecResult', result, sendBinaryFrame);
+    return 'readMcpResource';
+  }
 
   console.log(`[cursor-agent] unhandled exec case=${msgCase} execId=${execId}`);
   return 'unknown';
@@ -1802,4 +1825,6 @@ module.exports = {
   buildHeaders,
   loadProto,
   prewarmSharedClient,
+  // Internals exposed for unit tests only — not part of the public API.
+  _handleExecMessage: handleExecMessage,
 };

@@ -1379,6 +1379,33 @@ Considered. Rejected because:
 
 ---
 
+## MCP resource discovery handler (2026-05-15)
+
+### Symptom
+
+In a session that fired several `WebSearch` tool_use blocks (claude-code routes WebSearch through a `Task` subagent — a fresh conversation with `tools=1`), the proxy log showed:
+
+```
+[cursor-agent] unhandled exec case=listMcpResourcesExecArgs execId=…
+```
+
+The subagent's turn never reached `turnEnded`. The user filed it as "WebSearch seems not supported?" — actually WebSearch was fine (it routed back to claude-code as a normal tool_use); the stall was the *Cursor model inside the subagent* probing for MCP resources and not getting a reply.
+
+### Root cause
+
+`handleExecMessage` in `src/cursor-agent.js` had branches for the common exec cases (read/ls/write/delete/shell/shellStream/backgroundShellSpawn/grep/fetch/writeShellStdin/diagnostics + the mcpArgs bubble-up) but no branch for `listMcpResourcesExecArgs` or `readMcpResourceExecArgs`. The unhandled cases fell to the default `console.log('unhandled exec case=…')` and returned without sending a reply. Cursor's model treats no-reply as "client is still working" — the BiDi stream waits forever.
+
+### Fix
+
+Two new branches in `handleExecMessage`:
+
+- `listMcpResourcesExecArgs` → reply with `ListMcpResourcesExecResult { success: { resources: [] } }`. We host zero MCP resource servers, so empty success is the honest answer.
+- `readMcpResourceExecArgs` → reply with `ReadMcpResourceExecResult { notFound: { uri } }`. List returns empty so the model shouldn't issue these, but a confused model issuing them anyway should get a fast `not_found` instead of stalling.
+
+Verified by unit test that exercises both paths through `_handleExecMessage` (a test-only export added on `src/cursor-agent.js`): correct oneof case selected, expected payload echoed.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
