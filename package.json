@@ -7,13 +7,23 @@
     "start": "node server.js",
     "dev": "node server.js"
   },
-  "keywords": ["cursor", "openai", "api", "proxy"],
+  "keywords": [
+    "cursor",
+    "openai",
+    "api",
+    "proxy"
+  ],
   "author": "",
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
+    "@bufbuild/protobuf": "^2.12.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
+    "tdigest": "^0.1.2",
     "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }
