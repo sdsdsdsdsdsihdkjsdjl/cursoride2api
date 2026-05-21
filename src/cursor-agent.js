@@ -81,11 +81,26 @@ function encodeFrame(payload) {
 // fresh UUID per Cursor stream as x-session-id, plus the other client-type
 // hints. All overridable via env if a deployment needs to lie about its OS.
 const _clientType = process.env.CURSOR_CLIENT_TYPE || 'ide';
-const _clientOs = process.env.CURSOR_CLIENT_OS || (process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows_nt' : 'linux');
-const _clientArch = process.env.CURSOR_CLIENT_ARCH || (process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch);
 const _clientDevice = process.env.CURSOR_CLIENT_DEVICE_TYPE || 'desktop';
-const _clientOsVersion = process.env.CURSOR_CLIENT_OS_VERSION || require('os').release();
 const _clientCommit = process.env.CURSOR_COMMIT || 'd5c0e77a0214208f36b56d42e8e787de88d02ea4';
+
+// OS/arch/version are resolved per-token because the token's machineId pair
+// records where it was minted. A token minted on a Mac (token.macMachineId
+// truthy) sent through Linux/Windows headers tripped Cursor's anti-abuse
+// gate — every RunSSE open returned resource_exhausted "rate limit". When
+// the token is Mac-shaped but the host is not, claim Mac so the bundle is
+// internally consistent. Env vars still win (CURSOR_CLIENT_OS etc.) so
+// deployments can override either direction.
+function resolveClientFingerprint(token) {
+  const fakeMac = !!(token && token.macMachineId) && process.platform !== 'darwin';
+  const clientOs = process.env.CURSOR_CLIENT_OS
+    || (fakeMac ? 'darwin' : (process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows_nt' : 'linux'));
+  const clientArch = process.env.CURSOR_CLIENT_ARCH
+    || (fakeMac ? 'arm64' : (process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch));
+  const clientOsVersion = process.env.CURSOR_CLIENT_OS_VERSION
+    || (fakeMac ? '23.5.0' : require('os').release());
+  return { clientOs, clientArch, clientOsVersion };
+}
 // Cache the timezone string at module load — Intl.DateTimeFormat() does
 // non-trivial work and the answer never changes mid-process.
 const _cursorTimezone = (() => {
@@ -94,6 +109,7 @@ const _cursorTimezone = (() => {
 })();
 
 function buildHeaders(token, sessionId) {
+  const fp = resolveClientFingerprint(token);
   return {
     ':method': 'POST',
     ':path': '/agent.v1.AgentService/Run',
@@ -111,11 +127,11 @@ function buildHeaders(token, sessionId) {
     'x-session-id': sessionId || uuidv4(),
     'x-ghost-mode': 'false',
     'x-cursor-client-type': _clientType,
-    'x-cursor-client-os': _clientOs,
-    'x-cursor-client-arch': _clientArch,
+    'x-cursor-client-os': fp.clientOs,
+    'x-cursor-client-arch': fp.clientArch,
     'x-cursor-client-device-type': _clientDevice,
     // IDE-style fingerprint padding; harmless if backend ignores
-    'x-cursor-client-os-version': _clientOsVersion,
+    'x-cursor-client-os-version': fp.clientOsVersion,
     'x-cursor-commit': _clientCommit,
   };
 }
@@ -1850,6 +1866,7 @@ module.exports = {
   deterministicConversationId,
   encodeFrame,
   buildHeaders,
+  resolveClientFingerprint,
   loadProto,
   prewarmSharedClient,
   // Internals exposed for unit tests only — not part of the public API.
