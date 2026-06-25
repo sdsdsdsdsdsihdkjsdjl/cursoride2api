@@ -191,10 +191,16 @@ for chunk in resp:
 | `CURSOR_STALL_TIMEOUT_MS` | _(自动)_ | 全局覆盖按模型计算的 pre-content stall 阈值；通常不需要 — 让 `src/stall-thresholds.js` 按模型推导 |
 | `CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT` | _(自动)_ | 全局覆盖 post-content stall 阈值；同上 |
 | `CURSOR_FORCE_THINKING` | _(空)_ | `on`/`off`/`adaptive` — 全局覆盖客户端的 `thinking.type` |
-| `CURSOR_EMIT_THINKING_BLOCKS` | _(空=off)_ | `1` 时输出 `thinking` 内容块（缺签名，会破坏切换到真实 Anthropic API 的会话续传）。默认关闭以保证可移植性 |
+| `CURSOR_PROXY_THINKING_BLOCKS` | _(空=off)_ | `1` 时仅在客户端请求 `thinking.type=enabled` 时输出带 `proxy-local-thinking-v1.*` 签名的 thinking 块；后续提示会自动剥离这些代理本地块 |
+| `CURSOR_EMIT_THINKING_BLOCKS` | _(空=off)_ | 旧别名；等同于 `CURSOR_PROXY_THINKING_BLOCKS=1` |
 | `CURSOR_REINJECT_THINKING` | _(空=off)_ | `1` 时启用代理端思考连续性：把模型上一轮的思考内容（带 `<thinking>...</thinking>` 标签）回注到下一轮提示中。在 Cursor 的 ChatService（带签名）不可用时的近似方案。代价是每次续传都会多出几百到几千 token。详见 [DEVLOG.md](DEVLOG.md) 中的 "Proxy-side thinking re-injection" 章节。 |
 | `CURSOR_REINJECT_THINKING_MAX_BYTES_PER_TURN` | `4096` | 每轮存储的思考字节上限（避免长会话膨胀） |
 | `CURSOR_REINJECT_THINKING_MAX_TURNS` | `5` | 每个会话保留的思考轮数上限 |
+| `CURSOR_ALLOW_CLIENT_WEBSEARCH` | _(空=off)_ | 默认过滤客户端声明的 WebSearch/Search 工具，让 broad search 走 Cursor native WebSearch；设 `1` 才转发客户端 WebSearch |
+| `CURSOR_ALLOW_CLIENT_WEBFETCH` | _(空=off)_ | 默认在 `CURSOR_SERVER_WEBFETCH!=0` 时保留客户端 WebFetch/Fetch；设 `1` 强制保留 |
+| `CURSOR_ALLOW_CLIENT_WEB_TOOLS` | _(空=off)_ | 同时保留客户端 WebSearch 和 WebFetch |
+| `CURSOR_SUBAGENT_TYPE_MAP` | _(空)_ | Cursor native subagent → Claude Code `Task.subagent_type` 映射，例如 `explore=Explore,plan=Plan` |
+| `CURSOR_SUBAGENT_MODEL_KEYWORDS` | `sonnet,opus,haiku` | 允许透传给 Claude Code `Task.model` 的关键字；其它 Cursor 后端模型 slug 会被丢弃以避免客户端 schema 校验失败 |
 | `RUNTIME_STATS_FILE` | `./logs/runtime-stats.json` | 运行时统计持久化文件路径 |
 | `RUNTIME_STATS_PERSIST_MS` | `60000` | 统计快照写盘间隔 (ms) |
 | `RUNTIME_STATS_RECENT` | `1000` | 滚动窗口大小（用于时间分桶视图） |

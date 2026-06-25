@@ -190,8 +190,21 @@ function getThreshold(model) {
   const elevation = _currentElevation(s);
   const hardCapPre  = baseline.pre  * ELEVATION_HARD_CAP_FACTOR;
   const hardCapPost = baseline.post * ELEVATION_HARD_CAP_FACTOR;
-  const pre  = Math.min(hardCapPre,  Math.round(basePre  * elevation));
-  const post = Math.min(hardCapPost, Math.round(basePost * elevation));
+  let pre  = Math.min(hardCapPre,  Math.round(basePre  * elevation));
+  let post = Math.min(hardCapPost, Math.round(basePost * elevation));
+
+  // Honor documented env-var overrides for deployments that know their
+  // upstream/client tool round-trips need more headroom than the heuristics.
+  const envPre = process.env.CURSOR_STALL_TIMEOUT_MS;
+  const envPost = process.env.CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT;
+  if (envPre && /^\d+$/.test(envPre)) {
+    const v = parseInt(envPre, 10);
+    if (v > 0) { pre = v; source = 'env-override'; }
+  }
+  if (envPost && /^\d+$/.test(envPost)) {
+    const v = parseInt(envPost, 10);
+    if (v > 0) { post = v; source = 'env-override'; }
+  }
 
   const out = { pre, post, source, elevation };
   if (s) {

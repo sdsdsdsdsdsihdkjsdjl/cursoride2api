@@ -1,4 +1,4 @@
-// Streaming filter that suppresses `[Tool call: NAME({...})]` substrings
+// Streaming filter that suppresses textual tool-call substrings
 // from outbound text deltas before they reach claude-code.
 //
 // Why this exists:
@@ -9,8 +9,9 @@
 // tool_use block from those text patterns so the tool actually runs. But
 // the *original text* the model wrote was already on the wire by the time
 // the rescue runs, so claude-code displays the bracketed string as visible
-// junk above the rescued tool's result — `[Tool call: Read({...})]` on one
-// line, `Read 1 file (ctrl+o to expand)` on the next.
+// junk above the rescued tool's result — `[Tool call: Read({...})]` or
+// `[Tool call] Read({...})` on one line, `Read 1 file (ctrl+o to expand)`
+// on the next.
 //
 // Real Claude Code never shows that bracketed line. This filter matches
 // that behavior: any text delta containing `[Tool call: ...]` is held back
@@ -19,15 +20,19 @@
 //
 // Latency: at most one delta's worth. Text that doesn't contain `[` is
 // forwarded immediately. Text that begins with `[` is held until either
-// (a) the next character disambiguates against `[Tool call: ` prefix
+// (a) the next character disambiguates against a known tool-call prefix
 // (flushed immediately), or (b) the complete `[Tool call: NAME({...})]`
-// pattern resolves (matched range dropped, surrounding text forwarded).
+// / `[Tool call] NAME({...})` pattern resolves (matched range dropped,
+// surrounding text forwarded).
 //
 // The full original text (including the suppressed spans) still goes into
 // turnState.emittedTextForDetection so the structural rescue can find the
 // hits and synthesize tool_use blocks from them.
 
-const TAG = '[Tool call: ';
+const TAGS = [
+  { tag: '[Tool call: ', bracketAfterTag: false },
+  { tag: '[Tool call] ', bracketAfterTag: true },
+];
 
 class StreamingHallucinationFilter {
   constructor({ maxBufferSize = 64 * 1024 } = {}) {
@@ -58,24 +63,27 @@ class StreamingHallucinationFilter {
         out += this._buf.slice(0, bracketIdx);
         this._buf = this._buf.slice(bracketIdx);
       }
-      // Buffer now starts with `[`. Check the prefix against TAG.
-      const lenToCheck = Math.min(this._buf.length, TAG.length);
-      const prefixMatches = this._buf.slice(0, lenToCheck) === TAG.slice(0, lenToCheck);
-      if (!prefixMatches) {
-        // This `[` is definitely NOT the start of `[Tool call: ` — flush
+      // Buffer now starts with `[`. Check the prefix against known tags.
+      const possibleTags = TAGS.filter(({ tag }) => {
+        const lenToCheck = Math.min(this._buf.length, tag.length);
+        return this._buf.slice(0, lenToCheck) === tag.slice(0, lenToCheck);
+      });
+      if (possibleTags.length === 0) {
+        // This `[` is definitely NOT the start of a tool-call marker — flush
         // just the `[` and continue scanning for the next bracket.
         out += this._buf[0];
         this._buf = this._buf.slice(1);
         continue;
       }
-      if (this._buf.length < TAG.length) {
+      const completeTags = possibleTags.filter(({ tag }) => this._buf.length >= tag.length);
+      if (completeTags.length === 0) {
         // Partial prefix match — could become a pattern with more text.
         // Hold and wait for more deltas. Bounded by maxBufferSize.
         break;
       }
-      // Buffer starts with the full TAG. Find the closing `]` of the
-      // `[Tool call: NAME({...})]` pattern.
-      const closeIdx = this._findPatternClose(this._buf);
+      // Buffer starts with a full tag. Find the end of the textual tool-call
+      // pattern.
+      const closeIdx = this._findPatternClose(this._buf, completeTags[0]);
       if (closeIdx === -1) {
         // Pattern not yet complete — keep buffering, unless we've
         // exceeded the safety limit, in which case flush as text (better
@@ -105,19 +113,22 @@ class StreamingHallucinationFilter {
     return out;
   }
 
-  // Internal: given a buffer starting with TAG, find the index of the
-  // closing `]` of the `[Tool call: NAME]` or `[Tool call: NAME({...})]`
-  // pattern. Returns -1 if the pattern is not yet complete.
+  // Internal: given a buffer starting with a tag, find the end index of the
+  // `[Tool call: NAME]`, `[Tool call: NAME({...})]`, or
+  // `[Tool call] NAME({...})` pattern. Returns -1 if the pattern is not yet
+  // complete.
   //
   // Mirrors parseHallucinatedToolCalls in anthropic-tools.js — brace-
   // counting with quoted-string awareness so `{` / `}` inside JSON
   // strings don't perturb depth.
-  _findPatternClose(buf) {
-    let p = TAG.length;
+  _findPatternClose(buf, tagInfo) {
+    const tag = tagInfo && tagInfo.tag ? tagInfo.tag : TAGS[0].tag;
+    const bracketAfterTag = !!(tagInfo && tagInfo.bracketAfterTag);
+    let p = tag.length;
     // Read tool name up to '(' or ']'.
     while (p < buf.length && buf[p] !== '(' && buf[p] !== ']') p++;
     if (p >= buf.length) return -1;
-    if (buf[p] === ']') return p;
+    if (buf[p] === ']') return bracketAfterTag ? -1 : p;
     // Must be '(' — expect '({...})' or '(...)'.
     if (buf[p] !== '(') return -1;
     if (p + 1 >= buf.length) return -1;
@@ -145,6 +156,7 @@ class StreamingHallucinationFilter {
       if (q >= buf.length) return -1;
       if (buf[q] === ')') q++;
       else return -1;
+      if (bracketAfterTag) return q - 1;
       if (q >= buf.length) return -1;
       if (buf[q] === ']') return q;
       return -1;
@@ -154,6 +166,7 @@ class StreamingHallucinationFilter {
     while (q < buf.length && buf[q] !== ')') q++;
     if (q >= buf.length) return -1;
     q++;  // past ')'
+    if (bracketAfterTag) return q - 1;
     if (q >= buf.length) return -1;
     if (buf[q] === ']') return q;
     return -1;

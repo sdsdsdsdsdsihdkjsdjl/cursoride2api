@@ -61,6 +61,51 @@ function frameConnectMessage(payload, flags = 0) {
   return frame;
 }
 
+function normalizeImageBytes(image) {
+  if (!image || typeof image !== 'object') return null;
+  const raw = image.data ?? image.bytes ?? image.content;
+  if (raw instanceof Uint8Array || Buffer.isBuffer(raw)) return new Uint8Array(raw);
+  if (Array.isArray(raw)) return new Uint8Array(Buffer.from(raw));
+  const b64 = image.dataBase64 || image.base64 || image.contentBase64;
+  if (typeof b64 === 'string' && b64) {
+    const comma = b64.startsWith('data:') ? b64.indexOf(',') : -1;
+    const clean = comma >= 0 ? b64.slice(comma + 1) : b64;
+    try {
+      const buf = Buffer.from(clean, 'base64');
+      return buf.length > 0 ? new Uint8Array(buf) : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function buildSelectedContextForImages(create, agent, images) {
+  const selectedImages = [];
+  for (const image of images || []) {
+    if (!image || image.kind !== 'image') continue;
+    const data = normalizeImageBytes(image);
+    if (!data || data.length === 0) continue;
+    const fields = {
+      uuid: image.uuid || uuidv4(),
+      path: image.path || '',
+      mimeType: image.mediaType || image.mimeType || 'image/png',
+      dataOrBlobId: { case: 'data', value: data },
+    };
+    const width = Number(image.width ?? image.dimensions?.width ?? image.dimension?.width);
+    const height = Number(image.height ?? image.dimensions?.height ?? image.dimension?.height);
+    if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
+      fields.dimension = create(agent.SelectedImage_DimensionSchema, {
+        width: Math.floor(width),
+        height: Math.floor(height),
+      });
+    }
+    selectedImages.push(create(agent.SelectedImageSchema, fields));
+  }
+  if (selectedImages.length === 0) return undefined;
+  return create(agent.SelectedContextSchema, { selectedImages });
+}
+
 // Legacy export — historical callers (anthropic-tools.js used to call this)
 // passed plain JS objects. We keep the name and accept Uint8Array-or-Buffer.
 function encodeFrame(payload) {
@@ -402,6 +447,298 @@ function decodeValueBytes(buf) {
   return toJson(wkt.ValueSchema, v);
 }
 
+// ═══════════════════════════════════════════════
+//  Minimal protobuf wire helpers for forward-compatible exec cases
+// ═══════════════════════════════════════════════
+//
+// Cursor can add ExecServerMessage oneof branches before this vendored proto
+// is regenerated. Buf preserves them in `$unknown`, but `message.case` is
+// undefined. These helpers let us answer known newer branches by field number.
+
+const WIRE_VARINT = 0;
+const WIRE_LENGTH_DELIMITED = 2;
+
+function _asUint8Array(data) {
+  if (!data) return new Uint8Array(0);
+  if (data instanceof Uint8Array) return data;
+  if (Buffer.isBuffer(data)) return new Uint8Array(data);
+  if (Array.isArray(data)) return new Uint8Array(data);
+  return new Uint8Array(0);
+}
+
+function protoVarint(value) {
+  let n = Number(value);
+  if (!Number.isFinite(n) || n < 0) n = 0;
+  n = Math.floor(n);
+  const out = [];
+  while (n > 0x7f) {
+    out.push((n & 0x7f) | 0x80);
+    n = Math.floor(n / 128);
+  }
+  out.push(n);
+  return Buffer.from(out);
+}
+
+function protoTag(fieldNo, wireType) {
+  return protoVarint((fieldNo * 8) + wireType);
+}
+
+function protoFieldBytes(fieldNo, bytes) {
+  const b = Buffer.from(_asUint8Array(bytes));
+  return Buffer.concat([protoTag(fieldNo, WIRE_LENGTH_DELIMITED), protoVarint(b.length), b]);
+}
+
+function protoFieldString(fieldNo, value) {
+  return protoFieldBytes(fieldNo, Buffer.from(String(value || ''), 'utf8'));
+}
+
+function protoFieldUInt32(fieldNo, value) {
+  return Buffer.concat([protoTag(fieldNo, WIRE_VARINT), protoVarint(value)]);
+}
+
+function protoMessage(fields) {
+  return Buffer.concat((fields || []).filter((b) => b && b.length > 0).map((b) => Buffer.from(b)));
+}
+
+function readProtoVarint(bytes, offset) {
+  let result = 0;
+  let shift = 0;
+  let pos = offset || 0;
+  while (pos < bytes.length) {
+    const b = bytes[pos++];
+    result += (b & 0x7f) * Math.pow(2, shift);
+    if ((b & 0x80) === 0) return { value: result, offset: pos };
+    shift += 7;
+    if (shift > 56) break;
+  }
+  return { value: 0, offset: pos, error: true };
+}
+
+function readProtoLengthDelimited(data, start) {
+  const lenInfo = readProtoVarint(data, start);
+  const len = lenInfo.value || 0;
+  const bodyStart = lenInfo.offset;
+  const bodyEnd = Math.min(bodyStart + len, data.length);
+  return { bytes: data.subarray(bodyStart, bodyEnd), offset: bodyEnd };
+}
+
+function skipProtoField(data, wireType, offset) {
+  if (wireType === WIRE_VARINT) return readProtoVarint(data, offset).offset;
+  if (wireType === 1) return Math.min(offset + 8, data.length);
+  if (wireType === WIRE_LENGTH_DELIMITED) return readProtoLengthDelimited(data, offset).offset;
+  if (wireType === 5) return Math.min(offset + 4, data.length);
+  return data.length;
+}
+
+function parseLengthDelimitedFields(bytes) {
+  const data = _asUint8Array(bytes);
+  const out = [];
+  let offset = 0;
+  while (offset < data.length) {
+    const tag = readProtoVarint(data, offset);
+    if (tag.error || tag.offset <= offset) break;
+    offset = tag.offset;
+    const no = Math.floor(tag.value / 8);
+    const wireType = tag.value & 7;
+    if (wireType === WIRE_LENGTH_DELIMITED) {
+      const value = readProtoLengthDelimited(data, offset);
+      out.push({ no, wireType, data: value.bytes });
+      offset = value.offset;
+    } else {
+      const next = skipProtoField(data, wireType, offset);
+      out.push({ no, wireType, data: data.subarray(offset, next) });
+      offset = next;
+    }
+  }
+  return out;
+}
+
+function getUnknownLengthDelimited(execMsg, fieldNo) {
+  const unknown = Array.isArray(execMsg?.$unknown) ? execMsg.$unknown : [];
+  return unknown.find((u) => u && u.no === fieldNo && u.wireType === WIRE_LENGTH_DELIMITED) || null;
+}
+
+function getUnknownLengthDelimitedPayload(execMsg, fieldNo) {
+  const unknown = getUnknownLengthDelimited(execMsg, fieldNo);
+  if (!unknown) return null;
+  const raw = _asUint8Array(unknown.data);
+  // Buf stores unknown length-delimited field data as the encoded length
+  // varint plus the field body. Strip the length before decoding.
+  return readProtoLengthDelimited(raw, 0).bytes;
+}
+
+function describeUnknownFields(message) {
+  const unknown = Array.isArray(message?.$unknown) ? message.$unknown : [];
+  if (unknown.length === 0) return 'unknownFields=[]';
+  const parts = unknown.map((u) => {
+    const data = _asUint8Array(u?.data);
+    return `{no=${u?.no},wire=${u?.wireType},len=${data.length},hex=${Buffer.from(data.subarray(0, 16)).toString('hex')}}`;
+  });
+  return `unknownFields=[${parts.join(',')}]`;
+}
+
+function decodeUtf8(bytes) {
+  try { return Buffer.from(_asUint8Array(bytes)).toString('utf8'); }
+  catch { return ''; }
+}
+
+function decodeSubagentArgs(bytes) {
+  const args = {};
+  for (const f of parseLengthDelimitedFields(bytes)) {
+    if (f.no === 1) args.toolCallId = decodeUtf8(f.data);
+    else if (f.no === 2) args.subagentType = decodeUtf8(f.data);
+    else if (f.no === 3) args.modelId = decodeUtf8(f.data);
+    else if (f.no === 4) args.prompt = decodeUtf8(f.data);
+    else if (f.no === 6) args.resumeAgentId = decodeUtf8(f.data);
+    else if (f.no === 9) args.parentConversationId = decodeUtf8(f.data);
+  }
+  return args;
+}
+
+function textFromToolResultContent(content) {
+  if (typeof content === 'string') return content;
+  if (content && Array.isArray(content.items)) {
+    return content.items
+      .filter((i) => i?.kind === 'text')
+      .map((i) => i.text || '')
+      .join('\n');
+  }
+  if (content && typeof content === 'object' && content.error) {
+    return `[tool_error] ${String(content.error)}`;
+  }
+  if (content == null) return '';
+  try { return JSON.stringify(content); }
+  catch { return String(content); }
+}
+
+function firstNonEmptyLine(text) {
+  const lines = String(text || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return lines[0] || '';
+}
+
+function buildAgentClientMessagePayload(execClientPayload) {
+  // AgentClientMessage.message.exec_client_message = 2
+  return protoFieldBytes(2, execClientPayload);
+}
+
+function sendRawAgentClientMessage(payload, sendBinaryFrame) {
+  sendBinaryFrame(Buffer.from(payload));
+}
+
+function sendRawExecClientMessageAndClose(id, execId, oneofFieldNo, resultPayload, sendBinaryFrame) {
+  const execClientPayload = protoMessage([
+    protoFieldUInt32(1, id || 0),
+    protoFieldString(15, execId || ''),
+    protoFieldBytes(oneofFieldNo, resultPayload || new Uint8Array(0)),
+  ]);
+  sendRawAgentClientMessage(buildAgentClientMessagePayload(execClientPayload), sendBinaryFrame);
+  sendExecClientControlMessage(id, 'streamClose', sendBinaryFrame);
+}
+
+function buildExecuteHookResultPayload(executeHookArgsBytes) {
+  // ExecuteHookArgs.request = 1; mirror the request case with an empty
+  // "allow / continue" response when we can identify it.
+  const requestField = parseLengthDelimitedFields(executeHookArgsBytes).find((f) => f.no === 1);
+  const requestCase = requestField
+    ? parseLengthDelimitedFields(requestField.data).find((f) => f.no >= 1 && f.no <= 6)?.no
+    : null;
+  const responsePayload = requestCase && requestCase >= 1 && requestCase <= 6
+    ? protoFieldBytes(requestCase, new Uint8Array(0))
+    : new Uint8Array(0);
+  // ExecuteHookResult.response = 1
+  return protoFieldBytes(1, responsePayload);
+}
+
+function buildSubagentErrorResultPayload(errorText, agentId = '') {
+  const subagentError = protoMessage([
+    agentId ? protoFieldString(1, agentId) : null,
+    protoFieldString(2, errorText),
+  ]);
+  // SubagentResult.result.error = 2
+  return protoFieldBytes(2, subagentError);
+}
+
+function buildSubagentSuccessResultPayload({ agentId, finalMessage, toolCallCount }) {
+  const success = protoMessage([
+    protoFieldString(1, agentId || `cursoride2api-subagent-${Date.now().toString(36)}`),
+    finalMessage ? protoFieldString(2, finalMessage) : null,
+    protoFieldUInt32(3, Number.isFinite(toolCallCount) ? toolCallCount : 0),
+  ]);
+  // SubagentResult.result.success = 1
+  return protoFieldBytes(1, success);
+}
+
+function summarizeSubagentToolResult(content) {
+  const text = textFromToolResultContent(content);
+  if (content && typeof content === 'object' && content.error) {
+    return { ok: false, error: String(content.error) };
+  }
+  return {
+    ok: true,
+    finalMessage: text,
+    agentId: firstNonEmptyLine(text).match(/\b(?:agent[_ -]?id|id)\s*[:=]\s*([A-Za-z0-9_.:-]+)/i)?.[1] || '',
+    toolCallCount: 0,
+  };
+}
+
+const DEFAULT_SUBAGENT_MODEL_KEYWORDS = 'sonnet,opus,haiku';
+
+function _envFirst(...names) {
+  for (const name of names) {
+    if (process.env[name] != null) return process.env[name];
+  }
+  return undefined;
+}
+
+function _parseSubagentTypeMap(spec) {
+  const map = new Map();
+  for (const pair of String(spec || '').split(',')) {
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    const k = pair.slice(0, eq).trim().toLowerCase();
+    const v = pair.slice(eq + 1).trim();
+    if (k && v) map.set(k, v);
+  }
+  return map;
+}
+
+function normalizeSubagentType(raw) {
+  const def = (_envFirst('CURSOR_SUBAGENT_TYPE_DEFAULT', 'RATLC_SUBAGENT_TYPE_DEFAULT') || 'general-purpose').trim() || 'general-purpose';
+  const key = String(raw || '').trim().toLowerCase();
+  if (!key) return def;
+  const userMap = _parseSubagentTypeMap(_envFirst('CURSOR_SUBAGENT_TYPE_MAP', 'RATLC_SUBAGENT_TYPE_MAP'));
+  if (userMap.has(key)) return userMap.get(key);
+  if (key === 'general-purpose' || key === 'general' || key === 'general_purpose') return 'general-purpose';
+  return def;
+}
+
+function normalizeSubagentModel(raw) {
+  if (_envFirst('CURSOR_SUBAGENT_FORWARD_MODEL', 'RATLC_SUBAGENT_FORWARD_MODEL') === '0') return '';
+  const key = String(raw || '').trim().toLowerCase();
+  if (!key) return '';
+  const keywords = (_envFirst('CURSOR_SUBAGENT_MODEL_KEYWORDS', 'RATLC_SUBAGENT_MODEL_KEYWORDS') || DEFAULT_SUBAGENT_MODEL_KEYWORDS)
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return keywords.includes(key) ? key : '';
+}
+
+function buildSubagentToolArgsFromWire(argsBytes) {
+  const decoded = decodeSubagentArgs(argsBytes);
+  const prompt = decoded.prompt || '';
+  const rawType = decoded.subagentType || '';
+  const description = firstNonEmptyLine(prompt).slice(0, 80) || rawType || 'Cursor subagent';
+  const args = { description, prompt, subagent_type: normalizeSubagentType(rawType) };
+  const model = normalizeSubagentModel(decoded.modelId || '');
+  if (model) args.model = model;
+  if (decoded.resumeAgentId && _envFirst('CURSOR_SUBAGENT_FORWARD_RESUME', 'RATLC_SUBAGENT_FORWARD_RESUME') === '1') {
+    args.resume = decoded.resumeAgentId;
+  }
+  return {
+    decoded,
+    args,
+    toolCallId: decoded.toolCallId || `cursor-subagent-${crypto.randomBytes(8).toString('hex')}`,
+  };
+}
+
 // ── Decode mcpArgs.args into a plain JS object ──
 // Wire shape varies by McpArgs.args field definition in the .proto:
 //   OLD: map<string, bytes>  — values arrive as Uint8Array of Value bytes
@@ -558,13 +895,14 @@ function buildMcpToolDefinitions(mcpToolsRaw) {
 //  ExecServerMessage handling
 // ═══════════════════════════════════════════════
 
-function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
+function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opts = {}) {
   const { create, toBinary, agent } = _requireProto();
   const A = agent;
   const id = execMsg.id;
   const execId = execMsg.execId || '';
   const msgCase = execMsg.message?.case;
   const msgValue = execMsg.message?.value;
+  const nativeExecKinds = opts && opts.nativeExecKinds;
 
   if (process.env.CURSOR_AGENT_DEBUG) {
     console.log(`[cursor-agent][debug] exec id=${id} execId=${execId} case=${msgCase}`);
@@ -590,7 +928,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
     const result = create(A.RequestContextResultSchema, {
       result: { case: 'success', value: create(A.RequestContextSuccessSchema, { requestContext }) },
     });
-    sendExecClientMessage(id, execId, 'requestContextResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'requestContextResult', result, sendBinaryFrame);
     return 'requestContext';
   }
 
@@ -604,6 +942,48 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
     return 'mcp';
   }
 
+  // Newer Cursor builds send execute_hook_args=27 and subagent_args=28 on
+  // ExecServerMessage before our vendored proto knows those oneofs.
+  const executeHookArgsBytes = !msgCase ? getUnknownLengthDelimitedPayload(execMsg, 27) : null;
+  if (executeHookArgsBytes) {
+    const resultPayload = buildExecuteHookResultPayload(executeHookArgsBytes);
+    sendRawExecClientMessageAndClose(id, execId, 27, resultPayload, sendBinaryFrame);
+    return 'executeHook-forward-compatible';
+  }
+
+  const subagentArgsBytes = !msgCase ? getUnknownLengthDelimitedPayload(execMsg, 28) : null;
+  if (subagentArgsBytes) {
+    const ssOpt = opts ? opts.subagentSupport : undefined;
+    const subagentSupported = typeof ssOpt === 'function' ? ssOpt() !== false : ssOpt !== false;
+    const hasTaskTool = (mcpToolDefs || []).some(t => (
+      t && (t.name === 'Task' || t.name === 'mcp_Task' || t.toolName === 'Task')
+    ));
+    if (subagentSupported && hasTaskTool && nativeExecKinds) {
+      const subagent = buildSubagentToolArgsFromWire(subagentArgsBytes);
+      nativeExecKinds.set(execId, { kind: 'subagent', ...subagent.decoded });
+      if (process.env.CURSOR_LOG_NATIVE_EXEC === '1') {
+        console.log(
+          `[cursor-agent] subagent passthrough execId=${execId || '(empty)'} ` +
+          `type:${subagent.decoded.subagentType || '(none)'}→${subagent.args.subagent_type} ` +
+          `model:${subagent.decoded.modelId || '(none)'}→${subagent.args.model || '(inherit)'}`
+        );
+      }
+      onMcpCall({
+        id,
+        execId,
+        toolCallId: subagent.toolCallId,
+        toolName: 'Task',
+        args: subagent.args,
+      });
+      return 'subagent-passthrough';
+    }
+    const reason = subagentSupported && !hasTaskTool
+      ? 'Client did not declare a Task tool for Cursor subagent passthrough.'
+      : 'Cursor subagent execution is disabled in this proxy.';
+    sendRawExecClientMessageAndClose(id, execId, 28, buildSubagentErrorResultPayload(reason), sendBinaryFrame);
+    return subagentSupported ? 'subagent-rejected' : 'subagent-disabled';
+  }
+
   const REJECT_REASON = 'Tool not available; use MCP tools.';
 
   // ── Reject native Cursor tools so the model falls back to MCP ──
@@ -611,28 +991,28 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
     const result = create(A.ReadResultSchema, {
       result: { case: 'rejected', value: create(A.ReadRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'readResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'readResult', result, sendBinaryFrame);
     return 'read';
   }
   if (msgCase === 'lsArgs') {
     const result = create(A.LsResultSchema, {
       result: { case: 'rejected', value: create(A.LsRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'lsResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'lsResult', result, sendBinaryFrame);
     return 'ls';
   }
   if (msgCase === 'writeArgs') {
     const result = create(A.WriteResultSchema, {
       result: { case: 'rejected', value: create(A.WriteRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'writeResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'writeResult', result, sendBinaryFrame);
     return 'write';
   }
   if (msgCase === 'deleteArgs') {
     const result = create(A.DeleteResultSchema, {
       result: { case: 'rejected', value: create(A.DeleteRejectedSchema, { path: msgValue?.path || '', reason: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'deleteResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'deleteResult', result, sendBinaryFrame);
     return 'delete';
   }
   if (msgCase === 'shellArgs') {
@@ -647,7 +1027,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
         }),
       },
     });
-    sendExecClientMessage(id, execId, 'shellResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'shellResult', result, sendBinaryFrame);
     return 'shell';
   }
   if (msgCase === 'shellStreamArgs') {
@@ -663,7 +1043,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
         }),
       },
     });
-    sendExecClientMessage(id, execId, 'shellStream', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'shellStream', result, sendBinaryFrame);
     return 'shellStream';
   }
   if (msgCase === 'backgroundShellSpawnArgs') {
@@ -678,35 +1058,35 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
         }),
       },
     });
-    sendExecClientMessage(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
     return 'backgroundShell';
   }
   if (msgCase === 'grepArgs') {
     const result = create(A.GrepResultSchema, {
       result: { case: 'error', value: create(A.GrepErrorSchema, { error: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'grepResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'grepResult', result, sendBinaryFrame);
     return 'grep';
   }
   if (msgCase === 'fetchArgs') {
     const result = create(A.FetchResultSchema, {
       result: { case: 'error', value: create(A.FetchErrorSchema, { url: msgValue?.url || '', error: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'fetchResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'fetchResult', result, sendBinaryFrame);
     return 'fetch';
   }
   if (msgCase === 'writeShellStdinArgs') {
     const result = create(A.WriteShellStdinResultSchema, {
       result: { case: 'error', value: create(A.WriteShellStdinErrorSchema, { error: REJECT_REASON }) },
     });
-    sendExecClientMessage(id, execId, 'writeShellStdinResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'writeShellStdinResult', result, sendBinaryFrame);
     return 'writeShellStdin';
   }
   if (msgCase === 'diagnosticsArgs') {
     const result = create(A.DiagnosticsResultSchema, {
       result: { case: 'success', value: create(A.DiagnosticsSuccessSchema, { path: msgValue?.path || '', diagnostics: [], totalDiagnostics: 0 }) },
     });
-    sendExecClientMessage(id, execId, 'diagnosticsResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'diagnosticsResult', result, sendBinaryFrame);
     return 'diagnostics';
   }
   // MCP resource discovery: we host zero MCP resource servers, so reply
@@ -719,7 +1099,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
     const result = create(A.ListMcpResourcesExecResultSchema, {
       result: { case: 'success', value: create(A.ListMcpResourcesSuccessSchema, { resources: [] }) },
     });
-    sendExecClientMessage(id, execId, 'listMcpResourcesExecResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'listMcpResourcesExecResult', result, sendBinaryFrame);
     return 'listMcpResources';
   }
   // Same shape for individual resource reads. With list returning empty
@@ -729,11 +1109,12 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall) {
     const result = create(A.ReadMcpResourceExecResultSchema, {
       result: { case: 'notFound', value: create(A.ReadMcpResourceNotFoundSchema, { uri: msgValue?.uri || '' }) },
     });
-    sendExecClientMessage(id, execId, 'readMcpResourceExecResult', result, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'readMcpResourceExecResult', result, sendBinaryFrame);
     return 'readMcpResource';
   }
 
-  console.log(`[cursor-agent] unhandled exec case=${msgCase} execId=${execId}`);
+  console.log(`[cursor-agent] unhandled exec case=${msgCase} execId=${execId} ${describeUnknownFields(execMsg)}`);
+  if (id != null) sendExecClientControlMessage(id, 'streamClose', sendBinaryFrame);
   return 'unknown';
 }
 
@@ -834,6 +1215,41 @@ function sendExecClientMessage(id, execId, messageCase, value, sendBinaryFrame) 
     message: { case: 'execClientMessage', value: execClient },
   });
   sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, wrapper));
+}
+
+// ── Build an ExecClientControlMessage and send it as a binary connect frame ──
+// Mirrors Cursor IDE behavior: after each final exec result, close the exec
+// stream so Cursor doesn't keep the tool slot open and stall the next call.
+function sendExecClientControlMessage(id, controlCase, sendBinaryFrame) {
+  const { create, toBinary, agent } = _requireProto();
+  let value;
+  if (controlCase === 'streamClose') {
+    value = create(agent.ExecClientStreamCloseSchema, { id });
+  } else if (controlCase === 'heartbeat') {
+    value = create(agent.ExecClientHeartbeatSchema, { id });
+  } else {
+    throw new Error(`Unsupported control message case: ${controlCase}`);
+  }
+  const ctrl = create(agent.ExecClientControlMessageSchema, {
+    message: { case: controlCase, value },
+  });
+  const wrapper = create(agent.AgentClientMessageSchema, {
+    message: { case: 'execClientControlMessage', value: ctrl },
+  });
+  sendBinaryFrame(toBinary(agent.AgentClientMessageSchema, wrapper));
+}
+
+function sendExecClientMessageAndClose(id, execId, messageCase, value, sendBinaryFrame) {
+  sendExecClientMessage(id, execId, messageCase, value, sendBinaryFrame);
+  sendExecClientControlMessage(id, 'streamClose', sendBinaryFrame);
+}
+
+function sendForwardCompatibleSubagentResult(id, execId, content, sendBinaryFrame) {
+  const summary = summarizeSubagentToolResult(content);
+  const resultPayload = summary.ok
+    ? buildSubagentSuccessResultPayload(summary)
+    : buildSubagentErrorResultPayload(summary.error || 'Subagent failed');
+  sendRawExecClientMessageAndClose(id, execId, 28, resultPayload, sendBinaryFrame);
 }
 
 // ── KV server message handling (blob store handshake) ──
@@ -967,6 +1383,10 @@ function startConversation(token, options = {}) {
   let turnEndedFired = false;
   // Blob store keyed by blobId hex string
   const blobStore = new Map();
+  // execId -> native/forward-compatible result kind. Currently used for
+  // unknown-field Cursor subagent calls that are surfaced to the API client as
+  // Claude Code Task tool_use blocks.
+  const _nativeExecKinds = new Map();
 
   // ── Per-stream telemetry (for failure diagnostics) ──
   // We log a one-line `📊 stream-summary` on every stream error so we can
@@ -1129,6 +1549,16 @@ function startConversation(token, options = {}) {
     _bytesInAtLastUsefulFrame = streamBytesIn;
     const { create, toBinary, agent } = _requireProto();
 
+    const nativeKindRaw = _nativeExecKinds.get(execId);
+    if (nativeKindRaw) {
+      _nativeExecKinds.delete(execId);
+      const nativeKind = typeof nativeKindRaw === 'string' ? nativeKindRaw : nativeKindRaw.kind;
+      if (nativeKind === 'subagent') {
+        sendForwardCompatibleSubagentResult(id, execId, content, sendBinaryFrame);
+        return;
+      }
+    }
+
     // Build the content[] array of MCP items
     function buildContentItems(items) {
       const out = [];
@@ -1195,7 +1625,7 @@ function startConversation(token, options = {}) {
       });
     }
     console.log(`[cursor-agent] sending tool result execId=${execId} ${summary}`);
-    sendExecClientMessage(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
+    sendExecClientMessageAndClose(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
   }
 
   // Top-level server message dispatch
@@ -1212,6 +1642,9 @@ function startConversation(token, options = {}) {
         hasEmittedContent = true;
         streamMcpCallCount++;
         currentCallbacks.onMcpCall(info);
+      }, {
+        nativeExecKinds: _nativeExecKinds,
+        subagentSupport: options.subagentSupport,
       });
       return;
     }
@@ -1484,10 +1917,13 @@ function startConversation(token, options = {}) {
       });
     }
 
-    const userMsg = create(agent.UserMessageSchema, {
+    const userMsgFields = {
       text: prompt,
       messageId: uuidv4(),
-    });
+    };
+    const selectedContext = buildSelectedContextForImages(create, agent, options.images);
+    if (selectedContext) userMsgFields.selectedContext = selectedContext;
+    const userMsg = create(agent.UserMessageSchema, userMsgFields);
     const action = create(agent.ConversationActionSchema, {
       action: {
         case: 'userMessageAction',
@@ -1869,6 +2305,11 @@ module.exports = {
   resolveClientFingerprint,
   loadProto,
   prewarmSharedClient,
+  sendExecClientControlMessage,
+  sendExecClientMessageAndClose,
+  sendForwardCompatibleSubagentResult,
+  buildSelectedContextForImages,
   // Internals exposed for unit tests only — not part of the public API.
   _handleExecMessage: handleExecMessage,
+  handleExecMessage,
 };

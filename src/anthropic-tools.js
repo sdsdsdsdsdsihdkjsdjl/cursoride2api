@@ -4,6 +4,75 @@
 
 const crypto = require('crypto');
 
+function _envFlag(name) {
+  return /^(1|true|yes)$/i.test(process.env[name] || '');
+}
+
+function normalizeClientToolNameForPolicy(name) {
+  return String(name || '')
+    .replace(/^mcp__[^_]+__/, '')
+    .replace(/^mcp_/, '')
+    .replace(/[-_\s.]/g, '')
+    .toLowerCase();
+}
+
+const MCP_WIRE_ALIAS_TOOL_NAMES = new Set([
+  'AskQuestion', 'Delete', 'Edit', 'EditNotebook', 'FetchMcpResource',
+  'GenerateImage', 'Glob', 'Grep', 'ListMcpResources', 'Read',
+  'ReadLints', 'Shell', 'StrReplace', 'SwitchMode', 'Task',
+  'TodoWrite', 'WebFetch', 'WebSearch', 'Write',
+]);
+
+function normalizeMcpWireToolNameForClient(name, registeredNames) {
+  const raw = String(name || '');
+  if (raw.startsWith('mcp_') && !raw.startsWith('mcp__')) {
+    const unprefixed = raw.slice(4);
+    if (!registeredNames || registeredNames.has(unprefixed) || MCP_WIRE_ALIAS_TOOL_NAMES.has(unprefixed)) {
+      return unprefixed;
+    }
+  }
+  return raw;
+}
+
+const CLIENT_WEB_SEARCH_TOOL_NAMES = new Set([
+  'websearch',
+  'websearchtool',
+  'search',
+]);
+
+const CLIENT_WEB_FETCH_TOOL_NAMES = new Set([
+  'webfetch',
+  'fetch',
+  'webfetchtool',
+  'browserfetch',
+]);
+
+function isClientWebSearchToolName(name) {
+  return CLIENT_WEB_SEARCH_TOOL_NAMES.has(normalizeClientToolNameForPolicy(name));
+}
+
+function isClientWebFetchToolName(name) {
+  return CLIENT_WEB_FETCH_TOOL_NAMES.has(normalizeClientToolNameForPolicy(name));
+}
+
+function isClientWebLookupToolName(name) {
+  return isClientWebSearchToolName(name) || isClientWebFetchToolName(name);
+}
+
+function shouldDropClientWebLookupToolName(name) {
+  if (isClientWebSearchToolName(name)) {
+    return !(_envFlag('CURSOR_ALLOW_CLIENT_WEB_TOOLS') || _envFlag('CURSOR_ALLOW_CLIENT_WEBSEARCH'));
+  }
+  if (isClientWebFetchToolName(name)) {
+    return !(
+      _envFlag('CURSOR_ALLOW_CLIENT_WEB_TOOLS') ||
+      _envFlag('CURSOR_ALLOW_CLIENT_WEBFETCH') ||
+      process.env.CURSOR_SERVER_WEBFETCH !== '0'
+    );
+  }
+  return false;
+}
+
 /**
  * Anthropic tool definitions → intermediate MCP tool descriptors.
  *
@@ -42,6 +111,11 @@ function anthropicToolsToMcpTools(tools, providerIdentifier) {
   if (!tools || !Array.isArray(tools) || tools.length === 0) return [];
 
   const provider = providerIdentifier || 'cursoride2api';
+  // Keep broad web search native to Cursor by default. Forwarding client
+  // WebSearch/Search tools creates MCP aliases that compete with Cursor's
+  // native web-search path and encourages local fallback behavior.
+  tools = tools.filter(t => !(t && shouldDropClientWebLookupToolName(t.name)));
+
   // Cursor's upstream provider rejects requests with too many tools
   // (empirical threshold ~10-12 tools regardless of trimming). Two knobs:
   //
@@ -469,16 +543,30 @@ function deriveBridgeKey(modelId, messages, system, tools, remoteAddr, remotePor
  */
 function extractClientSessionId(req) {
   if (!req) return null;
-  // 1. Direct header.
-  const h = req.headers && req.headers['x-claude-code-session-id'];
-  if (typeof h === 'string' && /^[0-9a-fA-F-]{16,}$/.test(h)) return h;
-  // 2. body.metadata.user_id is a JSON-encoded string. Defensive parse.
   try {
-    const raw = req.body && req.body.metadata && req.body.metadata.user_id;
-    if (typeof raw === 'string' && raw.length > 0 && raw[0] === '{') {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.session_id === 'string' && parsed.session_id.length >= 8) {
-        return parsed.session_id;
+    const hdr = req.headers && (
+      req.headers['x-claude-code-session-id']
+      || req.headers['X-Claude-Code-Session-Id']
+      || req.headers['anthropic-session-id']
+      || req.headers['x-anthropic-session-id']
+      || req.headers['x-session-id']
+    );
+    if (typeof hdr === 'string' && hdr.length > 0) return hdr;
+  } catch { /* ignore */ }
+  // Fallback: body.metadata.user_id. Some clients pass a JSON-encoded string;
+  // others pass a plain object. Try both shapes.
+  try {
+    const body = req.body || req._parsedBody || null;
+    if (body && body.metadata && body.metadata.user_id != null) {
+      let meta = body.metadata.user_id;
+      if (typeof meta === 'string') {
+        try { meta = JSON.parse(meta); } catch { /* leave as string */ }
+      }
+      if (meta && typeof meta === 'object' && typeof meta.session_id === 'string' && meta.session_id) {
+        return meta.session_id;
+      }
+      if (typeof meta === 'string' && meta) {
+        return meta;
       }
     }
   } catch { /* ignore — body shape varied or absent */ }
@@ -508,8 +596,9 @@ function hasToolResults(messages) {
 }
 
 /**
- * Detect "hallucinated tool calls" — text content matching the pattern
- * `[Tool call: NAME]` or `[Tool call: NAME({...json...})]` that the model
+ * Detect "hallucinated tool calls" — text content matching the patterns
+ * `[Tool call: NAME]`, `[Tool call: NAME({...json...})]`,
+ * `[Tool call] NAME`, or `[Tool call] NAME({...json...})` that the model
  * sometimes emits as a *text block* instead of a structured tool_use.
  * Cursor's model can fall out of "tool-use mode" (especially on long
  * contexts or when tool-name conflicts confuse it, e.g. the model wants
@@ -528,12 +617,24 @@ function hasToolResults(messages) {
 function parseHallucinatedToolCalls(text) {
   const results = [];
   if (!text || typeof text !== 'string') return results;
-  const TAG = '[Tool call: ';
+  const TAGS = [
+    { tag: '[Tool call: ', bracketAfterTag: false },
+    { tag: '[Tool call] ', bracketAfterTag: true },
+  ];
   let i = 0;
   while (i < text.length) {
-    const start = text.indexOf(TAG, i);
-    if (start === -1) break;
-    let p = start + TAG.length;
+    let match = null;
+    for (const candidate of TAGS) {
+      const idx = text.indexOf(candidate.tag, i);
+      if (idx === -1) continue;
+      if (!match || idx < match.start) {
+        match = { ...candidate, start: idx };
+      }
+    }
+    if (!match) break;
+
+    const start = match.start;
+    let p = start + match.tag.length;
     // Read tool name up to '(' or ']'.
     let nameEnd = p;
     while (nameEnd < text.length && text[nameEnd] !== '(' && text[nameEnd] !== ']') nameEnd++;
@@ -576,10 +677,15 @@ function parseHallucinatedToolCalls(text) {
       parseOk = false;
     }
     if (text[p] === ']') p++;
+    else if (match.bracketAfterTag) {
+      // `[Tool call] NAME({...})` closes its bracket before the name, so the
+      // parsed span ends at the args close.
+      p = Math.max(p, nameEnd);
+    }
 
     if (parseOk && name) results.push({ name, args, span: [start, p] });
     // Always advance past the start tag at minimum to avoid infinite loop.
-    i = Math.max(p, start + TAG.length);
+    i = Math.max(p, start + match.tag.length);
   }
   return results;
 }
@@ -593,11 +699,14 @@ const HALLUCINATED_NAME_ALIASES = {
   'Shell': 'Bash',
   'Ls': 'LS',
   'Fetch': 'WebFetch',
+  'StrReplace': 'Edit',
 };
 
 function canonicalizeHallucinatedToolName(name, registeredNames) {
   if (!name) return name;
   if (registeredNames && registeredNames.has(name)) return name;
+  const unprefixed = normalizeMcpWireToolNameForClient(name, registeredNames);
+  if (unprefixed !== name) return unprefixed;
   const aliased = HALLUCINATED_NAME_ALIASES[name];
   if (aliased && registeredNames && registeredNames.has(aliased)) return aliased;
   // Caller decides whether to forward as-is and let claude-code report
@@ -642,8 +751,24 @@ const TOOL_ARG_NORMALIZERS = {
   Edit(args) {
     if (!args || typeof args !== 'object') return args;
     if (args.old != null && args.old_string == null) { args.old_string = args.old; delete args.old; }
+    if (args.oldString != null && args.old_string == null) { args.old_string = args.oldString; delete args.oldString; }
+    if (args.old_str != null && args.old_string == null) { args.old_string = args.old_str; delete args.old_str; }
+    if (args.find != null && args.old_string == null) { args.old_string = args.find; delete args.find; }
+    if (args.target != null && args.old_string == null) { args.old_string = args.target; delete args.target; }
     if (args.new != null && args.new_string == null) { args.new_string = args.new; delete args.new; }
+    if (args.newString != null && args.new_string == null) { args.new_string = args.newString; delete args.newString; }
+    if (args.new_str != null && args.new_string == null) { args.new_string = args.new_str; delete args.new_str; }
+    if (args.replace != null && args.new_string == null) { args.new_string = args.replace; delete args.replace; }
+    if (args.replacement != null && args.new_string == null) { args.new_string = args.replacement; delete args.replacement; }
     if (args.path != null && args.file_path == null) { args.file_path = args.path; delete args.path; }
+    if (args.replaceAll != null && args.replace_all == null) { args.replace_all = args.replaceAll; delete args.replaceAll; }
+    return args;
+  },
+  Grep(args) {
+    if (!args || typeof args !== 'object') return args;
+    if (args.outputMode != null && args.output_mode == null) { args.output_mode = args.outputMode; delete args.outputMode; }
+    if (!args.output_mode) args.output_mode = 'files_with_matches';
+    if (args.output_mode === 'files') args.output_mode = 'files_with_matches';
     return args;
   },
   MultiEdit(args) {
@@ -674,6 +799,10 @@ function normalizeHallucinatedToolArgs(toolName, args) {
 
 module.exports = {
   anthropicToolsToMcpTools,
+  normalizeClientToolNameForPolicy,
+  normalizeMcpWireToolNameForClient,
+  isClientWebSearchToolName, isClientWebFetchToolName,
+  isClientWebLookupToolName, shouldDropClientWebLookupToolName,
   encodeToolUseId, decodeToolUseId,
   extractToolResults, extractTools,
   findLatestUserMessage, extractFirstUserText,

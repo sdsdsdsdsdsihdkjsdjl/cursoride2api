@@ -3,6 +3,8 @@
 // ═══════════════════════════════════════════════
 
 const { v4: uuidv4 } = require('uuid');
+const proxyThinking = require('./proxy-thinking-adapter');
+const anthropicToolsPolicy = require('./anthropic-tools');
 
 /**
  * Parse a Bash command string for common file-write idioms and return
@@ -136,6 +138,50 @@ function anthropicMessagesToPrompt(messages, system, opts = {}) {
   }
 
   const parts = [];
+
+  let clientToolNames = Array.isArray(opts.clientTools)
+    ? opts.clientTools.map(t => t && t.name).filter(Boolean)
+    : [];
+  const hadNativeSearchTool = clientToolNames.some(name => anthropicToolsPolicy.isClientWebSearchToolName(name));
+  const hadBlockedWebLookupTool = clientToolNames.some(name => anthropicToolsPolicy.shouldDropClientWebLookupToolName(name));
+  if (clientToolNames.length > 0) {
+    clientToolNames = clientToolNames.filter(name => !anthropicToolsPolicy.shouldDropClientWebLookupToolName(name));
+  }
+  if (clientToolNames.length > 0) {
+    const prefixedByCursor = new Set([
+      'Read', 'Write', 'Grep', 'Glob', 'WebFetch',
+      'Shell', 'Delete', 'Task', 'TodoWrite', 'AskQuestion',
+      'ListMcpResources', 'ReadLints', 'SwitchMode', 'Ls', 'Fetch',
+      'Diagnostics',
+    ]);
+    const shown = clientToolNames.slice(0, 40).map((name) => (
+      prefixedByCursor.has(name) ? `${name} (may appear as mcp_${name})` : name
+    )).join(', ');
+    const more = clientToolNames.length > 40 ? `, ... (${clientToolNames.length - 40} more)` : '';
+    parts.push(
+      `<system>\n` +
+      `Tool routing note: this conversation is running through cursoride2api as an API bridge. ` +
+      `The MCP/function tools listed for this turn were declared by the external API client ` +
+      `(for example Claude Code), not by the user's Cursor IDE configuration. ` +
+      `When one of these tools is needed, call it normally; do not tell the user to configure it in Cursor. ` +
+      `If Cursor shows an mcp_ prefix for a tool, it is the same client-declared tool with a collision-safe name. ` +
+      `Broad web search should use Cursor's native WebSearch. For an explicit URL fetch, use WebFetch/Fetch when available. ` +
+      `Do not use Bash/curl for URL fetching unless the user specifically asks for a shell command. ` +
+      `If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls. ` +
+      `Available client-declared tools for this request: ${shown}${more}.\n` +
+      `</system>`
+    );
+  } else if (hadNativeSearchTool || hadBlockedWebLookupTool) {
+    parts.push(
+      `<system>\n` +
+      `Web search is provided by Cursor's native WebSearch in this bridge. ` +
+      `Do not look for or call client-declared MCP WebSearch or mcp_WebSearch variants as a broad-search fallback. ` +
+      `For explicit URL fetches, use WebFetch/Fetch when available. Do not use Bash, Shell, curl, wget, or local HTTP requests ` +
+      `as a broad-search fallback or URL-fetch workaround unless the user explicitly asks for a shell/curl test. ` +
+      `If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls.\n` +
+      `</system>`
+    );
+  }
 
   // 处理 system prompt
   if (system) {
@@ -370,6 +416,14 @@ function anthropicMessagesToPrompt(messages, system, opts = {}) {
             segments.push(b.text);
             if (role === 'user') userHasOriginalContent = true;
           }
+        } else if (b.type === 'thinking') {
+          // Proxy-local thinking is for Claude Code UI display only; do not
+          // replay it as model context unless thinking-history explicitly does.
+          if (!proxyThinking.isProxyLocalThinkingBlock(b) && b.thinking) {
+            segments.push(`<thinking>\n${b.thinking}\n</thinking>`);
+          }
+        } else if (b.type === 'redacted_thinking') {
+          // No useful text to render on the Cursor AgentService path.
         } else if (b.type === 'tool_use') {
           let argStr = '';
           try {
@@ -801,6 +855,9 @@ function buildAnthropicResponse(text, model, inputTokens, outputTokens, options 
       input: tu.input,
     });
   }
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' });
+  }
 
   return {
     id: `msg_${uuidv4()}`,
@@ -933,6 +990,17 @@ function buildContentBlockDeltaThinking(index, text) {
     type: 'content_block_delta',
     index: index,
     delta: { type: 'thinking_delta', thinking: text },
+  });
+}
+
+/**
+ * content_block_delta 事件 (thinking signature)
+ */
+function buildContentBlockDeltaSignature(index, signature) {
+  return formatSSE('content_block_delta', {
+    type: 'content_block_delta',
+    index: index,
+    delta: { type: 'signature_delta', signature: signature },
   });
 }
 
@@ -1073,6 +1141,7 @@ module.exports = {
   buildMessageStart, buildContentBlockStart, buildContentBlockDelta,
   buildContentBlockStartToolUse, buildContentBlockDeltaInputJson,
   buildContentBlockStartThinking, buildContentBlockDeltaThinking,
+  buildContentBlockDeltaSignature,
   buildContentBlockStop, buildMessageDelta, buildMessageStop, buildPing,
   buildModelsResponseWithAnthropicAliases,
   buildSseErrorEvent,

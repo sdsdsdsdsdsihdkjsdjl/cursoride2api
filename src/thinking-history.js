@@ -51,12 +51,15 @@ const TTL_MS = 30 * 60_000;
 //                                         lastAccessMs }>
 const _store = new Map();
 
-// Strip out `[Tool call: NAME({...})]` substrings — these are hallucinated
+// Strip out textual tool-call markers — these are hallucinated
 // tool-call markers we suppress from the visible response. Don't include
 // them in re-injected thinking either; the model would just see noise.
 function _scrubThinking(text) {
   if (!text) return '';
-  return text.replace(/\[Tool call: [^\]]*\]/g, '').trim();
+  return text
+    .replace(/\[Tool call: [^\]]*\]/g, '')
+    .replace(/\[Tool call\]\s+[A-Za-z_][\w.-]*(?:\([^]*?\))?/g, '')
+    .trim();
 }
 
 function isEnabled() { return _enabled; }

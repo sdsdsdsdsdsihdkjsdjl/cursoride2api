@@ -19,24 +19,17 @@ const preprocess = require('./src/preprocess');
 const debugLog = require('./src/debug-log');
 const stallThresholds = require('./src/stall-thresholds');
 const runtimeStats = require('./src/runtime-stats');
+const proxyThinking = require('./src/proxy-thinking-adapter');
 const { StreamingHallucinationFilter } = require('./src/streaming-hallucination-filter');
 
-// Thinking-block emission. Off by default: sessions created via this proxy
-// must remain portable to direct-Anthropic clients (real Claude API). Real
-// Anthropic rejects assistant messages whose thinking blocks lack a valid
-// server-issued cryptographic signature — and we can't forge that signature
-// because we don't have Anthropic's signing key, and Cursor's upstream
-// provider doesn't pass the original signatures back to us.
-//
-// Trade-off when off: claude-code's `✻ Cogitated for Xs (ctrl+o to expand)`
-// collapsed display disappears. The model's actual response is unaffected,
-// only the visible-reasoning UI. The hallucination rescue still scans the
-// internal thinking buffer for `[Tool call: ...]` patterns, so structural
-// protection isn't lost.
-//
-// Opt back in with CURSOR_EMIT_THINKING_BLOCKS=1 if you don't intend to
-// resume the session against direct Anthropic.
-const _emitThinkingBlocks = process.env.CURSOR_EMIT_THINKING_BLOCKS === '1';
+// Proxy-local thinking blocks are opt-in and emitted only when the client
+// explicitly requested Anthropic thinking. We add a recognizable proxy-local
+// signature so future prompts can strip these UI-only blocks instead of
+// replaying unsigned thinking as model context. The old env is kept as an
+// alias for compatibility with this branch's earlier experiments.
+const _proxyThinkingBlocks =
+  /^(1|true|yes)$/i.test(process.env.CURSOR_PROXY_THINKING_BLOCKS || '') ||
+  process.env.CURSOR_EMIT_THINKING_BLOCKS === '1';
 debugLog.init();
 
 // Configurable "small model" used for warmup pings, compaction summarization,
@@ -294,8 +287,9 @@ app.use(express.json({ limit: '10mb' }));
 function checkApiKey(req, res, next) {
   if (!API_KEY) return next();
   const auth = req.headers.authorization;
-  if (!auth) return res.status(401).json({ error: { message: 'Missing Authorization header', type: 'auth_error' } });
-  const key = auth.replace(/^Bearer\s+/i, '');
+  const apiKeyHeader = req.headers['x-api-key'];
+  if (!auth && !apiKeyHeader) return res.status(401).json({ error: { message: 'Missing Authorization header', type: 'auth_error' } });
+  const key = auth ? auth.replace(/^Bearer\s+/i, '') : String(apiKeyHeader || '');
   if (key !== API_KEY) return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
   next();
 }
@@ -478,6 +472,9 @@ function buildTurnCallbacks(ctx) {
     // turns. Only meaningful for fresh-turn handlers; continuations reuse
     // the previous assistant message slot.
     assistantTurnIdx = null,
+    // Whether the inbound Anthropic request explicitly enabled thinking and
+    // proxy-local thinking blocks are allowed by env.
+    clientThinkingEnabled = false,
   } = ctx;
   function stamp(name) {
     if (timings && timings.t0 != null && timings[name] == null) {
@@ -507,9 +504,15 @@ function buildTurnCallbacks(ctx) {
     }
     if (turnState.thinkingBlockOpen) {
       if (isStream && !res.writableEnded) {
-        res.write(anthropicConverter.buildContentBlockStop(turnState.nextBlockIndex - 1));
+        const idx = turnState.thinkingBlockIndex != null ? turnState.thinkingBlockIndex : (turnState.nextBlockIndex - 1);
+        if (turnState.thinkingAdapter) {
+          res.write(anthropicConverter.buildContentBlockDeltaSignature(idx, turnState.thinkingAdapter.signature()));
+        }
+        res.write(anthropicConverter.buildContentBlockStop(idx));
       }
       turnState.thinkingBlockOpen = false;
+      turnState.thinkingBlockIndex = null;
+      turnState.thinkingAdapter = null;
     }
   }
 
@@ -553,6 +556,7 @@ function buildTurnCallbacks(ctx) {
     let added = 0;
     for (const hit of newHits) {
       const canonical = anthropicTools.canonicalizeHallucinatedToolName(hit.name, registered);
+      if (anthropicTools.shouldDropClientWebLookupToolName(canonical)) continue;
       const normalizedArgs = anthropicTools.normalizeHallucinatedToolArgs(canonical, hit.args || {});
       const dupKey = (() => {
         try { return canonical + '|' + JSON.stringify(normalizedArgs); }
@@ -572,6 +576,7 @@ function buildTurnCallbacks(ctx) {
       const synthExecId = '';
       const synthToolCallId = `toolu_synth_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
       const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, synthExecId, synthToolCallId, sessionId);
+      if (isStream && !res.writableEnded) closeOpenBlock();
       const blockIndex = turnState.nextBlockIndex++;
       turnState.pendingToolCalls.push({
         execMsgId: 0,
@@ -633,6 +638,7 @@ function buildTurnCallbacks(ctx) {
       sessionId,
       requestedModel,
       cursorModel,
+      clientThinkingEnabled,
     };
     entry.lastAccessMs = Date.now();
     entry.pendingExecs = turnState.pendingToolCalls.slice();
@@ -726,11 +732,9 @@ function buildTurnCallbacks(ctx) {
       // emitted inside the thinking block. This buffer is internal-only.
       turnState.emittedThinkingForDetection += text;
 
-      // Drop thinking content from the API response by default. Anthropic's
-      // thinking blocks require a server-issued signature we cannot
-      // produce; emitting them poisons sessions against direct-Anthropic
-      // resume (see `_emitThinkingBlocks` comment at the top of this file).
-      if (!_emitThinkingBlocks) return;
+      // Drop thinking content from the API response unless explicitly enabled
+      // both by the proxy operator and by the client request.
+      if (!_proxyThinkingBlocks || !clientThinkingEnabled) return;
 
       if (turnState.textBlockOpen) closeOpenBlock();
       if (!turnState.thinkingBlockOpen) {
@@ -739,14 +743,24 @@ function buildTurnCallbacks(ctx) {
           res.write(anthropicConverter.buildContentBlockStartThinking(idx));
         }
         turnState.thinkingBlockOpen = true;
+        turnState.thinkingBlockIndex = idx;
+        turnState.thinkingAdapter = new proxyThinking.ProxyThinkingBlockAdapter({
+          source: 'cursor',
+          convKey,
+          requestId,
+          blockIndex: idx,
+          turnIndex: assistantTurnIdx,
+        });
       }
       // Same rationale as onTextDelta: skip the in-memory accumulator when
       // we're streaming — it's not used for the response, only for diagnostics.
       if (!isStream) {
         turnState.accumulatedThinking += text;
       }
+      if (turnState.thinkingAdapter) turnState.thinkingAdapter.append(text);
       if (isStream && !res.writableEnded) {
-        res.write(anthropicConverter.buildContentBlockDeltaThinking(turnState.nextBlockIndex - 1, text));
+        const idx = turnState.thinkingBlockIndex != null ? turnState.thinkingBlockIndex : (turnState.nextBlockIndex - 1);
+        res.write(anthropicConverter.buildContentBlockDeltaThinking(idx, text));
       }
     },
 
@@ -754,6 +768,11 @@ function buildTurnCallbacks(ctx) {
       stamp('firstFrame');
       stamp('firstTool');
       closeOpenBlock();
+      const registered = new Set(
+        (mcpTools || []).flatMap(t => [t && t.name, t && t.toolName]).filter(Boolean)
+      );
+      toolName = anthropicTools.normalizeMcpWireToolNameForClient(toolName, registered);
+      args = anthropicTools.normalizeHallucinatedToolArgs(toolName, args || {});
       const blockIndex = turnState.nextBlockIndex++;
       const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, execId, toolCallId, sessionId);
 
@@ -1053,6 +1072,8 @@ function makeTurnState() {
   return {
     textBlockOpen: false,
     thinkingBlockOpen: false,
+    thinkingBlockIndex: null,
+    thinkingAdapter: null,
     // Buffer of every text delta we've forwarded this turn — kept regardless
     // of isStream because we need it at end_turn to detect hallucinated
     // tool calls (`[Tool call: NAME({...})]`) the model emitted as text
@@ -1128,6 +1149,7 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
     cachedEntry: cached,
     isContinuation: true,  // continuation handler
     timings,
+    clientThinkingEnabled: !!cached.clientThinkingEnabled,
   });
 
   // Re-bind bridge callbacks so events from this resumed turn drive the
@@ -1176,11 +1198,31 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
   });
 }
 
+function extractAnthropicUserImages(messages) {
+  const images = [];
+  if (!Array.isArray(messages)) return images;
+  const latestUser = anthropicTools.findLatestUserMessage(messages);
+  const content = latestUser && Array.isArray(latestUser.content) ? latestUser.content : [];
+  for (const block of content) {
+    if (!block || block.type !== 'image' || !block.source) continue;
+    if (block.source.type === 'base64' && block.source.data) {
+      images.push({
+        kind: 'image',
+        mediaType: block.source.media_type || 'image/png',
+        dataBase64: block.source.data,
+      });
+    }
+  }
+  return images;
+}
+
 // ── Path B: Open a fresh Cursor conversation ──
 async function handleFreshTurn(req, res, token, params) {
   const {
     messages, system, requestedModel, cursorModel, isStream,
     convKey, bridgeKey, conversationId, tools,
+    clientThinkingEnabled = false,
+    images = [],
   } = params;
 
   const timings = { t0: Date.now() };
@@ -1190,6 +1232,7 @@ async function handleFreshTurn(req, res, token, params) {
   const thinkingHist = thinkingHistory.getHistory(convKey);
   const prompt = anthropicConverter.anthropicMessagesToPrompt(messages, system, {
     thinkingHistory: thinkingHist,
+    clientTools: tools,
   });
   // The assistant-message index this new turn will land at — used by the
   // onTurnEnded handler to key the recorded thinking by position.
@@ -1252,6 +1295,7 @@ async function handleFreshTurn(req, res, token, params) {
     // The position this turn's assistant message will occupy in the
     // conversation history — used to key recorded thinking content.
     assistantTurnIdx: newAssistantTurnIdx,
+    clientThinkingEnabled,
   });
 
   bridge = cursorAgent.startConversation(token, {
@@ -1260,6 +1304,7 @@ async function handleFreshTurn(req, res, token, params) {
     conversationId,
     conversationState,
     tools: mcpTools,
+    images,
     // Reuse the per-bridge sessionId we already minted for tool_use_id
     // encoding: it now also serves as the IDE-style x-session-id header
     // so Cursor's backend can schedule this stream independently.
@@ -1270,6 +1315,7 @@ async function handleFreshTurn(req, res, token, params) {
     onStepCompleted: callbacks.onStepCompleted,
     onTurnEnded: callbacks.onTurnEnded,
     onError: callbacks.onError,
+    subagentSupport: true,
   });
 
   // NOTE: We intentionally do NOT register req.on('close') here. In some Node
@@ -1361,6 +1407,11 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
     }
   }
   const isStream = stream === true;
+  const clientThinkingEnabled = !!(
+    body.thinking === 'enabled' ||
+    (body.thinking && typeof body.thinking === 'object' && body.thinking.type === 'enabled')
+  );
+  const images = extractAnthropicUserImages(messages);
 
   // Conversation/bridge cache keys.
   //
@@ -1472,6 +1523,8 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
   return handleFreshTurn(req, res, token, {
     messages, system, requestedModel, cursorModel, isStream,
     convKey, bridgeKey, conversationId, tools, requestId,
+    clientThinkingEnabled,
+    images,
   });
 });
 
@@ -1707,7 +1760,7 @@ app.listen(PORT, HOST, () => {
   if (debugLog.isEnabled()) {
     console.log(`  ║  📝 Debug: ${(debugLog.isVerbose() ? 'verbose' : 'on').padEnd(31)}║`);
   }
-  console.log(`  ║  💭 Thinking blocks: ${(_emitThinkingBlocks ? 'ON (non-portable)' : 'OFF (portable)').padEnd(21)}║`);
+  console.log(`  ║  💭 Thinking blocks: ${(_proxyThinkingBlocks ? 'ON (proxy-local)' : 'OFF').padEnd(21)}║`);
   console.log('  ╚═══════════════════════════════════════════╝');
   console.log('');
 });
