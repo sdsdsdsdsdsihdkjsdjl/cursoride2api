@@ -22,6 +22,8 @@ cursoride2api/
 │   ├── config.js          # 配置 & 模型映射
 │   ├── converter.js       # OpenAI ↔ Cursor 格式转换
 │   └── cursor-client.js   # Cursor Agent API 客户端 (H2 + ConnectRPC)
+├── scripts/
+│   └── context-tests/     # 手动长上下文 / NIAH 探针（不用于 CI）
 ├── token.json.example     # Token 配置模板
 ├── Cursor IDE API 逆向工程文档.md  # Cursor API 逆向文档
 ├── package.json
@@ -214,6 +216,18 @@ for chunk in resp:
 | `gemini-pro` | `gemini-3.1-pro` |
 
 > 💡 也可直接传 Cursor 原生模型名 (如 `composer-2`、`claude-4.5-sonnet-thinking`)，会直接透传。
+
+## 🧪 手动长上下文探针
+
+`scripts/context-tests/` 包含手动运行的长上下文 / Needle-In-A-Haystack 探针脚本，用于验证 `/v1/messages` 的上下文截断与召回表现。它们会生成大请求、耗时较长，并可能消耗较多模型额度，因此不放入 CI。
+
+```bash
+npm run probe:context
+npm run probe:niah
+REPS=1 SERVER=http://localhost:4141 npm run probe:niah:repeat
+```
+
+更多参数见 [`scripts/context-tests/README.md`](scripts/context-tests/README.md)。
 
 ## 📊 观测端点 / Observability Endpoints
 

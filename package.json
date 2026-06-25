@@ -5,7 +5,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "probe:context": "node scripts/context-tests/context-window-test.js",
+    "probe:niah": "node scripts/context-tests/niah-test.js",
+    "probe:niah:repeat": "node scripts/context-tests/niah-repeat.js"
   },
   "keywords": [
     "cursor",
