@@ -22,6 +22,8 @@ cursoride2api/
 │   ├── config.js          # 配置 & 模型映射
 │   ├── converter.js       # OpenAI ↔ Cursor 格式转换
 │   └── cursor-client.js   # Cursor Agent API 客户端 (H2 + ConnectRPC)
+├── scripts/
+│   └── context-tests/     # 手动长上下文 / NIAH 探针（不用于 CI）
 ├── token.json.example     # Token 配置模板
 ├── Cursor IDE API 逆向工程文档.md  # Cursor API 逆向文档
 ├── package.json
@@ -170,7 +172,40 @@ for chunk in resp:
 | `TOKEN_FILE` | `./token.json` | Token 文件路径 |
 | `DEFAULT_MODEL` | `claude-4.5-sonnet` | 默认 Cursor 模型 |
 | `CURSOR_CLIENT_VERSION` | `2.6.20` | Cursor 客户端版本号 |
+| `CURSOR_API_BASE_URL` | `https://api2.cursor.sh` | Cursor 后端地址（与官方 IDE 同名 env） |
+| `CURSOR_CLIENT_OS_VERSION` | `os.release()` | 上送的客户端 OS 版本（指纹用） |
+| `CURSOR_COMMIT` | _(默认 v3.2.11 hash)_ | 上送的客户端 commit hash（指纹用） |
 | `REQUEST_TIMEOUT` | `120000` | 请求超时 (ms) |
+| `TOKEN_RATE_LIMIT_PARK_MS` | `60000` | Token 命中 429 后冷却时长 (ms) |
+| `DEBUG_LOG` | _(空=关)_ | `1` 写错误日志到 `logs/`；`verbose` 也记录请求体 |
+| `DEBUG_LOG_DIR` | `./logs` | 日志目录覆盖 |
+| `CURSOR_AGENT_DEBUG` | _(空=关)_ | `1` 启用 cursor-agent 调试日志（pool/recycler 事件等） |
+| `TOOL_INCLUDE` | _(空)_ | Anthropic 工具白名单（按工具名） |
+| `TOOL_LIMIT` | `0` | 工具数量上限 |
+| `TOOL_DESC_LIMIT` | `600` | 工具描述截断长度（字符） |
+| `TOOL_SCHEMA_TRIM_BYTES` | `30000` | 总 schema 超过此值则剥离 properties[].description |
+| `SMALL_MODEL` | `claude-sonnet-4-6` | 用于 compact / haiku 升级的小模型 |
+| `SUBAGENT_USE_SMALL_MODEL` | _(空)_ | `1` 时把 subagent 流量也降级到 `SMALL_MODEL` |
+| `H2_POOL_SIZE` | `3` | HTTP/2 客户端连接池大小 |
+| `CURSOR_POOL_MAX_IDLE_MS` | `300000` | 空闲池连接自动回收阈值 (ms)；防止 LB 静默轮转造成的级联失败 |
+| `CURSOR_STALL_TIMEOUT_MS` | _(自动)_ | 全局覆盖按模型计算的 pre-content stall 阈值；通常不需要 — 让 `src/stall-thresholds.js` 按模型推导 |
+| `CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT` | _(自动)_ | 全局覆盖 post-content stall 阈值；同上 |
+| `CURSOR_FORCE_THINKING` | _(空)_ | `on`/`off`/`adaptive` — 全局覆盖客户端的 `thinking.type` |
+| `CURSOR_PROXY_THINKING_BLOCKS` | _(空=off)_ | `1` 时仅在客户端请求 `thinking.type=enabled` 时输出带 `proxy-local-thinking-v1.*` 签名的 thinking 块；后续提示会自动剥离这些代理本地块 |
+| `CURSOR_EMIT_THINKING_BLOCKS` | _(空=off)_ | 旧别名；等同于 `CURSOR_PROXY_THINKING_BLOCKS=1` |
+| `CURSOR_REINJECT_THINKING` | _(空=off)_ | `1` 时启用代理端思考连续性：把模型上一轮的思考内容（带 `<thinking>...</thinking>` 标签）回注到下一轮提示中。在 Cursor 的 ChatService（带签名）不可用时的近似方案。代价是每次续传都会多出几百到几千 token。详见 [DEVLOG.md](DEVLOG.md) 中的 "Proxy-side thinking re-injection" 章节。 |
+| `CURSOR_REINJECT_THINKING_MAX_BYTES_PER_TURN` | `4096` | 每轮存储的思考字节上限（避免长会话膨胀） |
+| `CURSOR_REINJECT_THINKING_MAX_TURNS` | `5` | 每个会话保留的思考轮数上限 |
+| `CURSOR_ALLOW_CLIENT_WEBSEARCH` | _(空=off)_ | 默认过滤客户端声明的 WebSearch/Search 工具，让 broad search 走 Cursor native WebSearch；设 `1` 才转发客户端 WebSearch |
+| `CURSOR_ALLOW_CLIENT_WEBFETCH` | _(空=off)_ | 默认在 `CURSOR_SERVER_WEBFETCH!=0` 时保留客户端 WebFetch/Fetch；设 `1` 强制保留 |
+| `CURSOR_ALLOW_CLIENT_WEB_TOOLS` | _(空=off)_ | 同时保留客户端 WebSearch 和 WebFetch |
+| `CURSOR_SUBAGENT_TYPE_MAP` | _(空)_ | Cursor native subagent → Claude Code `Task.subagent_type` 映射，例如 `explore=Explore,plan=Plan` |
+| `CURSOR_SUBAGENT_MODEL_KEYWORDS` | `sonnet,opus,haiku` | 允许透传给 Claude Code `Task.model` 的关键字；其它 Cursor 后端模型 slug 会被丢弃以避免客户端 schema 校验失败 |
+| `RUNTIME_STATS_FILE` | `./logs/runtime-stats.json` | 运行时统计持久化文件路径 |
+| `RUNTIME_STATS_PERSIST_MS` | `60000` | 统计快照写盘间隔 (ms) |
+| `RUNTIME_STATS_RECENT` | `1000` | 滚动窗口大小（用于时间分桶视图） |
+| `RUNTIME_STATS_CONN_RING` | `500` | 连接事件环形缓冲区大小 |
+| `RUNTIME_STATS_LOG_INTERVAL_MS` | _(空=关)_ | 定期输出 `📈 runtime/last1h` 摘要行的间隔；用于长跑部署 |
 
 ## 🗺️ 模型映射
 
@@ -188,6 +223,40 @@ for chunk in resp:
 
 > 💡 也可直接传 Cursor 原生模型名 (如 `composer-2`、`claude-4.5-sonnet-thinking`)，会直接透传。
 
+## 🧪 手动长上下文探针
+
+`scripts/context-tests/` 包含手动运行的长上下文 / Needle-In-A-Haystack 探针脚本，用于验证 `/v1/messages` 的上下文截断与召回表现。它们会生成大请求、耗时较长，并可能消耗较多模型额度，因此不放入 CI。
+
+```bash
+npm run probe:context
+npm run probe:niah
+REPS=1 SERVER=http://localhost:4141 npm run probe:niah:repeat
+```
+
+更多参数见 [`scripts/context-tests/README.md`](scripts/context-tests/README.md)。
+
+## 📊 观测端点 / Observability Endpoints
+
+代理内置一组只读 stats 端点，方便诊断和调参：
+
+| 端点 | 用途 |
+|------|------|
+| `GET /health` | 紧凑健康检查（token 池、stall 阈值、连接计数、最近一小时统计汇总） |
+| `GET /stats` | 按模型聚合的运行时统计（t-digest 分位数 + 计数器）。支持 `?window=last1h\|last24h\|<ms>`、`?model=<id>`、`?groupBy=model\|modelMode\|mode` |
+| `GET /stats/connections` | HTTP/2 连接池生命周期：每连接寿命、复用流数、关闭原因分布、每槽 churn |
+| `GET /stats/inflight` | 实时在飞 bridge 状态：`idleMsSinceLastUsefulFrame`、`currentThresholdMs`、`willTripStallInMs`、文本/思考 delta 计数、字节流。用于回答"现在这个 turn 是在思考还是卡住了？" |
+
+示例：
+
+```bash
+# 看看 opus-4-7-thinking-max 在 stream-continuation 模式下最近一小时的延迟分位
+curl 'http://localhost:4141/stats?window=last1h&groupBy=modelMode' \
+  | jq '.groups | with_entries(select(.key | startswith("claude-opus-4-7-thinking-max|stream|cont")))'
+
+# 实时盯一个可能卡住的 bridge
+watch -n 2 'curl -s http://localhost:4141/stats/inflight | jq ".bridges[0]"'
+```
+
 ## 🏗️ 技术原理
 
 本项目基于对 Cursor IDE `workbench.desktop.main.js` 的逆向分析：
@@ -198,7 +267,17 @@ for chunk in resp:
 4. 自动回复 `execServerMessage` (headless 模式)
 5. 实时解析 `interactionUpdate` 流并转为 OpenAI SSE 格式
 
-详细逆向文档见 [Cursor IDE API 逆向工程文档](Cursor%20IDE%20API%20逆向工程文档.md)
+详细逆向文档见 [Cursor IDE API 逆向工程文档](Cursor%20IDE%20API%20逆向工程文档.md)；近期开发笔记见 [DEVLOG.md](DEVLOG.md)；调试方法（live-monitoring）见 [DEBUGGING.md](DEBUGGING.md)。
+
+## 🔗 相关项目 / Related Projects
+
+本项目交叉参考了下列 Cursor 逆向研究（完整清单和取舍说明见 [REFERENCES.md](REFERENCES.md)；具体技术细节见 [DEVLOG.md](DEVLOG.md) "Cross-referencing with other Cursor RE projects" 章节）：
+
+- [`JJDTrump/cursor-reverse-engineering`](https://github.com/JJDTrump/cursor-reverse-engineering) — Cursor IDE 深度逆向分析（gRPC services, headers, ModelDetails）。
+- [`anyrobert/cursor-api-proxy`](https://github.com/anyrobert/cursor-api-proxy) — `cursor-agent` CLI → OpenAI 兼容代理；本项目的 health-aware TokenPool 设计参考自其 `account-pool.ts`。
+- [`JiuZ-Chn/Cursor-To-OpenAI`](https://github.com/JiuZ-Chn/Cursor-To-OpenAI) — 后端直连代理（与本项目同路线），dated-variant 回退正则参考自该项目。
+- [`unkn0wncode/extract-cursor-protos`](https://github.com/unkn0wncode/extract-cursor-protos) — 直接从 Cursor bundle 抽取完整 protobuf registry，用于核对 wire format。
+- [`ephraimduncan/opencode-cursor`](https://github.com/ephraimduncan/opencode-cursor)、[`burpheart/cursor-tap`](https://github.com/burpheart/cursor-tap) — 早期参考实现与抓包分析（proto 定义来源）。
 
 ## 📄 License
 
