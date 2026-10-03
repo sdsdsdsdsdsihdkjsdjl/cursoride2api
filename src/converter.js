@@ -81,13 +81,29 @@ function buildChatResponse(text, model, inputTokens, outputTokens) {
 }
 
 /**
- * 构建流式 SSE chunk
+ * Mint a fresh stream identity (id + created timestamp). OpenAI clients
+ * expect the same `chatcmpl-<id>` and `created` to repeat across every
+ * chunk in a single completion stream. Call this once per request and
+ * pass the result into buildStreamChunk / buildRoleChunk.
  */
-function buildStreamChunk(delta, model, finishReason = null) {
-  const chunk = {
+function newStreamIdentity() {
+  return {
     id: `chatcmpl-${uuidv4().replace(/-/g, '').substring(0, 24)}`,
-    object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
+  };
+}
+
+/**
+ * 构建流式 SSE chunk. `identity` should be the value returned by
+ * newStreamIdentity() at the start of the request — falls back to a
+ * fresh identity for callers that haven't migrated yet.
+ */
+function buildStreamChunk(delta, model, finishReason = null, identity = null) {
+  const ident = identity || newStreamIdentity();
+  const chunk = {
+    id: ident.id,
+    object: 'chat.completion.chunk',
+    created: ident.created,
     model: model,
     choices: [{
       index: 0,
@@ -101,11 +117,12 @@ function buildStreamChunk(delta, model, finishReason = null) {
 /**
  * 构建流式角色 chunk (第一条)
  */
-function buildRoleChunk(model) {
+function buildRoleChunk(model, identity = null) {
+  const ident = identity || newStreamIdentity();
   const chunk = {
-    id: `chatcmpl-${uuidv4().replace(/-/g, '').substring(0, 24)}`,
+    id: ident.id,
     object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000),
+    created: ident.created,
     model: model,
     choices: [{
       index: 0,
@@ -154,4 +171,5 @@ module.exports = {
   messagesToPrompt, mapModel,
   buildChatResponse, buildStreamChunk, buildRoleChunk,
   buildErrorResponse, buildModelsResponse,
+  newStreamIdentity,
 };
