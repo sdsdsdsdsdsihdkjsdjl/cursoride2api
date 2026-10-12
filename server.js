@@ -76,7 +76,11 @@ function pickToken() {
 
 // ── Express 应用 ──
 const app = express();
-app.use(cors());
+// 仅允许通过 ALLOWED_ORIGINS 显式配置的来源进行跨域访问, 未配置时默认禁止跨域
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
+app.use(cors({
+  origin: ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : false,
+}));
 app.use(express.json({ limit: '10mb' }));
 
 // ── API Key 简单校验 ──
