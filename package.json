@@ -5,15 +5,29 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "probe:context": "node scripts/context-tests/context-window-test.js",
+    "probe:niah": "node scripts/context-tests/niah-test.js",
+    "probe:niah:repeat": "node scripts/context-tests/niah-repeat.js",
+    "test": "node tests/src/anthropic-tools-test.js && node tests/src/proxy-thinking-adapter-test.js && node tests/src/forward-compatible-exec-test.js && node tests/src/selected-image-encoding-test.js"
   },
-  "keywords": ["cursor", "openai", "api", "proxy"],
+  "keywords": [
+    "cursor",
+    "openai",
+    "api",
+    "proxy"
+  ],
   "author": "",
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
+    "@bufbuild/protobuf": "^2.12.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
+    "tdigest": "^0.1.2",
     "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

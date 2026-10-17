@@ -33,6 +33,13 @@ function encodeFrame(obj) {
   return frame;
 }
 
+// Cache the timezone string at module load — Intl.DateTimeFormat() does
+// non-trivial work and the answer never changes mid-process.
+const _cursorTimezone = (() => {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
+  catch { return 'UTC'; }
+})();
+
 // ── 构建请求头 ──
 function buildHeaders(token) {
   return {
@@ -43,7 +50,7 @@ function buildHeaders(token) {
     'authorization': `Bearer ${token.accessToken}`,
     'x-cursor-checksum': generateChecksum(token.machineId || '', token.macMachineId || ''),
     'x-cursor-client-version': config.cursor.clientVersion,
-    'x-cursor-timezone': Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    'x-cursor-timezone': _cursorTimezone,
     'x-request-id': uuidv4(),
   };
 }
@@ -192,13 +199,16 @@ function chat(token, prompt, modelId, options = {}) {
     }
 
     req.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
+      // Hot path: only concat when there's a leftover partial frame from the
+      // previous chunk. Keeps frame parsing O(n) instead of O(n²) on long
+      // streams that arrive mostly aligned.
+      const work = (buffer.length > 0) ? Buffer.concat([buffer, chunk]) : chunk;
 
       let offset = 0;
-      while (offset + 5 <= buffer.length) {
-        const len = buffer.readUInt32BE(offset + 1);
-        if (offset + 5 + len > buffer.length) break;
-        const s = buffer.slice(offset + 5, offset + 5 + len).toString('utf8');
+      while (offset + 5 <= work.length) {
+        const len = work.readUInt32BE(offset + 1);
+        if (offset + 5 + len > work.length) break;
+        const s = work.slice(offset + 5, offset + 5 + len).toString('utf8');
         offset += 5 + len;
 
         try {
@@ -296,7 +306,9 @@ function chat(token, prompt, modelId, options = {}) {
 
         } catch {}
       }
-      buffer = buffer.slice(offset);
+      // If we consumed all bytes, drop the carry buffer (zero-copy reset).
+      // Otherwise, keep only the trailing partial-frame bytes.
+      buffer = (offset < work.length) ? work.slice(offset) : Buffer.alloc(0);
     });
 
     req.on('end', finish);
